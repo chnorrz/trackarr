@@ -15,6 +15,7 @@ COPY package.json package-lock.json ./
 RUN npm ci --omit=dev
 
 COPY lib ./lib
+COPY providers ./providers
 COPY server.js get-magnet.js ./
 
 # Bake the Camoufox browser binary into the image at build time (not into
