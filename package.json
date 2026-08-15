@@ -1,0 +1,13 @@
+{
+  "name": "ext.to-magnet-fetcher",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "main": "get-magnet.js",
+  "dependencies": {
+    "camoufox-js": "^0.12.0",
+    "cheerio": "^1.0.0",
+    "express": "^5.2.1",
+    "playwright-core": "<1.61.0"
+  }
+}
