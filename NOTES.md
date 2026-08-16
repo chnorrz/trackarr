@@ -520,7 +520,115 @@ request path, lower it.
 
 ---
 
-## 10. Open issues
+## 10. Testing
+
+`npm test` (builds first, then runs `node --experimental-test-module-mocks
+--test "test/**/*.test.ts"`). `npm run typecheck` type-checks source +
+tests without emitting (`tsconfig.test.json`). CI (`.github/workflows/ci.yml`)
+runs both on every push/PR; `docker-publish.yml` also gates the release build
+on the same `test` job (`needs: test`), so a broken suite can't ship.
+
+**No browser, no Docker, no network needed to run the suite at all** -
+verified decisively by running `CAMOUFOX_INSTALL_DIR=/tmp/nonexistent npm
+test` and getting all tests passing anyway. The mock boundary is
+`lib/browser.ts`'s `gotoCleared()` - provider tests never import camoufox-js
+for real.
+
+### Mock boundary
+
+- **Providers**: mock `gotoCleared` (via `node:test`'s `mock.module()`),
+  assert against hand-built fixtures in `test/fixtures/`.
+- **Server**: no mocking - `server.ts` exports `createApp(providers, opts?)`,
+  a pure factory taking the provider map and cache TTLs as arguments instead
+  of reading module-level singletons. Tests call `app.listen(0)` (OS-assigned
+  port) and hit it with real `fetch()`, exercising the actual HTTP layer.
+  Each `createApp()` call gets fresh `TTLCache` instances, so tests never
+  leak state into each other. Production (`node dist/server.js`) still boots
+  exactly as before via an `import.meta.url === file://${process.argv[1]}`
+  entrypoint guard at the bottom of the file - `createApp` itself has zero
+  side effects.
+
+### Fixtures must not contain real content
+
+`test/fixtures/*` are hand-built, not raw captures - no real torrent/episode
+titles, no real magnet hashes (a real infohash resolves to a real torrent).
+Fake titles use an obvious pattern (`Example Movie One (2024)... FAKEGRP`),
+fake magnet hashes use recognizable placeholders (`0000...aaa1`,
+`0000...bbb1`, etc). Exact selector structure (classes, attribute names, `td`
+index positions) is preserved byte-for-byte against the real markup, since
+that's the whole point of the fixture - only the *content* is fake.
+
+If you ever capture a fresh fixture from a live site to check selectors still
+match, do the substitution immediately and delete the raw capture - don't
+leave real captured HTML sitting in `/tmp` or anywhere it could get
+accidentally committed.
+
+### mock.module() gotchas (Node 22-24)
+
+- Needs the `--experimental-test-module-mocks` flag or `mock.module` is
+  `undefined`.
+- Register it **once per file**, at the top - calling `mock.module()` again
+  for the same specifier throws `ERR_INVALID_STATE`. To vary behaviour per
+  test, hold onto the `mock.fn()` handle and call
+  `.mock.mockImplementation(...)` on it inside each `test()` instead of
+  re-registering.
+- Use `options.exports`, not `options.namedExports` - the latter is
+  deprecated (still works, prints a warning).
+- Mock by absolute path (`path.join(ROOT, 'dist', 'lib', 'browser.js')`), not
+  a relative specifier - robust regardless of which file is importing it.
+- An untyped `mock.fn(async () => x)` infers its call-signature from that
+  *first* implementation, so `.mock.calls[i].arguments` can end up typed as
+  `[]` even after `mockImplementation()` swaps in a differently-shaped one
+  later. Type the mock explicitly:
+  `mock.fn<(url: string, opts?: GotoOptions) => Promise<Page>>(...)`.
+
+### Import path split: production vs test files
+
+Node runs `.ts` test files directly (no ts-node/tsx needed, Node 22.6+
+supports erasable-syntax TS natively) - but only for imports that resolve
+exactly as written:
+
+- **Importing production code**: always from `dist/*.js` (compiled output),
+  never raw `.ts` source. Production files use `.js`-extension imports
+  (required by NodeNext/ESM), and Node's native TS execution does not remap
+  those to sibling `.ts` files - `import('../../providers/1337x.ts')` fails
+  with `Cannot find module '.../lib/browser.js'`.
+- **Importing other test files** (e.g. `test/helpers.ts`): use the explicit
+  `.ts` extension - there's no compiled counterpart to point at.
+- `tsc --noEmit` needs `allowImportingTsExtensions: true` (in
+  `tsconfig.test.json` only) to accept those `.ts` import specifiers without
+  complaining.
+
+Since tests import compiled output, `npm test` runs `npm run build` first -
+if you edit source and the test doesn't seem to pick it up, that's usually
+because you're running the test binary directly instead of through `npm
+test`.
+
+### Test discovery
+
+Use the quoted glob `node --test "test/**/*.test.ts"` - both a bare
+`node --test test/` (tries to resolve `test/` as a module path, throws
+`MODULE_NOT_FOUND`) and an unquoted `**` (bash doesn't expand it recursively
+by default) fail. Node's own glob engine needs the literal, quoted pattern.
+Also: without the `*.test.ts` suffix restriction, Node's directory-heuristic
+auto-discovery will pick up non-test files like `test/helpers.ts` as a
+phantom passing test.
+
+### Adding tests for a new provider
+
+1. Build a fixture in `test/fixtures/` with fake content, real selectors.
+2. Mock `gotoCleared` once at the top of `test/providers/<id>.test.ts`
+   (copy the pattern from `1337x.test.ts` or `ext-to.test.ts`).
+3. Cover at minimum: a successful `search()` parse (title/size/category/etc),
+   a malformed-row edge case, `resolveMagnet()` success, and its failure
+   modes (missing id/url, no magnet found on the page).
+4. This does **not** replace the `testQuery`-against-the-real-site check in
+   section 8 - fixtures catch parsing regressions, not "the live site changed
+   its markup" or "this term returns zero results on this tracker".
+
+---
+
+## 11. Open issues
 
 **Brittleness.** The solver depends on the widget DOM shape and the `+22px`
 checkbox offset. Cloudflare can invalidate either at any time. Expect it, and

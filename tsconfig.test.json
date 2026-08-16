@@ -1,0 +1,15 @@
+{
+  // Type-checks test files too (`npm run typecheck`), without adding them to
+  // the actual build - tsconfig.json's include stays scoped to production
+  // source, so dist/ never gets polluted with compiled test output. Tests
+  // themselves run directly via `node --test` against .ts source (Node's
+  // native TypeScript support), not via this config.
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    // Test files import each other with .ts extensions (see NOTES.md - Node
+    // can run raw .ts directly, but only resolves .js-import-only production
+    // code against the compiled dist/ output, not sibling .ts source).
+    "allowImportingTsExtensions": true
+  },
+  "include": ["server.ts", "lib/**/*.ts", "providers/**/*.ts", "test/**/*.ts"]
+}

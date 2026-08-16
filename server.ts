@@ -17,7 +17,7 @@
  *   API_KEY=yoursecret PORT=9117 node server.js
  */
 
-import express, { type Request, type Response } from 'express';
+import express, { type Application, type Request, type Response } from 'express';
 import { closeBrowser, gotoCleared } from './lib/browser.js';
 import { CATEGORIES_XML } from './lib/categories.js';
 import { TTLCache } from './lib/cache.js';
@@ -44,8 +44,6 @@ const KEEPALIVE_INTERVAL_MS = process.env.KEEPALIVE_INTERVAL_MS === undefined
 // longer - avoids hitting the tracker again if Prowlarr re-grabs/retries.
 const SEARCH_CACHE_TTL_MS = Number(process.env.SEARCH_CACHE_TTL_MS) || 5 * 60 * 1000;
 const MAGNET_CACHE_TTL_MS = Number(process.env.MAGNET_CACHE_TTL_MS) || 60 * 60 * 1000;
-const searchCache = new TTLCache<SearchItem[]>(SEARCH_CACHE_TTL_MS);
-const magnetCache = new TTLCache<string>(MAGNET_CACHE_TTL_MS);
 
 // Express 5's req.query values are `string | string[] | ParsedQs | ParsedQs[]
 // | undefined` (from the `qs` package) - our params are always plain single
@@ -53,14 +51,6 @@ const magnetCache = new TTLCache<string>(MAGNET_CACHE_TTL_MS);
 // site.
 function queryString(v: unknown): string | undefined {
   return typeof v === 'string' ? v : undefined;
-}
-
-function checkKey(req: Request, res: Response): boolean {
-  if (queryString(req.query.apikey) !== API_KEY) {
-    res.status(401).send('Invalid apikey');
-    return false;
-  }
-  return true;
 }
 
 function xmlEscape(str: unknown): string {
@@ -90,68 +80,95 @@ ${CATEGORIES_XML}
 </caps>`;
 }
 
-async function search(provider: Provider, q: string): Promise<SearchItem[]> {
-  // Prowlarr's "Test" button (and likely periodic health checks) queries
-  // with an empty q, and requires a non-empty result set to let the indexer
-  // be saved - an empty-but-valid response isn't enough (confirmed: Save
-  // fails with a red exclamation mark otherwise). No provider has a real
-  // "browse everything" mode for a blank query, so substitute a term proven
-  // to return results for THIS SPECIFIC provider, rather than either
-  // returning nothing (which Prowlarr rejects) or fabricating a fake item
-  // (which would fail differently and more confusingly the moment anything
-  // tried to resolve its magnet link).
-  //
-  // This must be per-provider, not a single shared default: 'yify' is a
-  // movie-release-group tag with zero hits on a TV-only tracker like EZTV,
-  // which silently reproduced the exact same Prowlarr "no results" failure
-  // this substitution was meant to fix in the first place (see NOTES.md -
-  // this class of bug is why testQuery is checked before shipping a new
-  // provider now, not just assumed to inherit a working default).
-  if (!q || !q.trim()) {
-    if (!provider.testQuery) {
-      console.error(`[warn] ${provider.id} has no testQuery set, falling back to '' (empty) - verify this actually returns results for this provider.`);
+export interface AppOptions {
+  apiKey?: string;
+  searchCacheTtlMs?: number;
+  magnetCacheTtlMs?: number;
+}
+
+// Factory rather than a module-level app: lets tests inject a fake
+// providerMap and a fresh pair of caches per test instead of sharing the
+// real, module-level providers/caches (and, as a side effect, avoids
+// app.listen()/process signal handlers running just by importing this file
+// - see the entrypoint guard at the bottom).
+export function createApp(providers: Record<string, Provider>, opts: AppOptions = {}): Application {
+  const apiKey = opts.apiKey ?? API_KEY;
+  const searchCache = new TTLCache<SearchItem[]>(opts.searchCacheTtlMs ?? SEARCH_CACHE_TTL_MS);
+  const magnetCache = new TTLCache<string>(opts.magnetCacheTtlMs ?? MAGNET_CACHE_TTL_MS);
+
+  function checkKey(req: Request, res: Response): boolean {
+    if (queryString(req.query.apikey) !== apiKey) {
+      res.status(401).send('Invalid apikey');
+      return false;
     }
-    q = provider.testQuery || '';
+    return true;
   }
 
-  const cacheKey = `${provider.id}:${q.toLowerCase().trim()}`;
-  const cached = searchCache.get(cacheKey);
-  if (cached) {
-    console.error(`[cache] search hit for ${provider.id} q=${JSON.stringify(q)}`);
-    return cached;
+  async function search(provider: Provider, q: string): Promise<SearchItem[]> {
+    // Prowlarr's "Test" button (and likely periodic health checks) queries
+    // with an empty q, and requires a non-empty result set to let the
+    // indexer be saved - an empty-but-valid response isn't enough
+    // (confirmed: Save fails with a red exclamation mark otherwise). No
+    // provider has a real "browse everything" mode for a blank query, so
+    // substitute a term proven to return results for THIS SPECIFIC
+    // provider, rather than either returning nothing (which Prowlarr
+    // rejects) or fabricating a fake item (which would fail differently
+    // and more confusingly the moment anything tried to resolve its
+    // magnet link).
+    //
+    // This must be per-provider, not a single shared default: 'yify' is a
+    // movie-release-group tag with zero hits on a TV-only tracker like
+    // EZTV, which silently reproduced the exact same Prowlarr "no results"
+    // failure this substitution was meant to fix in the first place (see
+    // NOTES.md - this class of bug is why testQuery is checked before
+    // shipping a new provider now, not just assumed to inherit a working
+    // default).
+    if (!q || !q.trim()) {
+      if (!provider.testQuery) {
+        console.error(`[warn] ${provider.id} has no testQuery set, falling back to '' (empty) - verify this actually returns results for this provider.`);
+      }
+      q = provider.testQuery || '';
+    }
+
+    const cacheKey = `${provider.id}:${q.toLowerCase().trim()}`;
+    const cached = searchCache.get(cacheKey);
+    if (cached) {
+      console.error(`[cache] search hit for ${provider.id} q=${JSON.stringify(q)}`);
+      return cached;
+    }
+
+    const items = await provider.search(q);
+    // Never cache an empty result. A transient failure (proxy down,
+    // challenge not cleared, markup change) would otherwise be frozen in
+    // for the full TTL and keep being served after the underlying problem
+    // is fixed.
+    if (items.length) searchCache.set(cacheKey, items);
+    return items;
   }
 
-  const items = await provider.search(q);
-  // Never cache an empty result. A transient failure (proxy down, challenge
-  // not cleared, markup change) would otherwise be frozen in for the full
-  // TTL and keep being served after the underlying problem is fixed.
-  if (items.length) searchCache.set(cacheKey, items);
-  return items;
-}
+  async function resolveMagnet(provider: Provider, ref: MagnetRef): Promise<string> {
+    const cacheKey = `${provider.id}:${ref.id ?? ref.url}`;
+    const cached = magnetCache.get(cacheKey);
+    if (cached) {
+      console.error(`[cache] magnet hit for ${provider.id} ${JSON.stringify(ref)}`);
+      return cached;
+    }
 
-async function resolveMagnet(provider: Provider, ref: MagnetRef): Promise<string> {
-  const cacheKey = `${provider.id}:${ref.id ?? ref.url}`;
-  const cached = magnetCache.get(cacheKey);
-  if (cached) {
-    console.error(`[cache] magnet hit for ${provider.id} ${JSON.stringify(ref)}`);
-    return cached;
+    const magnet = await provider.resolveMagnet(ref);
+    magnetCache.set(cacheKey, magnet);
+    return magnet;
   }
 
-  const magnet = await provider.resolveMagnet(ref);
-  magnetCache.set(cacheKey, magnet);
-  return magnet;
-}
-
-function buildRss(req: Request, provider: Provider, items: SearchItem[]): string {
-  const selfUrl = `${req.protocol}://${req.get('host')}${req.originalUrl}`;
-  const rows = items
-    .map((it) => {
-      const downloadUrl =
-        `${req.protocol}://${req.get('host')}/${provider.id}/download?apikey=${encodeURIComponent(API_KEY)}` +
-        (it.id != null ? `&id=${it.id}` : '') +
-        `&url=${encodeURIComponent(it.detailUrl)}`;
-      const peers = it.seeds + it.leechers;
-      return `  <item>
+  function buildRss(req: Request, provider: Provider, items: SearchItem[]): string {
+    const selfUrl = `${req.protocol}://${req.get('host')}${req.originalUrl}`;
+    const rows = items
+      .map((it) => {
+        const downloadUrl =
+          `${req.protocol}://${req.get('host')}/${provider.id}/download?apikey=${encodeURIComponent(apiKey)}` +
+          (it.id != null ? `&id=${it.id}` : '') +
+          `&url=${encodeURIComponent(it.detailUrl)}`;
+        const peers = it.seeds + it.leechers;
+        return `  <item>
     <title>${xmlEscape(it.title)}</title>
     <guid isPermaLink="true">${xmlEscape(it.detailUrl)}</guid>
     <comments>${xmlEscape(it.detailUrl)}</comments>
@@ -165,10 +182,10 @@ function buildRss(req: Request, provider: Provider, items: SearchItem[]): string
     <torznab:attr name="seeders" value="${it.seeds}" />
     <torznab:attr name="peers" value="${peers}" />
   </item>`;
-    })
-    .join('\n');
+      })
+      .join('\n');
 
-  return `<?xml version="1.0" encoding="UTF-8"?>
+    return `<?xml version="1.0" encoding="UTF-8"?>
 <rss version="2.0" xmlns:atom="http://www.w3.org/2005/Atom" xmlns:torznab="http://torznab.com/schemas/2015/feed">
 <channel>
   <atom:link href="${xmlEscape(selfUrl)}" rel="self" type="application/rss+xml" />
@@ -176,69 +193,72 @@ function buildRss(req: Request, provider: Provider, items: SearchItem[]): string
 ${rows}
 </channel>
 </rss>`;
-}
-
-const app = express();
-
-function getProvider(req: Request, res: Response): Provider | null {
-  const provider = providerMap[req.params.provider as string];
-  if (!provider) {
-    res.status(404).send(`Unknown provider: ${req.params.provider}`);
-    return null;
-  }
-  return provider;
-}
-
-app.get('/:provider/api', async (req: Request, res: Response) => {
-  const provider = getProvider(req, res);
-  if (!provider) return;
-
-  const t = queryString(req.query.t);
-
-  if (t === 'caps') {
-    res.type('application/xml').send(capsXml(provider));
-    return;
   }
 
-  if (!checkKey(req, res)) return;
+  const app = express();
 
-  if (t === 'search' || t === 'movie-search' || t === 'tv-search') {
-    const q = queryString(req.query.q) || '';
-    try {
-      const items = await search(provider, q);
-      res.type('application/xml').send(buildRss(req, provider, items));
-    } catch (err) {
-      console.error(`${provider.id} search error:`, err);
-      res.status(500).send(`Search failed: ${err instanceof Error ? err.message : String(err)}`);
+  function getProvider(req: Request, res: Response): Provider | null {
+    const provider = providers[req.params.provider as string];
+    if (!provider) {
+      res.status(404).send(`Unknown provider: ${req.params.provider}`);
+      return null;
     }
-    return;
+    return provider;
   }
 
-  res.status(400).send(`Unsupported t=${t}`);
-});
+  app.get('/:provider/api', async (req: Request, res: Response) => {
+    const provider = getProvider(req, res);
+    if (!provider) return;
 
-app.get('/:provider/download', async (req: Request, res: Response) => {
-  const provider = getProvider(req, res);
-  if (!provider) return;
+    const t = queryString(req.query.t);
 
-  if (!checkKey(req, res)) return;
+    if (t === 'caps') {
+      res.type('application/xml').send(capsXml(provider));
+      return;
+    }
 
-  const idParam = queryString(req.query.id);
-  const id = idParam ? parseInt(idParam, 10) : null;
-  const url = queryString(req.query.url) || null;
-  if (!id && !url) {
-    res.status(400).send('Missing id or url param');
-    return;
-  }
+    if (!checkKey(req, res)) return;
 
-  try {
-    const magnet = await resolveMagnet(provider, { id, url });
-    res.redirect(302, magnet);
-  } catch (err) {
-    console.error(`${provider.id} download error:`, err);
-    res.status(500).send(`Download failed: ${err instanceof Error ? err.message : String(err)}`);
-  }
-});
+    if (t === 'search' || t === 'movie-search' || t === 'tv-search') {
+      const q = queryString(req.query.q) || '';
+      try {
+        const items = await search(provider, q);
+        res.type('application/xml').send(buildRss(req, provider, items));
+      } catch (err) {
+        console.error(`${provider.id} search error:`, err);
+        res.status(500).send(`Search failed: ${err instanceof Error ? err.message : String(err)}`);
+      }
+      return;
+    }
+
+    res.status(400).send(`Unsupported t=${t}`);
+  });
+
+  app.get('/:provider/download', async (req: Request, res: Response) => {
+    const provider = getProvider(req, res);
+    if (!provider) return;
+
+    if (!checkKey(req, res)) return;
+
+    const idParam = queryString(req.query.id);
+    const id = idParam ? parseInt(idParam, 10) : null;
+    const url = queryString(req.query.url) || null;
+    if (!id && !url) {
+      res.status(400).send('Missing id or url param');
+      return;
+    }
+
+    try {
+      const magnet = await resolveMagnet(provider, { id, url });
+      res.redirect(302, magnet);
+    } catch (err) {
+      console.error(`${provider.id} download error:`, err);
+      res.status(500).send(`Download failed: ${err instanceof Error ? err.message : String(err)}`);
+    }
+  });
+
+  return app;
+}
 
 // Visits a provider's keep-alive URL so its clearance cookie stays fresh.
 // gotoCleared() already solves only when challenged, so this is cheap while
@@ -281,20 +301,29 @@ function scheduleKeepAlive(): void {
   keepAliveTimer = setTimeout(tick, 5000);
 }
 
-app.listen(PORT, () => {
-  console.log(`Torznab server listening on http://localhost:${PORT}`);
-  for (const provider of Object.values(providerMap)) {
-    console.log(`  ${provider.name}: http://localhost:${PORT}/${provider.id}/api`);
-  }
-  console.log(`API key: ${API_KEY}${API_KEY === 'changeme' ? ' (set API_KEY env var to something real!)' : ''}`);
-  scheduleKeepAlive();
-});
-
 async function shutdown(): Promise<void> {
   console.log('Shutting down, closing browser...');
   if (keepAliveTimer) clearTimeout(keepAliveTimer);
   await closeBrowser();
   process.exit(0);
 }
-process.on('SIGINT', shutdown);
-process.on('SIGTERM', shutdown);
+
+// Only actually start listening (and register process-level signal handlers)
+// when this file is run directly - e.g. `node dist/server.js`, which is what
+// the Dockerfile's CMD does. Importing createApp() from a test must not have
+// these side effects.
+const isMain = import.meta.url === `file://${process.argv[1]}`;
+if (isMain) {
+  const app = createApp(providerMap);
+  app.listen(PORT, () => {
+    console.log(`Torznab server listening on http://localhost:${PORT}`);
+    for (const provider of Object.values(providerMap)) {
+      console.log(`  ${provider.name}: http://localhost:${PORT}/${provider.id}/api`);
+    }
+    console.log(`API key: ${API_KEY}${API_KEY === 'changeme' ? ' (set API_KEY env var to something real!)' : ''}`);
+    scheduleKeepAlive();
+  });
+
+  process.on('SIGINT', shutdown);
+  process.on('SIGTERM', shutdown);
+}

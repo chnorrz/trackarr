@@ -228,6 +228,21 @@ it handles Cloudflare for you.
 
 ---
 
+## Development
+
+```bash
+npm run typecheck   # tsc --noEmit
+npm test            # builds, then runs the test suite
+```
+
+The test suite needs no browser, no Docker, and no network access - provider
+tests run against hand-built fixtures in `test/fixtures/`, and the server is
+tested via dependency injection rather than the real process. See NOTES.md
+section 10 for how the mocking works and how to add tests for a new
+provider.
+
+---
+
 ## Limitations
 
 - **Search returns the first page only.** No pagination.

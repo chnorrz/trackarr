@@ -12,11 +12,27 @@ env:
   IMAGE_NAME: ${{ github.repository }}
 
 jobs:
+  # Gates the release build on the same test suite ci.yml runs on every
+  # push/PR - defense in depth in case a release is ever cut without CI
+  # having run against that exact commit (e.g. from a stale branch).
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm run typecheck
+      - run: npm test
+
   # Each architecture builds on a native runner and pushes an untagged image
   # by digest. Building arm64 under QEMU would work but is painfully slow
   # here - the image downloads ~650MB of Camoufox and compiles better-sqlite3
   # natively. Free arm64 runners require the repo to be public.
   build:
+    needs: test
     strategy:
       fail-fast: false
       matrix:

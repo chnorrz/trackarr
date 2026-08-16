@@ -1,12 +1,14 @@
 {
   "name": "trackarr",
-  "version": "1.0.0",
+  "version": "0.1.0-alpha8",
   "private": true,
   "type": "module",
   "main": "dist/server.js",
   "scripts": {
     "build": "tsc",
-    "start": "node dist/server.js"
+    "start": "node dist/server.js",
+    "test": "npm run build && node --experimental-test-module-mocks --test \"test/**/*.test.ts\"",
+    "typecheck": "tsc --noEmit -p tsconfig.test.json"
   },
   "dependencies": {
     "camoufox-js": "^0.12.0",
