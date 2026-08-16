@@ -144,6 +144,10 @@ async function resolveMagnet({ id }) {
 export default {
   id: 'ext-to',
   name: 'ext.to',
+  // Background warm-up target. Must be a real listing page: bare /browse/
+  // doesn't render searchPageToken, and the challenge lives on the listing
+  // path rather than the homepage.
+  keepAlive: { url: `${BASE}/browse/?q=yify` },
   search,
   resolveMagnet
 };

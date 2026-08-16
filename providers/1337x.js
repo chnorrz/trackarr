@@ -97,6 +97,9 @@ async function resolveMagnet({ url }) {
 export default {
   id: '1337x',
   name: '1337x',
+  // Landing page is enough here - the challenge isn't path-specific, and it's
+  // a cheaper page than a search. Needs the same proxy as everything else.
+  keepAlive: { url: `${BASE}/`, proxy: '1337x' },
   search,
   resolveMagnet
 };

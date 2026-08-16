@@ -18,13 +18,25 @@
  */
 
 import express from 'express';
-import { closeBrowser } from './lib/browser.js';
+import { closeBrowser, gotoCleared } from './lib/browser.js';
 import { CATEGORIES_XML } from './lib/categories.js';
 import { TTLCache } from './lib/cache.js';
 import { providerMap } from './providers/index.js';
 
 const PORT = process.env.PORT || 9117;
 const API_KEY = process.env.API_KEY || 'changeme';
+
+// Solving a challenge takes ~20-30s. Landing that inside a Prowlarr search
+// risks the search timing out, so a background task periodically visits each
+// provider to keep its Cloudflare clearance warm and move that cost off the
+// request path. It only *solves* when actually challenged - with a valid
+// cookie the visit is cheap.
+//
+// The interval is a guess: the real clearance lifetime was never measured,
+// only estimated at roughly 15-30 min. Tune with the env var, 0 disables.
+const KEEPALIVE_INTERVAL_MS = process.env.KEEPALIVE_INTERVAL_MS === undefined
+  ? 15 * 60 * 1000
+  : Number(process.env.KEEPALIVE_INTERVAL_MS);
 
 // Search results change (new uploads, seed counts) so keep the cache short.
 // Magnet info hashes never change for a given torrent, so cache those much
@@ -194,16 +206,59 @@ app.get('/:provider/download', async (req, res) => {
   }
 });
 
+// Visits a provider's keep-alive URL so its clearance cookie stays fresh.
+// gotoCleared() already solves only when challenged, so this is cheap while
+// the cookie is still valid.
+async function warmProvider(provider) {
+  const ka = provider.keepAlive;
+  if (!ka) return;
+  const started = Date.now();
+  try {
+    const page = await gotoCleared(ka.url, ka.proxy ? { proxy: ka.proxy } : {});
+    await page.close();
+    console.error(`[keepalive] ${provider.id} ok (${Date.now() - started}ms)`);
+  } catch (err) {
+    // Never throw: a tracker being unreachable must not kill the scheduler.
+    console.error(`[keepalive] ${provider.id} failed: ${err.message}`);
+  }
+}
+
+let keepAliveTimer = null;
+
+function scheduleKeepAlive() {
+  if (!KEEPALIVE_INTERVAL_MS) {
+    console.log('Keep-alive disabled (KEEPALIVE_INTERVAL_MS=0)');
+    return;
+  }
+  console.log(`Keep-alive every ~${Math.round(KEEPALIVE_INTERVAL_MS / 60000)} min`);
+
+  const tick = async () => {
+    // Sequential, not parallel: solves are serialised anyway (XTEST input is
+    // global), and this keeps at most one browser page open at a time.
+    for (const provider of Object.values(providerMap)) {
+      await warmProvider(provider);
+    }
+    // +/-20% jitter, so we're not hitting the trackers on an exact schedule.
+    const next = KEEPALIVE_INTERVAL_MS * (0.8 + Math.random() * 0.4);
+    keepAliveTimer = setTimeout(tick, next);
+  };
+
+  // Warm shortly after boot so the first real search doesn't pay for a solve.
+  keepAliveTimer = setTimeout(tick, 5000);
+}
+
 app.listen(PORT, () => {
   console.log(`Torznab server listening on http://localhost:${PORT}`);
   for (const provider of Object.values(providerMap)) {
     console.log(`  ${provider.name}: http://localhost:${PORT}/${provider.id}/api`);
   }
   console.log(`API key: ${API_KEY}${API_KEY === 'changeme' ? ' (set API_KEY env var to something real!)' : ''}`);
+  scheduleKeepAlive();
 });
 
 async function shutdown() {
   console.log('Shutting down, closing browser...');
+  if (keepAliveTimer) clearTimeout(keepAliveTimer);
   await closeBrowser();
   process.exit(0);
 }

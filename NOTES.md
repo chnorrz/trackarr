@@ -435,28 +435,46 @@ cf_clearance hides solver breakage entirely.
 
 ---
 
-## 9. Open issues
+## 9. Keep-alive
 
-**Concurrent solves are unserialised.** XTEST input is global to the display,
-so two simultaneous solves fight over one virtual mouse. Low risk under
-Prowlarr's polling, real under load.
+A solve costs ~20 s. Landing that inside a Prowlarr search risks the search
+timing out, so a background task periodically visits each provider's
+`keepAlive.url` to keep its clearance warm.
 
-An attempt to add a mutex was **reverted** — the supporting changes
-(viewport pinning, `bringToFront`, reworked widget detection) regressed
-auto-solve to failing every time. Ruled out individually as the cause: click
-coordinates, `bringToFront`, `page.content()` polling, the reload, and
-warm-up ordering.
+It **checks rather than solves**: `gotoCleared()` only solves when actually
+challenged, so a visit with a valid cookie is cheap. Measured on a fresh
+volume with a 1 min interval:
 
-**Prime remaining suspect:** `xdo()` swallows errors. If the warm-up movement
-silently no-ops, the widget stays on "Verifying..." and the click lands on
-nothing — exactly the observed symptom. Verify the mouse actually moves:
+| Tick | ext.to | 1337x | Solve? |
+|---|---|---|---|
+| boot warm-up | 19.3 s | 17.3 s | yes, one each |
+| later ticks | 1.7 s / 2.3 s | 0.75 s / 0.87 s | no |
 
-```js
-execFileSync('xdotool', ['getmouselocation'], { env: { ...process.env, DISPLAY: ':99' } })
-```
+Searches afterwards ran in **1.9 s / 2.4 s with zero solves** on the request
+path, versus ~19 s cold.
+
+`KEEPALIVE_INTERVAL_MS` (default 15 min, `0` disables) with ±20% jitter so
+we're not hitting trackers on an exact schedule. Providers opt in by
+exporting `keepAlive: { url, proxy? }`.
+
+**The interval is a guess.** The real clearance lifetime was never measured —
+only estimated at roughly 15–30 min. If challenges start appearing on the
+request path, lower it.
+
+---
+
+## 10. Open issues
 
 **Brittleness.** The solver depends on the widget DOM shape and the `+22px`
 checkbox offset. Cloudflare can invalidate either at any time. Expect it, and
 check a screenshot first when it breaks.
 
 **No pagination** — search returns page 1 only. Deliberate MVP scope.
+
+**`xdo()` swallows errors.** Not currently causing problems, but if the
+warm-up movement ever silently no-ops, the widget stays on "Verifying..." and
+the click lands on nothing. Verify the mouse actually moves:
+
+```js
+execFileSync('xdotool', ['getmouselocation'], { env: { ...process.env, DISPLAY: ':99' } })
+```

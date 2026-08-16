@@ -58,6 +58,10 @@ Prowlarr  ──HTTP──>  torznab-bridge  ──> headless Firefox (Camoufox)
   50 results eagerly would mean 50 page loads per search.
 - **Results are cached** (searches 5 min, magnets 1 h) to keep traffic to the
   trackers low.
+- **Clearance is kept warm in the background.** Solving a challenge takes
+  ~20 s, and paying that during a Prowlarr search can make the search time
+  out. A periodic task visits each tracker to keep the cookie fresh, so
+  searches stay in the low seconds.
 
 `.cf-cookies.json` in the data volume holds the Cloudflare clearance, so
 restarts don't trigger a fresh challenge.
@@ -139,6 +143,7 @@ All via environment variables.
 | `DATA_DIR` | `/data` | Where the Cloudflare cookie is persisted |
 | `SEARCH_CACHE_TTL_MS` | `300000` | Search cache lifetime (5 min) |
 | `MAGNET_CACHE_TTL_MS` | `3600000` | Magnet cache lifetime (1 h) |
+| `KEEPALIVE_INTERVAL_MS` | `900000` | Background Cloudflare warm-up (15 min). `0` disables |
 | `PROXY_URL` | *(unset)* | Upstream proxy, see below. Unset = direct |
 | `PROXY_PROVIDERS` | *(unset)* | Which providers use the proxy. Empty = none |
 
