@@ -41,15 +41,16 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 COPY package.json package-lock.json ./
 RUN npm ci --omit=dev
 
+# Bake the Camoufox browser binary into the image at build time (not into
+# the ephemeral home dir) so containers don't need to download ~300MB on
+# every cold start. Kept ahead of the source COPYs so editing source
+# doesn't invalidate this layer and re-download the browser every build.
+ENV CAMOUFOX_INSTALL_DIR=/opt/camoufox
+RUN npx camoufox-js fetch
+
 COPY lib ./lib
 COPY providers ./providers
 COPY server.js get-magnet.js ./
-
-# Bake the Camoufox browser binary into the image at build time (not into
-# the ephemeral home dir) so containers don't need to download ~300MB on
-# every cold start.
-ENV CAMOUFOX_INSTALL_DIR=/opt/camoufox
-RUN npx camoufox-js fetch
 
 ENV DATA_DIR=/data
 ENV PORT=9117

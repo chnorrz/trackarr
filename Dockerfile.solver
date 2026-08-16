@@ -1,0 +1,32 @@
+# Interactive Cloudflare solver image. Built on top of the server image so
+# it reuses the already-downloaded Camoufox binary instead of pulling it
+# again.
+#
+# Runs a real (non-headless) browser on a virtual X display and exposes
+# that display over VNC, so a human can click the Turnstile checkbox once.
+# The resulting cf_clearance cookie is bound to this container's Linux
+# network stack, which is what makes it usable by the server container
+# (a cookie solved on the macOS host is rejected here).
+FROM ext-to-torznab:test
+
+# DEBIAN_FRONTEND=noninteractive: x11vnc pulls in tzdata, which otherwise
+# blocks the build on an interactive timezone prompt.
+RUN DEBIAN_FRONTEND=noninteractive apt-get update && \
+    DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+    x11vnc \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY solve.js ./
+
+ENV DISPLAY=:99
+EXPOSE 5900
+
+# Xvfb provides the display, x11vnc shares it, then the solver drives a
+# visible browser on it. -nopw is fine because the port is only published
+# to localhost for the duration of a solve.
+CMD ["bash", "-c", "\
+Xvfb :99 -screen 0 1280x900x24 -ac +extension GLX & \
+sleep 2 && \
+x11vnc -display :99 -forever -nopw -shared -quiet & \
+sleep 1 && \
+node solve.js"]
