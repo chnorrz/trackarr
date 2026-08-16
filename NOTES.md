@@ -20,7 +20,7 @@ one process (shared browser + cache).
 | `lib/cache.js` | TTL cache (search 5 min, magnets 1 h) |
 | `lib/categories.js` | Shared Torznab category ids |
 | `providers/*.js` | Per-tracker `{ id, name, search(q), resolveMagnet({id,url}) }` |
-| `tools/ipv6-proxy.js` | CONNECT proxy, runs on the **macOS host** (see 1337x) |
+| `tools/tinyproxy.conf` | Proxy config, runs on the **macOS host** (see 1337x) |
 | `get-magnet.js` | Standalone CLI, uses ext.to's *detail-page* flow (legacy) |
 
 Adding a tracker: write `providers/<id>.js`, register in
@@ -114,25 +114,51 @@ enabling IPv6 in the Docker daemon cannot help. The VM simply can't route it.
 A 1006 page has **no widget**, so the Turnstile auto-solver is irrelevant
 here. Different failure, different fix.
 
-**Solution:** `tools/ipv6-proxy.js` runs on the macOS host (which has working
-IPv6) and the container tunnels through it. Because HTTP `CONNECT` only pipes
-bytes, TLS stays end-to-end and the browser's fingerprint is unchanged — only
-the egress address differs. `net.connect({ family: 6 })` is required; Node's
-default Happy Eyeballs often picks the banned IPv4.
+**Solution:** run **tinyproxy** on the macOS host (which has working IPv6) and
+tunnel the container through it. Because HTTP `CONNECT` only pipes bytes, TLS
+stays end-to-end and the browser's fingerprint is unchanged — only the egress
+address differs.
+
+No IPv6-specific flag is needed: tinyproxy uses the system resolver, and macOS
+follows RFC 6724 (IPv6 first) — the same reason a normal browser here reaches
+1337x fine. (An earlier hand-rolled Node proxy *did* need an explicit
+`family: 6`, because Node's Happy Eyeballs kept picking the banned IPv4. That
+is a Node quirk, not a system one.)
 
 ```bash
-# on the host - must outlive the shell, hence launchctl
-launchctl submit -l ext-ipv6-proxy -o /tmp/proxy.log \
-  -- "$(which node)" /path/to/tools/ipv6-proxy.js
+brew install tinyproxy
+
+# must outlive the shell, hence launchctl
+launchctl submit -l ext-tinyproxy -o /tmp/tp.log -e /tmp/tp.err \
+  -- "$(which tinyproxy)" -d -c /path/to/tools/tinyproxy.conf
 
 # container reaches the host at host.docker.internal (192.168.5.2 under Colima)
 docker run ... -e PROXY_URL=http://192.168.5.2:8888 ...
 ```
 
-Providers opt in per request: `gotoCleared(url, { proxy: true })`. Falls back
-to a direct connection when `PROXY_URL` is unset. Only the direct context's
-cookies are persisted, so the proxied context can't clobber ext.to's
+`tools/tinyproxy.conf` restricts access to localhost plus the Docker/Colima
+ranges — without those `Allow` lines it would be an open relay on the LAN.
+
+### Proxy configuration (env)
+
+| Var | Meaning |
+|---|---|
+| `PROXY_URL` | e.g. `http://192.168.5.2:8888`. **Unset = proxy disabled**, everything direct. |
+| `PROXY_PROVIDERS` | Comma-separated provider ids, overriding which use it. Unset = whichever ask in code. Set but **empty = none** (kill switch). |
+
+Providers ask per request with `gotoCleared(url, { proxy: '<id>' })`; passing
+the id is what lets `PROXY_PROVIDERS` target them. A provider asking for a
+proxy that isn't configured silently goes direct. Only the direct context's
+cookies are persisted, so a proxied context can't clobber ext.to's
 `cf_clearance`.
+
+Verified behaviour:
+
+| Config | 1337x | ext.to |
+|---|---|---|
+| `PROXY_URL` set, `PROXY_PROVIDERS` unset | 20 results via proxy | 50, direct |
+| `PROXY_URL` set, `PROXY_PROVIDERS=` | hard blocked (direct) | unaffected |
+| no `PROXY_URL` | hard blocked (direct) | unaffected |
 
 ---
 

@@ -24,10 +24,10 @@ function directText($el) {
 }
 
 // 1337x has banned our IPv4 address but not our IPv6 one, and the container
-// has no IPv6 of its own - so route through the host proxy (see
-// tools/ipv6-proxy.js). Harmlessly falls back to a direct connection when
-// PROXY_URL isn't set.
-const VIA_PROXY = { proxy: true };
+// has no IPv6 of its own - so ask to route through the host proxy (see
+// NOTES.md). Passing the provider id lets PROXY_PROVIDERS target it. Falls
+// back to a direct connection when no proxy is configured.
+const VIA_PROXY = { proxy: '1337x' };
 
 async function search(q) {
   const searchUrl = `${BASE}/search/${encodeURIComponent(q)}/1/`;
