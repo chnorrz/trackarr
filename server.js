@@ -81,6 +81,21 @@ ${CATEGORIES_XML}
 }
 
 async function search(provider, q) {
+  // Prowlarr's "Test" button (and likely periodic health checks) queries
+  // with an empty q, and requires a non-empty result set to let the indexer
+  // be saved - an empty-but-valid response isn't enough (confirmed: Save
+  // fails with a red exclamation mark otherwise). Neither provider has a
+  // real "browse everything" mode for a blank query - ext.to's /browse/?q=
+  // with no query doesn't render a results listing at all (see NOTES.md) -
+  // so substitute a generic term already proven safe/reliable against both
+  // providers throughout this project's testing, rather than either
+  // returning nothing (which Prowlarr rejects) or fabricating a fake item
+  // (which would fail differently and more confusingly the moment anything
+  // tried to resolve its magnet link).
+  if (!q || !q.trim()) {
+    q = 'yify';
+  }
+
   const cacheKey = `${provider.id}:${q.toLowerCase().trim()}`;
   const cached = searchCache.get(cacheKey);
   if (cached) {
