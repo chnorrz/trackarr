@@ -24,9 +24,13 @@ WORKDIR /app
 # fonts-liberation/fonts-dejavu-core/fonts-freefont-ttf: the base image has
 # very few fonts installed (~50 vs ~2800 font faces on a real desktop) -
 # an abnormally small font list is another common headless-bot signal.
-RUN apt-get update && apt-get install -y --no-install-recommends \
+# xdotool drives the Turnstile checkbox at the X server level - see
+# autoSolveChallenge() in lib/browser.js for why Playwright's own mouse API
+# is not sufficient.
+RUN DEBIAN_FRONTEND=noninteractive apt-get update && \
+    DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
     python3 make g++ \
-    xvfb libgl1-mesa-dri libglx-mesa0 \
+    xvfb xdotool libgl1-mesa-dri libglx-mesa0 \
     fonts-liberation fonts-dejavu-core fonts-freefont-ttf fontconfig \
     && rm -rf /var/lib/apt/lists/* \
     # fc-list under-counts fonts here due to a fontconfig+overlayfs false
@@ -54,7 +58,11 @@ COPY server.js get-magnet.js ./
 
 ENV DATA_DIR=/data
 ENV PORT=9117
+# The browser runs non-headless against this display. It must be a real
+# size: Camoufox's built-in 'virtual' mode uses a 1x1 screen, which leaves
+# nowhere to render or click the Turnstile widget.
+ENV DISPLAY=:99
 VOLUME ["/data"]
 EXPOSE 9117
 
-CMD ["node", "server.js"]
+CMD ["bash", "-c", "Xvfb :99 -screen 0 1280x900x24 -ac +extension GLX & sleep 2 && exec node server.js"]
