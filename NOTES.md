@@ -21,7 +21,6 @@ one process (shared browser + cache).
 | `lib/categories.js` | Shared Torznab category ids |
 | `providers/*.js` | Per-tracker `{ id, name, search(q), resolveMagnet({id,url}) }` |
 | `tools/tinyproxy.conf` | Proxy config, runs on the **macOS host** (see 1337x) |
-| `get-magnet.js` | Standalone CLI, uses ext.to's *detail-page* flow (legacy) |
 
 Adding a tracker: write `providers/<id>.js`, register in
 `providers/index.js`. Nothing else needs touching.
@@ -57,7 +56,7 @@ maps to "Other".
 
 Two different flows exist. Use the search one.
 
-| | Search flow (used) | Detail flow (legacy, `get-magnet.js`) |
+| | Search flow (used) | Detail flow (exists, unused) |
 |---|---|---|
 | Endpoint | `/ajax/getSearchMagnet.php` | `/ajax/getTorrentMagnet.php` |
 | Token | `window.searchPageToken` | `window.pageToken` |

@@ -1,9 +1,9 @@
 {
-  "name": "ext.to-magnet-fetcher",
+  "name": "trackarr",
   "version": "1.0.0",
   "private": true,
   "type": "module",
-  "main": "get-magnet.js",
+  "main": "server.js",
   "dependencies": {
     "camoufox-js": "^0.12.0",
     "cheerio": "^1.0.0",

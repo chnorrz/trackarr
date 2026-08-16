@@ -54,7 +54,7 @@ RUN npx camoufox-js fetch
 
 COPY lib ./lib
 COPY providers ./providers
-COPY server.js get-magnet.js ./
+COPY server.js ./
 
 ENV DATA_DIR=/data
 ENV PORT=9117
