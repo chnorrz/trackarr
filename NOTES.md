@@ -442,6 +442,45 @@ curl -sD- -o/dev/null "localhost:9117/ext-to/download?apikey=k&id=<id>"         
 Use a **fresh volume** to exercise the cold-start solve; an existing
 cf_clearance hides solver breakage entirely.
 
+### Before calling a new provider done: verify `testQuery` actually returns results
+
+Prowlarr's Test button (and Save - Save genuinely fails, red exclamation
+mark, if Test's result set is empty) searches with a **blank** `q`. No
+provider has a real "browse everything" mode for that, so `server.js`
+substitutes `provider.testQuery` (falling back to `'yify'` with a loud
+`console.error` warning if a provider doesn't set one).
+
+**This has already broken twice for the same underlying reason:** a
+provider's search term needs to actually be a good fit for what that
+tracker carries. `'yify'` is a movie-release-group tag - it silently
+returned **zero** results on EZTV (TV-only) even though the blank-query
+substitution mechanism itself was working correctly, reproducing the exact
+"Query successful, but no results were returned from your indexer"
+Prowlarr error that mechanism exists to prevent. It looks like a Prowlarr
+bug or a scraping bug; it's neither.
+
+So: **before considering a new provider finished, run its `testQuery`
+directly and confirm it returns a non-trivial result count**, the same way
+you'd smoke-test anything else here:
+
+```bash
+node -e "
+import('./providers/<id>.js').then(async ({default: p}) => {
+  const items = await p.search(p.testQuery);
+  console.log(p.testQuery, '->', items.length, 'results');
+  if (items[0]) console.log('sample:', items[0].title);
+  process.exit(0);
+});
+"
+```
+
+Prefer a **release-group tag over a specific title** where the tracker's
+content supports it (`'yify'` for general/movie trackers, `'MeGusta'` for
+EZTV's TV-only catalog) - broader, more perpetual hit surface than betting
+on one show/movie staying available forever. A specific well-known title
+(e.g. a long-running show name) is an acceptable fallback if the tracker
+has no equivalent tagging convention.
+
 ---
 
 ## 9. Keep-alive

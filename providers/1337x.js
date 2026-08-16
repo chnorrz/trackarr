@@ -100,6 +100,7 @@ export default {
   // Landing page is enough here - the challenge isn't path-specific, and it's
   // a cheaper page than a search. Needs the same proxy as everything else.
   keepAlive: { url: `${BASE}/`, proxy: '1337x' },
+  testQuery: 'yify',
   search,
   resolveMagnet
 };

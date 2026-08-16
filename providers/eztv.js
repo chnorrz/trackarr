@@ -127,6 +127,7 @@ export default {
   id: 'eztv',
   name: 'EZTV',
   keepAlive: { url: `${BASE}/` },
+  testQuery: 'MeGusta',
   search,
   resolveMagnet
 };

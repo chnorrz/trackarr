@@ -84,16 +84,24 @@ async function search(provider, q) {
   // Prowlarr's "Test" button (and likely periodic health checks) queries
   // with an empty q, and requires a non-empty result set to let the indexer
   // be saved - an empty-but-valid response isn't enough (confirmed: Save
-  // fails with a red exclamation mark otherwise). Neither provider has a
-  // real "browse everything" mode for a blank query - ext.to's /browse/?q=
-  // with no query doesn't render a results listing at all (see NOTES.md) -
-  // so substitute a generic term already proven safe/reliable against both
-  // providers throughout this project's testing, rather than either
+  // fails with a red exclamation mark otherwise). No provider has a real
+  // "browse everything" mode for a blank query, so substitute a term proven
+  // to return results for THIS SPECIFIC provider, rather than either
   // returning nothing (which Prowlarr rejects) or fabricating a fake item
   // (which would fail differently and more confusingly the moment anything
   // tried to resolve its magnet link).
+  //
+  // This must be per-provider, not a single shared default: 'yify' is a
+  // movie-release-group tag with zero hits on a TV-only tracker like EZTV,
+  // which silently reproduced the exact same Prowlarr "no results" failure
+  // this substitution was meant to fix in the first place (see NOTES.md -
+  // this class of bug is why testQuery is checked before shipping a new
+  // provider now, not just assumed to inherit a working default).
   if (!q || !q.trim()) {
-    q = 'yify';
+    if (!provider.testQuery) {
+      console.error(`[warn] ${provider.id} has no testQuery set, falling back to '' (empty) - verify this actually returns results for this provider.`);
+    }
+    q = provider.testQuery || '';
   }
 
   const cacheKey = `${provider.id}:${q.toLowerCase().trim()}`;

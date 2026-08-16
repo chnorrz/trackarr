@@ -148,6 +148,7 @@ export default {
   // doesn't render searchPageToken, and the challenge lives on the listing
   // path rather than the homepage.
   keepAlive: { url: `${BASE}/browse/?q=yify` },
+  testQuery: 'yify',
   search,
   resolveMagnet
 };

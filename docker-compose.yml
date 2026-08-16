@@ -8,8 +8,8 @@
 #      that name:
 #      docker inspect -f '{{range $k,$v := .NetworkSettings.Networks}}{{$k}} {{end}}' prowlarr
 #   2. docker compose up -d
-#   3. In Prowlarr, add each provider as a generic Torznab indexer:
-#        URL: http://trackarr:9117/ext-to   (and /1337x)
+#   3. In Prowlarr, add each provider as a generic Torznab indexer. Example:
+#        URL: http://trackarr:9117/ext-to
 #        API Key: whatever you set below
 #
 # If your host doesn't need the IPv6 workaround (only 1337x does, and only if
@@ -25,7 +25,7 @@ services:
     environment:
       # CHANGE THIS - generate your own, e.g. `openssl rand -hex 24`, and use
       # the same value when adding trackarr as an indexer in Prowlarr.
-      API_KEY: f46141cb7d6313b0008defa980ed122710a1da1b8c20ed6a
+      API_KEY: changeme
       PROXY_URL: http://tinyproxy:8888
       # PROXY_URL alone does nothing - no provider is proxied unless it's
       # also explicitly named here. Not set by default since needing this at
