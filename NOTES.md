@@ -101,7 +101,8 @@ Much lighter protection, and **no cookie needed**.
 1337x has banned our **IPv4** address; our IPv6 is clean. It therefore works
 in a desktop browser but not from the container, and needs the host proxy —
 see [section 4](#4-ipv4-bans-and-the-ipv6-proxy). It requests this itself via
-`gotoCleared(url, { proxy: '1337x' })`, so it only needs `PROXY_URL` set.
+`gotoCleared(url, { proxy: '1337x' })`, but that alone isn't enough - it also
+needs `1337x` listed in `PROXY_PROVIDERS`, which isn't set by default.
 
 ---
 
@@ -180,7 +181,7 @@ launchctl submit -l ext-tinyproxy -o /tmp/tp.log -e /tmp/tp.err \
 
 # host address from inside a container: 192.168.5.2 under Colima,
 # host.docker.internal elsewhere
-docker run ... -e PROXY_URL=http://192.168.5.2:8888 ...
+docker run ... -e PROXY_URL=http://192.168.5.2:8888 -e PROXY_PROVIDERS=1337x ...
 ```
 
 `tools/tinyproxy.conf` restricts access to localhost plus the Docker/Colima
@@ -191,11 +192,14 @@ ranges. Without those `Allow` lines it is an open relay on the LAN.
 | Var | Meaning |
 |---|---|
 | `PROXY_URL` | e.g. `http://192.168.5.2:8888`. **Unset = proxy disabled**, everything direct. |
-| `PROXY_PROVIDERS` | Comma-separated provider ids, overriding which use it. Unset = whichever ask in code. Set but **empty = none** (kill switch, no code change needed). |
+| `PROXY_PROVIDERS` | Comma-separated provider ids allowed to use it. **Unset or empty = none.** |
 
-Providers opt in per request with `gotoCleared(url, { proxy: '<id>' })`;
-passing the id is what lets `PROXY_PROVIDERS` target them. Asking for a proxy
-that isn't configured silently falls back to direct.
+Deliberately opt-in, not opt-out: a provider asking for the proxy in code
+(`gotoCleared(url, { proxy: '<id>' })`) is not enough on its own - it must
+also be named in `PROXY_PROVIDERS`, or it goes direct regardless. `PROXY_URL`
+alone does nothing. Not baked into `docker-compose.yml`'s defaults either -
+needing this at all is specific to whichever tracker banned your IP, not
+something every deployment should silently opt into.
 
 Only the direct context's cookies are persisted, so a proxied context cannot
 clobber ext.to's `cf_clearance`.
@@ -204,11 +208,17 @@ clobber ext.to's `cf_clearance`.
 the egress IP (section 5), so routing ext.to through the proxy would
 invalidate its stored cookie.
 
-Verified behaviour:
+`proxyEnabledFor()`'s matching logic is covered by a standalone unit test (6
+cases: unset, empty, explicit match, non-match, no `PROXY_URL` regardless of
+`PROXY_PROVIDERS`, and a multi-value list) - all passing confirms the
+allow-list mechanism itself is correct. The original end-to-end Docker
+verification below predates this change (back when unset meant "whichever
+providers ask in code"), so it demonstrates the proxy path works at all, not
+this specific default.
 
 | Config | 1337x | ext.to |
 |---|---|---|
-| `PROXY_URL` set, `PROXY_PROVIDERS` unset | 20 results via proxy | 50, direct |
+| `PROXY_URL` set, `PROXY_PROVIDERS` unset (old default) | 20 results via proxy | 50, direct |
 | `PROXY_URL` set, `PROXY_PROVIDERS=` | hard blocked (direct) | unaffected |
 | no `PROXY_URL` | hard blocked (direct) | unaffected |
 

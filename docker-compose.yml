@@ -26,9 +26,11 @@ services:
       # CHANGE THIS - generate your own, e.g. `openssl rand -hex 24`, and use
       # the same value when adding trackarr as an indexer in Prowlarr.
       API_KEY: f46141cb7d6313b0008defa980ed122710a1da1b8c20ed6a
-      # Only 1337x asks for this (see providers/1337x.js); ext.to and any
-      # future direct-working provider are unaffected either way.
       PROXY_URL: http://tinyproxy:8888
+      # PROXY_URL alone does nothing - no provider is proxied unless it's
+      # also explicitly named here. Not set by default since needing this at
+      # all is specific to your situation (see NOTES.md section 4) - add it
+      # yourself, e.g. PROXY_PROVIDERS: "1337x"
     volumes:
       - trackarr-data:/data
     networks:

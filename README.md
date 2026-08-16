@@ -172,7 +172,7 @@ All via environment variables.
 | `MAGNET_CACHE_TTL_MS` | `3600000` | Magnet cache lifetime (1 h) |
 | `KEEPALIVE_INTERVAL_MS` | `900000` | Background Cloudflare warm-up (15 min). `0` disables |
 | `PROXY_URL` | *(unset)* | Upstream proxy, see below. Unset = direct |
-| `PROXY_PROVIDERS` | *(unset)* | Which providers use the proxy. Empty = none |
+| `PROXY_PROVIDERS` | *(unset)* | Comma-separated provider ids allowed to use the proxy. **Unset or empty = none** - opt-in, not opt-out |
 
 ### Proxy (optional)
 
@@ -183,11 +183,14 @@ works. A container usually has no IPv6 of its own, so it needs to borrow the hos
 brew install tinyproxy    # or apt install tinyproxy
 tinyproxy -d -c tools/tinyproxy.conf
 
-docker run ... -e PROXY_URL=http://192.168.5.2:8888 ...
+docker run ... -e PROXY_URL=http://192.168.5.2:8888 -e PROXY_PROVIDERS=1337x ...
 ```
 
-`PROXY_PROVIDERS=` (empty) disables it again without touching anything else.
-Full diagnosis steps and the reasoning are in `NOTES.md` section 4.
+Both vars are required - `PROXY_URL` alone does nothing, since no provider is
+proxied unless it's explicitly named in `PROXY_PROVIDERS` too. Remove
+`PROXY_PROVIDERS` (or clear it) to disable the proxy for everything without
+touching `PROXY_URL`. Full diagnosis steps and the reasoning are in
+`NOTES.md` section 4.
 
 **Don't proxy a provider that already works directly** - the Cloudflare
 clearance cookie is bound to the egress IP.
