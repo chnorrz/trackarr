@@ -324,6 +324,17 @@ returns `[]` — you cannot get iframe geometry.
 Working sequence: load → short settle → read geometry → mouse warm-up →
 approach → click. The warm-up (~30 moves) is what unsticks "Verifying...".
 
+### After the solve: wait for the redirect
+
+Clearing the challenge only means the interstitial is gone. Cloudflare *then*
+client-side redirects to the URL you originally asked for. Returning as soon
+as the challenge markers disappear hands the caller a near-empty page.
+
+Symptom: **HTTP 200 with 0 results on the first request after a cold-start
+solve, and correct results on the second.** It looks like a broken parser or
+a stale cache, and it isn't either. `gotoCleared` now waits for
+`networkidle` after a solve and re-reads the content.
+
 ---
 
 ## 7. Environment gotchas
