@@ -23,7 +23,9 @@ services:
     container_name: trackarr
     restart: unless-stopped
     environment:
-      API_KEY: changeme-set-a-real-key
+      # CHANGE THIS - generate your own, e.g. `openssl rand -hex 24`, and use
+      # the same value when adding trackarr as an indexer in Prowlarr.
+      API_KEY: f46141cb7d6313b0008defa980ed122710a1da1b8c20ed6a
       # Only 1337x asks for this (see providers/1337x.js); ext.to and any
       # future direct-working provider are unaffected either way.
       PROXY_URL: http://tinyproxy:8888
@@ -41,6 +43,12 @@ services:
       # Must match the trackarr-net subnet below - if you change one, change
       # both. Only requests from this subnet are allowed through the proxy.
       ALLOWED_SUBNET: 172.28.99.0/24
+      # Only needed if 1337x's ban is on your IPv4 specifically and your host
+      # has real IPv6 (see NOTES.md section 4) - forces tinyproxy's outgoing
+      # connections onto its own IPv6 address rather than letting IPv4/IPv6
+      # racing pick whichever connects first, with no awareness that IPv4
+      # leads to the ban. Set to "false" (or remove) if you don't need this.
+      FORCE_IPV6: "true"
     networks:
       - trackarr-net     # not on media_default - nothing else can reach it
 
