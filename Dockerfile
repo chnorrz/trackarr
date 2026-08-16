@@ -1,56 +1,66 @@
-# Base image matches our pinned playwright-core version and already has all
-# the system libs Firefox (and therefore Camoufox, a patched Firefox) needs
-# to run headless on Linux - no manual apt-get juggling required.
-FROM mcr.microsoft.com/playwright:v1.60.0-jammy
+# ---------------------------------------------------------------------------
+# Builder: compiles native modules and downloads the Camoufox browser.
+#
+# The full node image carries a C/C++ toolchain, which camoufox-js needs to
+# build better-sqlite3. None of that has to survive into the runtime image.
+# ---------------------------------------------------------------------------
+FROM node:22-bookworm AS builder
 
 WORKDIR /app
-
-# camoufox-js depends on better-sqlite3, a native module that needs a
-# compiler to build - the Playwright base image is runtime-only.
-#
-# Real Firefox "headless" mode has weak/no WebGL support regardless of
-# installed GL libs (unlike Chromium) - camoufox-js works around this with
-# a `headless: 'virtual'` mode that runs Xvfb + true (virtual-display)
-# Firefox under the hood, giving it a real GL context to render with
-# (libgl1-mesa-dri/libglx-mesa0 provide the software/llvmpipe renderer).
-# Camoufox's fingerprint spoofing then relabels that real context (e.g. as
-# an NVIDIA GPU) - it can't synthesize a fake one from nothing. Without
-# this, WebGL context creation fails entirely and a browser claiming to be
-# Windows+Firefox with zero WebGL support at all is a blatant bot signal -
-# confirmed empirically: this exact gap was the cause of headless auto-pass
-# working reliably on macOS (real WebGL) but failing consistently in plain
-# `headless: true` Docker (no WebGL) for the same site/IP.
-#
-# fonts-liberation/fonts-dejavu-core/fonts-freefont-ttf: the base image has
-# very few fonts installed (~50 vs ~2800 font faces on a real desktop) -
-# an abnormally small font list is another common headless-bot signal.
-# xdotool drives the Turnstile checkbox at the X server level - see
-# autoSolveChallenge() in lib/browser.js for why Playwright's own mouse API
-# is not sufficient.
-RUN DEBIAN_FRONTEND=noninteractive apt-get update && \
-    DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-    python3 make g++ \
-    xvfb xdotool libgl1-mesa-dri libglx-mesa0 \
-    fonts-liberation fonts-dejavu-core fonts-freefont-ttf fontconfig \
-    && rm -rf /var/lib/apt/lists/* \
-    # fc-list under-counts fonts here due to a fontconfig+overlayfs false
-    # positive ("looped directory detected") in the base image's font dirs,
-    # which silently skips most of them during cache scanning. Workaround:
-    # copy the actual font files into a fresh directory tree fontconfig can
-    # scan cleanly (56 -> 103 usable font faces).
-    && mkdir -p /usr/local/share/fonts \
-    && find /usr/share/fonts -type f \( -name '*.ttf' -o -name '*.otf' -o -name '*.ttc' \) -exec cp {} /usr/local/share/fonts/ \; \
-    && fc-cache -f /usr/local/share/fonts
 
 COPY package.json package-lock.json ./
 RUN npm ci --omit=dev
 
-# Bake the Camoufox browser binary into the image at build time (not into
-# the ephemeral home dir) so containers don't need to download ~300MB on
-# every cold start. Kept ahead of the source COPYs so editing source
-# doesn't invalidate this layer and re-download the browser every build.
+# Bake the browser in at build time so containers don't download ~650MB on
+# every cold start. CAMOUFOX_INSTALL_DIR keeps it outside the home dir so it
+# can be copied into the runtime stage.
 ENV CAMOUFOX_INSTALL_DIR=/opt/camoufox
 RUN npx camoufox-js fetch
+
+# ---------------------------------------------------------------------------
+# Runtime: node + the system libraries Firefox needs, and nothing else.
+#
+# We deliberately do NOT use mcr.microsoft.com/playwright here. That image is
+# convenient but ships Chromium, WebKit and its own Firefox (~2.1GB) which we
+# never run - Camoufox brings its own browser binary. Instead we install just
+# the shared libraries via playwright's install-deps, which resolves them for
+# us rather than us hand-maintaining the list.
+# ---------------------------------------------------------------------------
+FROM node:22-bookworm-slim
+
+WORKDIR /app
+
+COPY --from=builder /app/node_modules ./node_modules
+COPY --from=builder /opt/camoufox /opt/camoufox
+ENV CAMOUFOX_INSTALL_DIR=/opt/camoufox
+
+# install-deps firefox: the shared libraries Firefox links against, without
+# any browser binaries.
+#
+# xvfb: the browser runs non-headless against a virtual display. Real Firefox
+#   "headless" mode has weak/no WebGL regardless of installed GL libs, and a
+#   browser claiming to be desktop Firefox with zero WebGL is a blatant bot
+#   signal - that gap was why plain headless failed Cloudflare in Docker while
+#   working on macOS for the same site/IP.
+# libgl1-mesa-dri/libglx-mesa0: the software (llvmpipe) GL renderer that gives
+#   Firefox a real WebGL context for Camoufox's spoofing to relabel. It cannot
+#   synthesise one from nothing.
+# xdotool: drives the Turnstile checkbox at the X server level - see
+#   autoSolveChallenge() in lib/browser.js for why Playwright's mouse API is
+#   not sufficient.
+# fonts-*: an abnormally small font list is another headless-bot signal.
+RUN DEBIAN_FRONTEND=noninteractive apt-get update && \
+    npx playwright-core install-deps firefox && \
+    DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+      xvfb xdotool libgl1-mesa-dri libglx-mesa0 \
+      fonts-liberation fonts-dejavu-core fonts-freefont-ttf fontconfig \
+    && rm -rf /var/lib/apt/lists/* \
+    # fontconfig can silently skip most fonts in a container due to a
+    # "looped directory detected" false positive on overlayfs. Copying them
+    # into a fresh tree it can scan cleanly avoids that.
+    && mkdir -p /usr/local/share/fonts \
+    && find /usr/share/fonts -type f \( -name '*.ttf' -o -name '*.otf' -o -name '*.ttc' \) -exec cp {} /usr/local/share/fonts/ \; \
+    && fc-cache -f /usr/local/share/fonts
 
 COPY lib ./lib
 COPY providers ./providers
@@ -58,9 +68,9 @@ COPY server.js ./
 
 ENV DATA_DIR=/data
 ENV PORT=9117
-# The browser runs non-headless against this display. It must be a real
-# size: Camoufox's built-in 'virtual' mode uses a 1x1 screen, which leaves
-# nowhere to render or click the Turnstile widget.
+# The browser runs non-headless against this display. It must be a real size:
+# Camoufox's built-in 'virtual' mode uses a 1x1 screen, which leaves nowhere
+# to render or click the Turnstile widget.
 ENV DISPLAY=:99
 VOLUME ["/data"]
 EXPOSE 9117
