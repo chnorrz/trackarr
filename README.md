@@ -1,4 +1,4 @@
-# torznab-bridge
+# trackarr
 
 A small self-hosted server that exposes scraper-hostile torrent trackers to
 **Prowlarr** as ordinary Torznab indexers.
@@ -37,9 +37,9 @@ keeping the whole flow inside one browser session.
 ## How it works
 
 ```
-Prowlarr  ──HTTP──>  torznab-bridge  ──> headless Firefox (Camoufox)  ──> tracker
-   Torznab XML          Express            clears Cloudflare, scrapes,
-                                           calls the site's own magnet API
+Prowlarr  ──HTTP──>  trackarr  ──> headless Firefox (Camoufox)  ──> tracker
+   Torznab XML        Express         clears Cloudflare, scrapes,
+                                      calls the site's own magnet API
 ```
 
 - **One persistent browser.** A single [Camoufox](https://github.com/daijro/camoufox)
@@ -70,15 +70,27 @@ restarts don't trigger a fresh challenge.
 
 ## Quick start
 
-```bash
-docker build -t torznab-bridge .
-docker volume create torznab-bridge-data
+Pull the published image:
 
-docker run -d --name torznab-bridge \
+```bash
+docker volume create trackarr-data
+
+docker run -d --name trackarr \
   -p 9117:9117 \
   -e API_KEY=pick-something-random \
-  -v torznab-bridge-data:/data \
-  torznab-bridge
+  -v trackarr-data:/data \
+  ghcr.io/chnorrz/trackarr:latest
+```
+
+Or build it yourself:
+
+```bash
+docker build -t trackarr .
+docker run -d --name trackarr \
+  -p 9117:9117 \
+  -e API_KEY=pick-something-random \
+  -v trackarr-data:/data \
+  trackarr
 ```
 
 Check it's alive - this needs no API key:
