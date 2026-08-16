@@ -1,0 +1,52 @@
+# Deploys trackarr alongside an existing Prowlarr Docker stack, plus an
+# optional tinyproxy sidecar for trackers that ban an IPv4 address while
+# leaving IPv6 clean (see NOTES.md section 4 - currently 1337x).
+#
+# Usage:
+#   1. Set PROWLARR_NETWORK below to whatever network Prowlarr is actually
+#      on: docker inspect -f '{{range $k,$v := .NetworkSettings.Networks}}{{$k}} {{end}}' prowlarr
+#   2. docker compose up -d
+#   3. In Prowlarr, add each provider as a generic Torznab indexer:
+#        URL: http://trackarr:9117/ext-to   (and /1337x)
+#        API Key: whatever you set below
+#
+# If your host doesn't need the IPv6 workaround (only 1337x does, and only if
+# your IPv4 happens to be banned - see NOTES.md section 4 to check), delete
+# the tinyproxy service, the PROXY_URL env line, and the trackarr-net network,
+# and just put trackarr on your Prowlarr network directly.
+
+services:
+  trackarr:
+    image: ghcr.io/chnorrz/trackarr:latest
+    container_name: trackarr
+    restart: unless-stopped
+    environment:
+      API_KEY: changeme-set-a-real-key
+      # Only 1337x asks for this (see providers/1337x.js); ext.to and any
+      # future direct-working provider are unaffected either way.
+      PROXY_URL: http://tinyproxy:8888
+    volumes:
+      - trackarr-data:/data
+    networks:
+      - media_default   # external: Prowlarr's existing network, join it to be reachable by name
+      - trackarr-net     # private: only shared with the tinyproxy sidecar
+
+  tinyproxy:
+    build: ./docker/tinyproxy
+    container_name: trackarr-tinyproxy
+    restart: unless-stopped
+    networks:
+      - trackarr-net     # not on media_default - nothing else can reach it
+
+networks:
+  media_default:
+    external: true       # rename to match Prowlarr's actual network if different
+  trackarr-net:
+    enable_ipv6: true
+    ipam:
+      config:
+        - subnet: 172.28.99.0/24
+        - subnet: fd00:dead:beef:99::/64
+
+volumes:
+  trackarr-data:
