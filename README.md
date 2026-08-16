@@ -13,8 +13,9 @@ Currently supported:
 
 | Provider | Endpoint path | Notes |
 |---|---|---|
-| ext.to | `/ext-to/api` | Cloudflare Turnstile + HMAC-signed magnet API |
-| 1337x | `/1337x/api` | Only reachable over IPv6 from here, see [Proxy](#proxy-optional) |
+| ext.to | `/ext-to/api` | General catalog; magnet via signed API |
+| 1337x | `/1337x/api` | General catalog; magnet embedded in detail page |
+| EZTV | `/eztv/api` | TV only; magnet embedded in search results |
 
 ---
 
@@ -142,7 +143,8 @@ Once per provider:
 
 4. **Test**, then **Save**.
 
-Repeat with `http://<host>:9117/1337x` for the other provider.
+Repeat for the other providers: `http://<host>:9117/1337x` and
+`http://<host>:9117/eztv`.
 
 **If Prowlarr runs in Docker too**, `localhost` won't reach this container.
 Use the host's LAN IP, or put both on the same Docker network and use the
