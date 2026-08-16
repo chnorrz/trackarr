@@ -16,11 +16,12 @@ Port 8888
 Listen 0.0.0.0
 Timeout 600
 
-# Scoped to the trackarr-net subnet defined in docker-compose.yml. Update
-# both together if that subnet ever changes.
+# Scoped to the docker-compose.yml network subnet by default, substituted
+# from ALLOWED_SUBNET at container start - see entrypoint.sh. Change the
+# subnet via that env var, not by editing this file.
 Allow 127.0.0.1
 Allow ::1
-Allow 172.28.99.0/24
+Allow ${ALLOWED_SUBNET}
 
 # HTTPS tunnelling only - trackers are https-only.
 ConnectPort 443

@@ -108,6 +108,21 @@ curl "http://localhost:9117/ext-to/api?t=search&q=ubuntu&apikey=pick-something-r
 The first search may take ~20 s while a Cloudflare challenge is solved.
 Later ones are fast.
 
+### Deploying alongside an existing Prowlarr stack
+
+`docker-compose.yml` in this repo joins trackarr to an existing Compose
+project's network (so Prowlarr can reach it by container name) and adds an
+optional `tinyproxy` sidecar for providers that need the IPv6 workaround
+described below (currently 1337x) - see the comments in the file for the one
+line you need to edit (your Prowlarr network's name) before running
+`docker compose up -d`.
+
+It references prebuilt images (`ghcr.io/chnorrz/trackarr` and
+`ghcr.io/chnorrz/trackarr-tinyproxy`) rather than building locally, so it
+works with any deployment method, including pasting or uploading just the
+compose file (e.g. Portainer stacks) where the rest of the repo isn't present
+alongside it.
+
 ## Adding it to Prowlarr
 
 Once per provider:
@@ -229,6 +244,8 @@ Container logs are the first stop - all Cloudflare activity is logged with a
 | `Blocked by Cloudflare (IP ban/rate limit)` | Hard block, not a challenge. See the proxy section. |
 | Search returns 0 results, HTTP 200 | Markup changed, or the provider's selectors need updating. |
 | `Invalid apikey` | `API_KEY` doesn't match what Prowlarr sends. |
+| `docker pull`/`compose up` fails to fetch the image | GHCR packages default to **private** even on a public repo. Set `trackarr` and `trackarr-tinyproxy` to public in their package settings, or `docker login ghcr.io` with a PAT that has `read:packages`. |
+| `compose build ... path ... not found` for `tinyproxy` | Stale config - `docker-compose.yml` now references the prebuilt `ghcr.io/chnorrz/trackarr-tinyproxy` image, not a local build. Re-pull the compose file. |
 
 `NOTES.md` holds the deeper technical background: what Cloudflare does and
 doesn't detect, how the auto-solver works, and a debugging playbook.

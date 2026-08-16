@@ -3,8 +3,10 @@
 # leaving IPv6 clean (see NOTES.md section 4 - currently 1337x).
 #
 # Usage:
-#   1. Set PROWLARR_NETWORK below to whatever network Prowlarr is actually
-#      on: docker inspect -f '{{range $k,$v := .NetworkSettings.Networks}}{{$k}} {{end}}' prowlarr
+#   1. Update the "media_default" network name below (both the trackarr
+#      service and the networks: block) if Prowlarr isn't on a network with
+#      that name:
+#      docker inspect -f '{{range $k,$v := .NetworkSettings.Networks}}{{$k}} {{end}}' prowlarr
 #   2. docker compose up -d
 #   3. In Prowlarr, add each provider as a generic Torznab indexer:
 #        URL: http://trackarr:9117/ext-to   (and /1337x)
@@ -32,9 +34,13 @@ services:
       - trackarr-net     # private: only shared with the tinyproxy sidecar
 
   tinyproxy:
-    build: ./docker/tinyproxy
+    image: ghcr.io/chnorrz/trackarr-tinyproxy:latest
     container_name: trackarr-tinyproxy
     restart: unless-stopped
+    environment:
+      # Must match the trackarr-net subnet below - if you change one, change
+      # both. Only requests from this subnet are allowed through the proxy.
+      ALLOWED_SUBNET: 172.28.99.0/24
     networks:
       - trackarr-net     # not on media_default - nothing else can reach it
 
