@@ -20,6 +20,7 @@ one process (shared browser + cache).
 | `lib/cache.js` | TTL cache (search 5 min, magnets 1 h) |
 | `lib/categories.js` | Shared Torznab category ids |
 | `providers/*.js` | Per-tracker `{ id, name, search(q), resolveMagnet({id,url}) }` |
+| `tools/ipv6-proxy.js` | CONNECT proxy, runs on the **macOS host** (see 1337x) |
 | `get-magnet.js` | Standalone CLI, uses ext.to's *detail-page* flow (legacy) |
 
 Adding a tracker: write `providers/<id>.js`, register in
@@ -96,7 +97,7 @@ Much lighter protection, and **no cookie needed**.
 - Dates are only relative strings; no exact-date attribute. `pubDate` falls
   back to now.
 
-### The IPv4 ban (current blocker)
+### The IPv4 ban — and the fix
 
 1337x has banned the **IPv4** address; the IPv6 is clean.
 
@@ -105,13 +106,33 @@ Much lighter protection, and **no cookie needed**.
 | macOS host (prefers IPv6) | normal solvable challenge |
 | Host forced to IPv4 | `banned your IP`, Cloudflare error **1006** |
 | Container (no IPv6) | same ban page |
+| Container → host proxy → IPv6 | **works** |
 
 **Colima's VM has no IPv6 at all** — no global addresses, no egress — so
-enabling IPv6 in the Docker daemon cannot help. Options: wait it out, proxy
-1337x, or run natively on macOS.
+enabling IPv6 in the Docker daemon cannot help. The VM simply can't route it.
 
 A 1006 page has **no widget**, so the Turnstile auto-solver is irrelevant
 here. Different failure, different fix.
+
+**Solution:** `tools/ipv6-proxy.js` runs on the macOS host (which has working
+IPv6) and the container tunnels through it. Because HTTP `CONNECT` only pipes
+bytes, TLS stays end-to-end and the browser's fingerprint is unchanged — only
+the egress address differs. `net.connect({ family: 6 })` is required; Node's
+default Happy Eyeballs often picks the banned IPv4.
+
+```bash
+# on the host - must outlive the shell, hence launchctl
+launchctl submit -l ext-ipv6-proxy -o /tmp/proxy.log \
+  -- "$(which node)" /path/to/tools/ipv6-proxy.js
+
+# container reaches the host at host.docker.internal (192.168.5.2 under Colima)
+docker run ... -e PROXY_URL=http://192.168.5.2:8888 ...
+```
+
+Providers opt in per request: `gotoCleared(url, { proxy: true })`. Falls back
+to a direct connection when `PROXY_URL` is unset. Only the direct context's
+cookies are persisted, so the proxied context can't clobber ext.to's
+`cf_clearance`.
 
 ---
 
@@ -254,6 +275,16 @@ directory (including the empty `colima` subdir, which blocks restart), then
 
 **macOS Screen Sharing rejects `x11vnc -nopw`** — it won't do "no auth". Use
 `-passwd <something>` if you ever need a VNC solve again.
+
+**Background processes started from a tool shell get killed** when that
+command ends or times out — `nohup` and `disown` are not enough, the whole
+process group goes. For anything that must outlive the shell (the IPv6
+proxy), use `launchctl submit`. `setsid` does not exist on macOS.
+
+**Never cache empty results.** A transient failure (proxy down, challenge not
+cleared) got cached for the full 5 min TTL and kept being served *after* the
+fix, which looked exactly like "the parser is broken". Cost real debugging
+time; `server.js` now only caches non-empty results.
 
 ---
 

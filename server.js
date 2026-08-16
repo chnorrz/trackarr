@@ -77,7 +77,10 @@ async function search(provider, q) {
   }
 
   const items = await provider.search(q);
-  searchCache.set(cacheKey, items);
+  // Never cache an empty result. A transient failure (proxy down, challenge
+  // not cleared, markup change) would otherwise be frozen in for the full
+  // TTL and keep being served after the underlying problem is fixed.
+  if (items.length) searchCache.set(cacheKey, items);
   return items;
 }
 

@@ -23,9 +23,15 @@ function directText($el) {
   return $el.clone().children().remove().end().text().trim();
 }
 
+// 1337x has banned our IPv4 address but not our IPv6 one, and the container
+// has no IPv6 of its own - so route through the host proxy (see
+// tools/ipv6-proxy.js). Harmlessly falls back to a direct connection when
+// PROXY_URL isn't set.
+const VIA_PROXY = { proxy: true };
+
 async function search(q) {
   const searchUrl = `${BASE}/search/${encodeURIComponent(q)}/1/`;
-  const page = await gotoCleared(searchUrl);
+  const page = await gotoCleared(searchUrl, VIA_PROXY);
   try {
     const html = await page.content();
     const $ = cheerio.load(html);
@@ -83,7 +89,7 @@ function parseSize(str) {
 async function resolveMagnet({ url }) {
   if (!url) throw new Error('1337x: resolveMagnet requires a url.');
 
-  const page = await gotoCleared(url);
+  const page = await gotoCleared(url, VIA_PROXY);
   try {
     const html = await page.content();
     const $ = cheerio.load(html);
