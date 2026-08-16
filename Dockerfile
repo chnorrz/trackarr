@@ -1,21 +1,29 @@
 # ---------------------------------------------------------------------------
-# Builder: compiles native modules and downloads the Camoufox browser.
-#
-# The full node image carries a C/C++ toolchain, which camoufox-js needs to
-# build better-sqlite3. None of that has to survive into the runtime image.
+# Builder: installs full deps (needed both to compile TypeScript and for
+# camoufox-js's native better-sqlite3 dependency), compiles TS, downloads the
+# Camoufox browser, then prunes devDependencies back out. `npm prune` reuses
+# what's already installed rather than a second `npm ci`, so nothing gets
+# downloaded or natively compiled twice for one image build.
 # ---------------------------------------------------------------------------
 FROM node:22-bookworm AS builder
 
 WORKDIR /app
 
-COPY package.json package-lock.json ./
-RUN npm ci --omit=dev
+COPY package.json package-lock.json tsconfig.json ./
+RUN npm ci
 
 # Bake the browser in at build time so containers don't download ~650MB on
 # every cold start. CAMOUFOX_INSTALL_DIR keeps it outside the home dir so it
 # can be copied into the runtime stage.
 ENV CAMOUFOX_INSTALL_DIR=/opt/camoufox
 RUN npx camoufox-js fetch
+
+COPY lib ./lib
+COPY providers ./providers
+COPY server.ts ./
+RUN npm run build
+
+RUN npm prune --omit=dev
 
 # ---------------------------------------------------------------------------
 # Runtime: node + the system libraries Firefox needs, and nothing else.
@@ -46,7 +54,7 @@ ENV CAMOUFOX_INSTALL_DIR=/opt/camoufox
 #   Firefox a real WebGL context for Camoufox's spoofing to relabel. It cannot
 #   synthesise one from nothing.
 # xdotool: drives the Turnstile checkbox at the X server level - see
-#   autoSolveChallenge() in lib/browser.js for why Playwright's mouse API is
+#   autoSolveChallenge() in lib/browser.ts for why Playwright's mouse API is
 #   not sufficient.
 # fonts-*: an abnormally small font list is another headless-bot signal.
 RUN DEBIAN_FRONTEND=noninteractive apt-get update && \
@@ -62,9 +70,7 @@ RUN DEBIAN_FRONTEND=noninteractive apt-get update && \
     && find /usr/share/fonts -type f \( -name '*.ttf' -o -name '*.otf' -o -name '*.ttc' \) -exec cp {} /usr/local/share/fonts/ \; \
     && fc-cache -f /usr/local/share/fonts
 
-COPY lib ./lib
-COPY providers ./providers
-COPY server.js ./
+COPY --from=builder /app/dist ./
 
 ENV DATA_DIR=/data
 ENV PORT=9117

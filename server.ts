@@ -5,9 +5,9 @@
  * use as "Torznab (Custom)" indexers in Prowlarr. One indexer per tracker,
  * all served from this one process (shared browser session pool + cache).
  *
- * Add a tracker: create providers/<id>.js exporting
+ * Add a tracker: create providers/<id>.ts exporting
  * { id, name, search(q), resolveMagnet({ id, url }) } (see providers/ for
- * examples), then register it in providers/index.js.
+ * examples), then register it in providers/index.ts.
  *
  * Each provider gets its own Torznab endpoint at /<provider-id>/api, e.g.:
  *   http://localhost:9117/ext-to/api
@@ -17,11 +17,12 @@
  *   API_KEY=yoursecret PORT=9117 node server.js
  */
 
-import express from 'express';
+import express, { type Request, type Response } from 'express';
 import { closeBrowser, gotoCleared } from './lib/browser.js';
 import { CATEGORIES_XML } from './lib/categories.js';
 import { TTLCache } from './lib/cache.js';
 import { providerMap } from './providers/index.js';
+import type { MagnetRef, Provider, SearchItem } from './lib/types.js';
 
 const PORT = process.env.PORT || 9117;
 const API_KEY = process.env.API_KEY || 'changeme';
@@ -43,28 +44,37 @@ const KEEPALIVE_INTERVAL_MS = process.env.KEEPALIVE_INTERVAL_MS === undefined
 // longer - avoids hitting the tracker again if Prowlarr re-grabs/retries.
 const SEARCH_CACHE_TTL_MS = Number(process.env.SEARCH_CACHE_TTL_MS) || 5 * 60 * 1000;
 const MAGNET_CACHE_TTL_MS = Number(process.env.MAGNET_CACHE_TTL_MS) || 60 * 60 * 1000;
-const searchCache = new TTLCache(SEARCH_CACHE_TTL_MS);
-const magnetCache = new TTLCache(MAGNET_CACHE_TTL_MS);
+const searchCache = new TTLCache<SearchItem[]>(SEARCH_CACHE_TTL_MS);
+const magnetCache = new TTLCache<string>(MAGNET_CACHE_TTL_MS);
 
-function checkKey(req, res) {
-  if (req.query.apikey !== API_KEY) {
+// Express 5's req.query values are `string | string[] | ParsedQs | ParsedQs[]
+// | undefined` (from the `qs` package) - our params are always plain single
+// strings, so this narrows that down in one place rather than at every call
+// site.
+function queryString(v: unknown): string | undefined {
+  return typeof v === 'string' ? v : undefined;
+}
+
+function checkKey(req: Request, res: Response): boolean {
+  if (queryString(req.query.apikey) !== API_KEY) {
     res.status(401).send('Invalid apikey');
     return false;
   }
   return true;
 }
 
-function xmlEscape(str) {
-  return String(str).replace(/[&<>"']/g, (c) => ({
+function xmlEscape(str: unknown): string {
+  const entities: Record<string, string> = {
     '&': '&amp;',
     '<': '&lt;',
     '>': '&gt;',
     '"': '&quot;',
     "'": '&apos;'
-  })[c]);
+  };
+  return String(str).replace(/[&<>"']/g, (c) => entities[c] as string);
 }
 
-function capsXml(provider) {
+function capsXml(provider: Provider): string {
   return `<?xml version="1.0" encoding="UTF-8"?>
 <caps>
   <server title="${xmlEscape(provider.name)}" strapline="${xmlEscape(provider.name)} Torznab proxy" />
@@ -80,7 +90,7 @@ ${CATEGORIES_XML}
 </caps>`;
 }
 
-async function search(provider, q) {
+async function search(provider: Provider, q: string): Promise<SearchItem[]> {
   // Prowlarr's "Test" button (and likely periodic health checks) queries
   // with an empty q, and requires a non-empty result set to let the indexer
   // be saved - an empty-but-valid response isn't enough (confirmed: Save
@@ -119,7 +129,7 @@ async function search(provider, q) {
   return items;
 }
 
-async function resolveMagnet(provider, ref) {
+async function resolveMagnet(provider: Provider, ref: MagnetRef): Promise<string> {
   const cacheKey = `${provider.id}:${ref.id ?? ref.url}`;
   const cached = magnetCache.get(cacheKey);
   if (cached) {
@@ -132,7 +142,7 @@ async function resolveMagnet(provider, ref) {
   return magnet;
 }
 
-function buildRss(req, provider, items) {
+function buildRss(req: Request, provider: Provider, items: SearchItem[]): string {
   const selfUrl = `${req.protocol}://${req.get('host')}${req.originalUrl}`;
   const rows = items
     .map((it) => {
@@ -170,8 +180,8 @@ ${rows}
 
 const app = express();
 
-function getProvider(req, res) {
-  const provider = providerMap[req.params.provider];
+function getProvider(req: Request, res: Response): Provider | null {
+  const provider = providerMap[req.params.provider as string];
   if (!provider) {
     res.status(404).send(`Unknown provider: ${req.params.provider}`);
     return null;
@@ -179,11 +189,11 @@ function getProvider(req, res) {
   return provider;
 }
 
-app.get('/:provider/api', async (req, res) => {
+app.get('/:provider/api', async (req: Request, res: Response) => {
   const provider = getProvider(req, res);
   if (!provider) return;
 
-  const t = req.query.t;
+  const t = queryString(req.query.t);
 
   if (t === 'caps') {
     res.type('application/xml').send(capsXml(provider));
@@ -193,13 +203,13 @@ app.get('/:provider/api', async (req, res) => {
   if (!checkKey(req, res)) return;
 
   if (t === 'search' || t === 'movie-search' || t === 'tv-search') {
-    const q = req.query.q || '';
+    const q = queryString(req.query.q) || '';
     try {
       const items = await search(provider, q);
       res.type('application/xml').send(buildRss(req, provider, items));
     } catch (err) {
       console.error(`${provider.id} search error:`, err);
-      res.status(500).send(`Search failed: ${err.message}`);
+      res.status(500).send(`Search failed: ${err instanceof Error ? err.message : String(err)}`);
     }
     return;
   }
@@ -207,14 +217,15 @@ app.get('/:provider/api', async (req, res) => {
   res.status(400).send(`Unsupported t=${t}`);
 });
 
-app.get('/:provider/download', async (req, res) => {
+app.get('/:provider/download', async (req: Request, res: Response) => {
   const provider = getProvider(req, res);
   if (!provider) return;
 
   if (!checkKey(req, res)) return;
 
-  const id = req.query.id ? parseInt(req.query.id, 10) : null;
-  const url = req.query.url || null;
+  const idParam = queryString(req.query.id);
+  const id = idParam ? parseInt(idParam, 10) : null;
+  const url = queryString(req.query.url) || null;
   if (!id && !url) {
     res.status(400).send('Missing id or url param');
     return;
@@ -225,14 +236,14 @@ app.get('/:provider/download', async (req, res) => {
     res.redirect(302, magnet);
   } catch (err) {
     console.error(`${provider.id} download error:`, err);
-    res.status(500).send(`Download failed: ${err.message}`);
+    res.status(500).send(`Download failed: ${err instanceof Error ? err.message : String(err)}`);
   }
 });
 
 // Visits a provider's keep-alive URL so its clearance cookie stays fresh.
 // gotoCleared() already solves only when challenged, so this is cheap while
 // the cookie is still valid.
-async function warmProvider(provider) {
+async function warmProvider(provider: Provider): Promise<void> {
   const ka = provider.keepAlive;
   if (!ka) return;
   const started = Date.now();
@@ -242,13 +253,13 @@ async function warmProvider(provider) {
     console.error(`[keepalive] ${provider.id} ok (${Date.now() - started}ms)`);
   } catch (err) {
     // Never throw: a tracker being unreachable must not kill the scheduler.
-    console.error(`[keepalive] ${provider.id} failed: ${err.message}`);
+    console.error(`[keepalive] ${provider.id} failed: ${err instanceof Error ? err.message : String(err)}`);
   }
 }
 
-let keepAliveTimer = null;
+let keepAliveTimer: ReturnType<typeof setTimeout> | null = null;
 
-function scheduleKeepAlive() {
+function scheduleKeepAlive(): void {
   if (!KEEPALIVE_INTERVAL_MS) {
     console.log('Keep-alive disabled (KEEPALIVE_INTERVAL_MS=0)');
     return;
@@ -279,7 +290,7 @@ app.listen(PORT, () => {
   scheduleKeepAlive();
 });
 
-async function shutdown() {
+async function shutdown(): Promise<void> {
   console.log('Shutting down, closing browser...');
   if (keepAliveTimer) clearTimeout(keepAliveTimer);
   await closeBrowser();

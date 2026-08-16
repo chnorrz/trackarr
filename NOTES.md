@@ -13,17 +13,25 @@ A Torznab server that makes scraper-hostile torrent trackers usable as
 "Torznab (Custom)" indexers in Prowlarr. One indexer per provider, all from
 one process (shared browser + cache).
 
+TypeScript, `strict: true`. `npm run build` compiles `.ts` -> `dist/*.js`;
+the Docker image only ever runs the compiled output (`node dist/server.js`,
+or just `server.js` once `dist/` is the container's `/app`). There's no
+`ts-node`/`tsx` at runtime, deliberately - keeps the production image from
+carrying a whole extra toolchain just to interpret TS on every start.
+
 | File | Role |
 |---|---|
-| `server.js` | Torznab endpoints: `/:provider/api`, `/:provider/download` |
-| `lib/browser.js` | Camoufox session, Cloudflare clearing, auto-solve |
-| `lib/cache.js` | TTL cache (search 5 min, magnets 1 h) |
-| `lib/categories.js` | Shared Torznab category ids |
-| `providers/*.js` | Per-tracker `{ id, name, search(q), resolveMagnet({id,url}) }` |
+| `server.ts` | Torznab endpoints: `/:provider/api`, `/:provider/download` |
+| `lib/browser.ts` | Camoufox session, Cloudflare clearing, auto-solve |
+| `lib/cache.ts` | TTL cache (search 5 min, magnets 1 h) |
+| `lib/categories.ts` | Shared Torznab category ids |
+| `lib/parse.ts` | Shared size-string parsing |
+| `lib/types.ts` | `Provider`/`SearchItem`/`MagnetRef` shared interfaces |
+| `providers/*.ts` | Per-tracker, each `export default {...} satisfies Provider` |
 | `tools/tinyproxy.conf` | Proxy config, runs on the **macOS host** (see 1337x) |
 
-Adding a tracker: write `providers/<id>.js`, register in
-`providers/index.js`. Nothing else needs touching.
+Adding a tracker: write `providers/<id>.ts`, register in
+`providers/index.ts`. Nothing else needs touching.
 
 ---
 
@@ -383,7 +391,7 @@ proxy), use `launchctl submit`. `setsid` does not exist on macOS.
 **Never cache empty results.** A transient failure (proxy down, challenge not
 cleared) got cached for the full 5 min TTL and kept being served *after* the
 fix, which looked exactly like "the parser is broken". Cost real debugging
-time; `server.js` now only caches non-empty results.
+time; `server.ts` now only caches non-empty results.
 
 ---
 
@@ -446,7 +454,7 @@ cf_clearance hides solver breakage entirely.
 
 Prowlarr's Test button (and Save - Save genuinely fails, red exclamation
 mark, if Test's result set is empty) searches with a **blank** `q`. No
-provider has a real "browse everything" mode for that, so `server.js`
+provider has a real "browse everything" mode for that, so `server.ts`
 substitutes `provider.testQuery` (falling back to `'yify'` with a loud
 `console.error` warning if a provider doesn't set one).
 
@@ -464,8 +472,9 @@ directly and confirm it returns a non-trivial result count**, the same way
 you'd smoke-test anything else here:
 
 ```bash
+npm run build
 node -e "
-import('./providers/<id>.js').then(async ({default: p}) => {
+import('./dist/providers/<id>.js').then(async ({default: p}) => {
   const items = await p.search(p.testQuery);
   console.log(p.testQuery, '->', items.length, 'results');
   if (items[0]) console.log('sample:', items[0].title);

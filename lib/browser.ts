@@ -3,6 +3,7 @@ import path from 'path';
 import { execFileSync } from 'child_process';
 import { fileURLToPath } from 'url';
 import { Camoufox } from 'camoufox-js';
+import type { Browser, BrowserContext, Cookie, Page } from 'playwright-core';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 // DATA_DIR is configurable so it can point at a mounted volume in Docker -
@@ -16,7 +17,7 @@ const COOKIE_FILE = path.join(DATA_DIR, '.cf-cookies.json');
 // the UA) on every launch.
 const UA_FILE = path.join(DATA_DIR, '.cf-ua.txt');
 
-function isChallenge(html) {
+function isChallenge(html: string): boolean {
   // Note: 'challenge-platform' is NOT a reliable marker - Cloudflare injects a
   // bot-management beacon script (/cdn-cgi/challenge-platform/scripts/jsd/main.js)
   // on legit, already-cleared pages too, causing false positives.
@@ -27,11 +28,11 @@ function isChallenge(html) {
 // static error page - no Turnstile widget, so isChallenge() doesn't catch
 // it. Left undetected, this silently looks like a real "cleared" page with
 // zero search results instead of a clear failure.
-function isBlocked(html) {
+function isBlocked(html: string): boolean {
   return html.includes('Access denied') && html.includes('Cloudflare');
 }
 
-async function safeContent(page) {
+async function safeContent(page: Page): Promise<string> {
   try {
     return await page.content();
   } catch {
@@ -39,7 +40,7 @@ async function safeContent(page) {
   }
 }
 
-function loadCookies() {
+function loadCookies(): Cookie[] | null {
   try {
     return JSON.parse(fs.readFileSync(COOKIE_FILE, 'utf8'));
   } catch {
@@ -47,11 +48,11 @@ function loadCookies() {
   }
 }
 
-function saveCookies(cookies) {
+function saveCookies(cookies: Cookie[]): void {
   fs.writeFileSync(COOKIE_FILE, JSON.stringify(cookies, null, 2));
 }
 
-function loadUserAgent() {
+function loadUserAgent(): string | null {
   try {
     return fs.readFileSync(UA_FILE, 'utf8').trim() || null;
   } catch {
@@ -59,10 +60,10 @@ function loadUserAgent() {
   }
 }
 
-let sharedBrowser = null;
-let sharedContext = null;
-let proxyBrowser = null;
-let proxyContext = null;
+let sharedBrowser: Browser | null = null;
+let sharedContext: BrowserContext | null = null;
+let proxyBrowser: Browser | null = null;
+let proxyContext: BrowserContext | null = null;
 
 // XTEST input is global to the X display, so two solves running at once fight
 // over the same virtual mouse and both fail. Matters most with the background
@@ -70,11 +71,14 @@ let proxyContext = null;
 //
 // Deliberately minimal: only the solve is serialised. An earlier attempt also
 // added a reload/bringToFront/viewport rework and broke solving outright.
-let solveChain = Promise.resolve();
+let solveChain: Promise<unknown> = Promise.resolve();
 
-function serializeSolve(task) {
+function serializeSolve<T>(task: () => Promise<T>): Promise<T> {
   const run = solveChain.then(task, task);
-  solveChain = run.then(() => {}, () => {});
+  solveChain = run.then(
+    () => {},
+    () => {}
+  );
   return run;
 }
 
@@ -97,7 +101,7 @@ const PROXY_PROVIDERS = (process.env.PROXY_PROVIDERS || '')
   .map((s) => s.trim())
   .filter(Boolean);
 
-function proxyEnabledFor(who) {
+function proxyEnabledFor(who: string | null): boolean {
   if (!PROXY_URL || !who) return false;
   return PROXY_PROVIDERS.includes(who);
 }
@@ -117,11 +121,11 @@ function proxyEnabledFor(who) {
 //     returns PAGE coordinates. Firefox's window chrome offsets the content
 //     area (mozInnerScreenY is ~57px), so clicking raw page coords lands
 //     above the checkbox and does nothing.
-async function autoSolveChallenge(page) {
+async function autoSolveChallenge(page: Page): Promise<boolean> {
   const display = process.env.DISPLAY;
   if (!display) return false;
 
-  const xdo = (args) => {
+  const xdo = (args: string[]): boolean => {
     try {
       execFileSync('xdotool', args, { env: { ...process.env, DISPLAY: display } });
       return true;
@@ -139,21 +143,41 @@ async function autoSolveChallenge(page) {
 
   // Movement warm-up: this is what gets the widget past "Verifying...".
   for (let i = 0; i < 30; i++) {
-    xdo(['mousemove',
+    xdo([
+      'mousemove',
       String(300 + Math.round(Math.sin(i / 4) * 250) + i * 8),
-      String(300 + Math.round(Math.cos(i / 5) * 160))]);
+      String(300 + Math.round(Math.cos(i / 5) * 160))
+    ]);
     await new Promise((r) => setTimeout(r, 100));
   }
 
-  const geo = await page.evaluate(() => {
-    const el = document.querySelector('[id^=cf-chl-widget], .cf-turnstile, #mZiFs3');
-    const r = el ? el.getBoundingClientRect() : null;
-    return {
-      offX: window.mozInnerScreenX,
-      offY: window.mozInnerScreenY,
-      rect: r ? { x: r.x, y: r.y, h: r.height } : null
-    };
-  }).catch(() => null);
+  interface WidgetGeo {
+    offX: number;
+    offY: number;
+    rect: { x: number; y: number; h: number } | null;
+  }
+
+  // mozInnerScreenX/Y are Firefox-only, not in lib.dom.d.ts (which models a
+  // more Chromium-shaped Window) - this callback runs inside Firefox itself
+  // (see the module comment above on why page coords need this offset), so
+  // they're genuinely present at runtime despite TS not knowing about them.
+  interface FirefoxWindow extends Window {
+    mozInnerScreenX: number;
+    mozInnerScreenY: number;
+  }
+
+  const geo = await page
+    .evaluate<WidgetGeo>(() => {
+      const el = document.querySelector('[id^=cf-chl-widget], .cf-turnstile, #mZiFs3');
+      const r = el ? el.getBoundingClientRect() : null;
+      const win = window as unknown as FirefoxWindow;
+      return {
+        offX: win.mozInnerScreenX,
+        offY: win.mozInnerScreenY,
+        rect: r ? { x: r.x, y: r.y, h: r.height } : null
+      };
+    })
+    .catch(() => null);
 
   if (!geo || !geo.rect) {
     console.error('[cf] no Turnstile widget found to click.');
@@ -165,7 +189,12 @@ async function autoSolveChallenge(page) {
   const cy = Math.round(geo.offY + geo.rect.y + geo.rect.h / 2);
   console.error(`[cf] clicking checkbox at screen ${cx},${cy}`);
 
-  for (const [dx, dy, wait] of [[-150, -80, 350], [-60, -25, 300], [-12, -4, 250], [0, 0, 500]]) {
+  for (const [dx, dy, wait] of [
+    [-150, -80, 350],
+    [-60, -25, 300],
+    [-12, -4, 250],
+    [0, 0, 500]
+  ] as const) {
     xdo(['mousemove', String(cx + dx), String(cy + dy)]);
     await new Promise((r) => setTimeout(r, wait));
   }
@@ -175,7 +204,7 @@ async function autoSolveChallenge(page) {
 
 // Persistent browser/context, reused across requests so we don't pay
 // browser-startup cost per request.
-async function getPersistentContext() {
+async function getPersistentContext(): Promise<BrowserContext> {
   if (sharedContext) return sharedContext;
   // On Linux we run a real (non-headless) browser against the Xvfb display
   // in DISPLAY. Camoufox's own 'virtual' mode would also use Xvfb, but at
@@ -184,32 +213,53 @@ async function getPersistentContext() {
   const headless = process.platform === 'linux' ? false : true;
   // Pin the spoofed OS so it stays consistent with the UA the stored
   // cf_clearance cookie was issued to (see UA_FILE above).
-  const os = process.platform === 'linux' ? 'linux' : undefined;
-  sharedBrowser = await Camoufox(os ? { headless, os } : { headless });
+  const os = process.platform === 'linux' ? ('linux' as const) : undefined;
+  // A local const (rather than reading the module-level `let` back) avoids
+  // TypeScript having to assume something else could have reassigned
+  // sharedBrowser across the `await`s below - which can't actually happen
+  // in single-threaded Node, but TS can't know that for a mutable outer-
+  // scope variable.
+  const browser = await Camoufox(os ? { headless, os } : { headless });
+  sharedBrowser = browser;
 
   const userAgent = loadUserAgent();
   if (userAgent) console.error(`[cf] using stored User-Agent: ${userAgent}`);
-  sharedContext = await sharedBrowser.newContext(userAgent ? { userAgent } : {});
+  const context = await browser.newContext(userAgent ? { userAgent } : {});
+  sharedContext = context;
 
   const cookies = loadCookies();
-  if (cookies) await sharedContext.addCookies(cookies).catch(() => {});
-  return sharedContext;
+  if (cookies) await context.addCookies(cookies).catch(() => {});
+  return context;
 }
 
 // Separate browser for providers that must egress through PROXY_URL (see
 // NOTES.md - 1337x bans our IPv4 but not our IPv6, and the Colima VM has no
 // IPv6 of its own). Playwright's Firefox wants the proxy set at launch, so
 // this is a second browser rather than a second context.
-async function getProxyContext() {
+async function getProxyContext(): Promise<BrowserContext | null> {
   if (proxyContext) return proxyContext;
   if (!PROXY_URL) return null;
   console.error(`[cf] launching proxied browser via ${PROXY_URL}`);
   const headless = process.platform === 'linux' ? false : true;
-  const opts = { headless, proxy: { server: PROXY_URL } };
-  if (process.platform === 'linux') opts.os = 'linux';
-  proxyBrowser = await Camoufox(opts);
-  proxyContext = await proxyBrowser.newContext();
-  return proxyContext;
+  // A literal object argument at the call site (rather than a pre-built
+  // `opts` variable) matters here: Camoufox()'s return type is generic on
+  // whether user_data_dir is present, and extracting the parameter type
+  // separately loses that inference, resolving to BrowserContext instead of
+  // Browser.
+  const browser = process.platform === 'linux'
+    ? await Camoufox({ headless, proxy: { server: PROXY_URL }, os: 'linux' })
+    : await Camoufox({ headless, proxy: { server: PROXY_URL } });
+  proxyBrowser = browser;
+  const context = await browser.newContext();
+  proxyContext = context;
+  return context;
+}
+
+export interface GotoOptions {
+  timeoutMs?: number;
+  /** Route through PROXY_URL. Pass the provider's id (so PROXY_PROVIDERS can
+   * target it) or `true` for an unnamed request. */
+  proxy?: boolean | string;
 }
 
 // Navigates a fresh page (in the shared headless context) to `url` and
@@ -222,14 +272,14 @@ async function getProxyContext() {
 // PROXY_PROVIDERS can target it) or `true` for an unnamed request. Whether
 // it actually happens is decided by the env vars above - a provider asking
 // for a proxy that isn't configured silently goes direct.
-export async function gotoCleared(url, opts = {}) {
-  const { timeoutMs = 30000, proxy = false } = typeof opts === 'number' ? { timeoutMs: opts } : opts;
-  const wants = typeof proxy === 'string' ? proxy : (proxy ? '*' : null);
+export async function gotoCleared(url: string, opts: GotoOptions | number = {}): Promise<Page> {
+  const { timeoutMs = 30000, proxy = false } = typeof opts === 'number' ? { timeoutMs: opts, proxy: false as const } : opts;
+  const wants = typeof proxy === 'string' ? proxy : proxy ? '*' : null;
   const useProxy = proxyEnabledFor(wants);
 
   console.error(`[cf] gotoCleared: ${url}${useProxy ? ` (via proxy ${PROXY_URL})` : ''}`);
 
-  const context = (useProxy ? await getProxyContext() : null) || await getPersistentContext();
+  const context = (useProxy ? await getProxyContext() : null) || (await getPersistentContext());
   const usingProxy = useProxy && context === proxyContext;
   if (wants && !usingProxy) {
     console.error(`[cf] proxy not enabled for '${wants}', using a direct connection.`);
@@ -238,7 +288,7 @@ export async function gotoCleared(url, opts = {}) {
   const page = await context.newPage();
   await page.goto(url, { waitUntil: 'load', timeout: 60000 });
 
-  const waitUntilCleared = async (ms) => {
+  const waitUntilCleared = async (ms: number): Promise<string> => {
     const deadline = Date.now() + ms;
     let html = await safeContent(page);
     while ((isChallenge(html) || !html) && Date.now() < deadline) {
@@ -285,7 +335,7 @@ export async function gotoCleared(url, opts = {}) {
   return page;
 }
 
-export async function closeBrowser() {
+export async function closeBrowser(): Promise<void> {
   if (proxyBrowser) await proxyBrowser.close().catch(() => {});
   proxyBrowser = null;
   proxyContext = null;

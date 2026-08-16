@@ -1,19 +1,20 @@
 import crypto from 'crypto';
 import * as cheerio from 'cheerio';
 import { gotoCleared } from '../lib/browser.js';
-import { CATEGORIES, matchCategory } from '../lib/categories.js';
+import { CATEGORIES, matchCategory, type CategoryRule } from '../lib/categories.js';
 import { parseSize } from '../lib/parse.js';
+import type { MagnetRef, Provider, SearchItem } from '../lib/types.js';
 
 const BASE = 'https://ext.to';
 const MAGNET_ENDPOINT = `${BASE}/ajax/getSearchMagnet.php`;
 
-function computeHMAC(torrentId, timestamp, token) {
+function computeHMAC(torrentId: number, timestamp: number, token: string): string {
   return crypto.createHash('sha256').update(`${torrentId}|${timestamp}|${token}`).digest('hex');
 }
 
 // Matched against the breadcrumb text ("Movies", "Highres Movies", "TV").
 // Order matters - first match wins.
-const CATEGORY_RULES = [
+const CATEGORY_RULES: CategoryRule[] = [
   [['tv', 'series'], CATEGORIES.TV],
   [['anime'], CATEGORIES.TV_ANIME],
   [['music', 'audio'], CATEGORIES.AUDIO],
@@ -28,13 +29,13 @@ const CATEGORY_RULES = [
 // torrent detail page visit needed, just a fresh /browse/ page load to get
 // a valid page-nonce + csrf token, then the torrent id carried through from
 // the search results.
-async function search(q) {
+async function search(q: string): Promise<SearchItem[]> {
   const searchUrl = `${BASE}/browse/?q=${encodeURIComponent(q)}`;
   const page = await gotoCleared(searchUrl);
   try {
     const html = await page.content();
     const $ = cheerio.load(html);
-    const items = [];
+    const items: SearchItem[] = [];
 
     $('table.search-table tbody > tr').each((_, el) => {
       const $tr = $(el);
@@ -44,7 +45,7 @@ async function search(q) {
       if (!title || !href) return;
       const detailUrl = new URL(href, BASE).toString();
 
-      const torrentId = parseInt($tr.find('a.search-magnet-btn[data-id]').first().attr('data-id'), 10);
+      const torrentId = parseInt($tr.find('a.search-magnet-btn[data-id]').first().attr('data-id') || '', 10);
       if (!torrentId) return;
 
       const tds = $tr.find('> td');
@@ -59,7 +60,7 @@ async function search(q) {
       const categoryText = $tr.find('.related-posted a[href^="/"] strong').first().text().trim();
 
       const parsedDate = ageDate ? new Date(ageDate) : null;
-      const pubDate = parsedDate && !isNaN(parsedDate) ? parsedDate : new Date();
+      const pubDate = parsedDate && !isNaN(parsedDate.getTime()) ? parsedDate : new Date();
 
       items.push({
         title,
@@ -79,10 +80,15 @@ async function search(q) {
   }
 }
 
+interface MagnetPostResult {
+  status: number;
+  text: string;
+}
+
 // Resolves a magnet URI for a given torrent id using the search-listing
 // page's magnet flow. `id` is the torrent id from search() - `url` is
 // ignored, ext.to doesn't need the detail page at all.
-async function resolveMagnet({ id }) {
+async function resolveMagnet({ id }: MagnetRef): Promise<string> {
   if (!id) throw new Error('ext-to: resolveMagnet requires an id.');
 
   // Bare /browse/ (no query) doesn't render searchPageToken - needs an
@@ -93,17 +99,17 @@ async function resolveMagnet({ id }) {
     const html = await page.content();
 
     const pageTokenMatch = html.match(/searchPageToken\s*=\s*['"]([^'"]+)['"]/);
-    if (!pageTokenMatch) throw new Error('Could not find window.searchPageToken on page.');
+    if (!pageTokenMatch || !pageTokenMatch[1]) throw new Error('Could not find window.searchPageToken on page.');
     const pageToken = pageTokenMatch[1];
 
     const csrfMatch = html.match(/<meta name="csrf-token" content="([^"]+)"/);
-    if (!csrfMatch) throw new Error('Could not find csrf-token meta tag on page.');
+    if (!csrfMatch || !csrfMatch[1]) throw new Error('Could not find csrf-token meta tag on page.');
     const sessid = csrfMatch[1];
 
     const timestamp = Math.floor(Date.now() / 1000);
     const hmac = computeHMAC(id, timestamp, pageToken);
 
-    const result = await page.evaluate(
+    const result = await page.evaluate<MagnetPostResult, { endpoint: string; torrentId: number; timestamp: number; hmac: string; sessid: string }>(
       async ({ endpoint, torrentId, timestamp, hmac, sessid }) => {
         const body = new URLSearchParams({
           torrent_id: String(torrentId),
@@ -124,7 +130,7 @@ async function resolveMagnet({ id }) {
       { endpoint: MAGNET_ENDPOINT, torrentId: id, timestamp, hmac, sessid }
     );
 
-    let json;
+    let json: { success?: boolean; url?: string };
     try {
       json = JSON.parse(result.text);
     } catch {
@@ -151,4 +157,4 @@ export default {
   testQuery: 'yify',
   search,
   resolveMagnet
-};
+} satisfies Provider;

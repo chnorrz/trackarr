@@ -201,9 +201,12 @@ clearance cookie is bound to the egress IP.
 
 ## Adding a tracker
 
-Create `providers/<id>.js` exporting:
+Create `providers/<id>.ts` exporting a default that satisfies the `Provider`
+interface from `lib/types.ts`:
 
-```js
+```ts
+import type { Provider } from '../lib/types.js';
+
 export default {
   id: 'mytracker',
   name: 'My Tracker',
@@ -213,15 +216,15 @@ export default {
   async resolveMagnet({ id, url }) {
     // -> 'magnet:?xt=...'
   }
-};
+} satisfies Provider;
 ```
 
-Register it in `providers/index.js`. It gets `/<id>/api` and `/<id>/download`
-automatically. Use `gotoCleared(url)` from `lib/browser.js` to fetch pages -
+Register it in `providers/index.ts`. It gets `/<id>/api` and `/<id>/download`
+automatically. Use `gotoCleared(url)` from `lib/browser.ts` to fetch pages -
 it handles Cloudflare for you.
 
-`providers/1337x.js` is the simpler reference (magnets sit in the HTML);
-`providers/ext-to.js` shows the signed-API case.
+`providers/1337x.ts` is the simpler reference (magnets sit in the HTML);
+`providers/ext-to.ts` shows the signed-API case.
 
 ---
 

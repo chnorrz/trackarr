@@ -2,6 +2,7 @@ import * as cheerio from 'cheerio';
 import { gotoCleared } from '../lib/browser.js';
 import { CATEGORIES } from '../lib/categories.js';
 import { parseSize } from '../lib/parse.js';
+import type { MagnetRef, Provider, SearchItem } from '../lib/types.js';
 
 const BASE = 'https://eztvx.to';
 
@@ -17,7 +18,7 @@ const BASE = 'https://eztvx.to';
 // the same search URL (a page-wide layout switch, not a per-row action) -
 // the server responds with the SAME results re-rendered with a magnet link
 // embedded directly in each row. Reproducing that POST directly (same
-// pattern as ext.to's magnet API - see providers/ext-to.js) means search()
+// pattern as ext.to's magnet API - see providers/ext-to.ts) means search()
 // can capture every result's magnet in the same request that finds it,
 // instead of needing a separate detail-page visit per grab like 1337x.
 //
@@ -25,24 +26,30 @@ const BASE = 'https://eztvx.to';
 // page visit, same shape as 1337x) - it's the fallback for when a result's
 // magnet has aged out of magnetCache below (e.g. the process restarted
 // between search and grab).
-const magnetCache = new Map();
+const magnetCache = new Map<string, string>();
 const MAGNET_CACHE_MAX = 500;
 
-function rememberMagnet(detailUrl, magnet) {
+function rememberMagnet(detailUrl: string, magnet: string): void {
   if (magnetCache.size >= MAGNET_CACHE_MAX) {
-    magnetCache.delete(magnetCache.keys().next().value);
+    const oldest = magnetCache.keys().next().value;
+    if (oldest !== undefined) magnetCache.delete(oldest);
   }
   magnetCache.set(detailUrl, magnet);
 }
 
-async function search(q) {
+interface WlinksResult {
+  status: number;
+  text: string;
+}
+
+async function search(q: string): Promise<SearchItem[]> {
   const searchUrl = `${BASE}/search/?q1=${encodeURIComponent(q)}`;
   const page = await gotoCleared(searchUrl);
   try {
     // Reveal the per-row magnet links (see comment above). Runs inside the
     // page via fetch, not Node's own fetch, for the same TLS/cookie-
     // consistency reason as ext.to's magnet POST.
-    const wlinks = await page.evaluate(async (url) => {
+    const wlinks = await page.evaluate<WlinksResult, string>(async (url) => {
       const res = await fetch(url, {
         method: 'POST',
         headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
@@ -56,7 +63,7 @@ async function search(q) {
     // detail-page fallback still covers grabs either way.
     const html = wlinks.status === 200 ? wlinks.text : await page.content();
     const $ = cheerio.load(html);
-    const items = [];
+    const items: SearchItem[] = [];
 
     $('tr[name="hover"].forum_header_border').each((_, el) => {
       const $tr = $(el);
@@ -72,8 +79,8 @@ async function search(q) {
       // button cell (before the reveal-click above).
       const titleAttr = titleLink.attr('title') || titleLink.text();
       const sizeMatch = titleAttr.match(/\(([\d.,]+\s*(?:B|KB|MB|GB|TB))\)\s*$/i);
-      const title = (sizeMatch ? titleAttr.slice(0, sizeMatch.index) : titleAttr).trim();
-      const size = sizeMatch ? parseSize(sizeMatch[1]) : 0;
+      const title = (sizeMatch && sizeMatch.index !== undefined ? titleAttr.slice(0, sizeMatch.index) : titleAttr).trim();
+      const size = sizeMatch && sizeMatch[1] ? parseSize(sizeMatch[1]) : 0;
 
       const magnet = $tr.find('a.magnet[href^="magnet:"]').first().attr('href');
       if (magnet) rememberMagnet(detailUrl, magnet);
@@ -103,7 +110,7 @@ async function search(q) {
   }
 }
 
-async function resolveMagnet({ url }) {
+async function resolveMagnet({ url }: MagnetRef): Promise<string> {
   if (!url) throw new Error('eztv: resolveMagnet requires a url.');
 
   const cached = magnetCache.get(url);
@@ -130,4 +137,4 @@ export default {
   testQuery: 'MeGusta',
   search,
   resolveMagnet
-};
+} satisfies Provider;

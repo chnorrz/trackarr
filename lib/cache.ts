@@ -1,12 +1,19 @@
+interface CacheEntry<T> {
+  value: T;
+  expires: number;
+}
+
 // Simple in-memory TTL cache. Good enough for a single-process server -
 // no need for anything fancier here.
-export class TTLCache {
-  constructor(ttlMs) {
+export class TTLCache<T> {
+  private readonly ttlMs: number;
+  private readonly map = new Map<string, CacheEntry<T>>();
+
+  constructor(ttlMs: number) {
     this.ttlMs = ttlMs;
-    this.map = new Map();
   }
 
-  get(key) {
+  get(key: string): T | undefined {
     const entry = this.map.get(key);
     if (!entry) return undefined;
     if (Date.now() > entry.expires) {
@@ -16,7 +23,7 @@ export class TTLCache {
     return entry.value;
   }
 
-  set(key, value) {
+  set(key: string, value: T): void {
     this.map.set(key, { value, expires: Date.now() + this.ttlMs });
   }
 }

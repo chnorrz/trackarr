@@ -9,7 +9,7 @@ export const CATEGORIES = {
   XXX: 6000,
   BOOKS: 7000,
   OTHER: 8000
-};
+} as const;
 
 export const CATEGORIES_XML = `    <category id="2000" name="Movies" />
     <category id="5000" name="TV" />
@@ -19,6 +19,9 @@ export const CATEGORIES_XML = `    <category id="2000" name="Movies" />
     <category id="6000" name="XXX" />
     <category id="7000" name="Books" />
     <category id="8000" name="Other" />`;
+
+/** An ordered [keywords, category] rule for matchCategory - first match wins. */
+export type CategoryRule = [string[], number];
 
 /**
  * Maps a provider-specific string to a Torznab category id.
@@ -30,11 +33,8 @@ export const CATEGORIES_XML = `    <category id="2000" name="Movies" />
  * The keyword tables stay in the providers because the input differs per
  * site: ext.to matches breadcrumb text, 1337x matches a CSS icon class. Only
  * the matching mechanism is shared.
- *
- * @param {string} text  e.g. "Highres Movies" or "flaticon-tv"
- * @param {Array<[string[], number]>} rules
  */
-export function matchCategory(text, rules) {
+export function matchCategory(text: string | undefined | null, rules: CategoryRule[]): number {
   const haystack = (text || '').toLowerCase();
   for (const [keywords, category] of rules) {
     if (keywords.some((k) => haystack.includes(k))) return category;

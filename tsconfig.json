@@ -1,0 +1,24 @@
+{
+  "compilerOptions": {
+    "target": "ES2023",
+    // "DOM" is only needed for the handful of page.evaluate(() => ...)
+    // callbacks (lib/browser.ts, providers/ext-to.ts, providers/eztv.ts) -
+    // those closures run inside the browser page, not this Node process, but
+    // still need document/window/fetch typed for the code to compile.
+    "lib": ["ES2023", "DOM"],
+    "module": "NodeNext",
+    "moduleResolution": "NodeNext",
+    "outDir": "dist",
+    "rootDir": ".",
+    "strict": true,
+    "noUncheckedIndexedAccess": true,
+    "esModuleInterop": true,
+    "skipLibCheck": true,
+    "forceConsistentCasingInFileNames": true,
+    "resolveJsonModule": true,
+    "sourceMap": false,
+    "declaration": false
+  },
+  "include": ["server.ts", "lib/**/*.ts", "providers/**/*.ts"],
+  "exclude": ["node_modules", "dist"]
+}

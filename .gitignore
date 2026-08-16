@@ -1,3 +1,5 @@
 node_modules
+dist
 .cf-cookies.json
+.cf-ua.txt
 *.log
