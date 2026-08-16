@@ -1,20 +1,22 @@
 import * as cheerio from 'cheerio';
 import { gotoCleared } from '../lib/browser.js';
-import { CATEGORIES } from '../lib/categories.js';
+import { CATEGORIES, matchCategory } from '../lib/categories.js';
+import { parseSize } from '../lib/parse.js';
 
 const BASE = 'https://1337x.to';
 
-function mapCategory(iconClass) {
-  const c = (iconClass || '').toLowerCase();
-  if (c.includes('tv')) return CATEGORIES.TV;
-  if (c.includes('anime')) return CATEGORIES.TV_ANIME;
-  if (c.includes('music')) return CATEGORIES.AUDIO;
-  if (c.includes('games') || c.includes('apps')) return CATEGORIES.PC;
-  if (c.includes('book')) return CATEGORIES.BOOKS;
-  if (c.includes('xxx')) return CATEGORIES.XXX;
-  if (c.includes('movie') || c.includes('hd') || c.includes('documentary')) return CATEGORIES.MOVIES;
-  return CATEGORIES.OTHER;
-}
+// Matched against the row's icon class ("flaticon-movies", "flaticon-hd").
+// Order matters - first match wins, and "hd" must stay below "tv" so an HD
+// TV episode isn't filed as a movie.
+const CATEGORY_RULES = [
+  [['tv'], CATEGORIES.TV],
+  [['anime'], CATEGORIES.TV_ANIME],
+  [['music'], CATEGORIES.AUDIO],
+  [['games', 'apps'], CATEGORIES.PC],
+  [['book'], CATEGORIES.BOOKS],
+  [['xxx'], CATEGORIES.XXX],
+  [['movie', 'hd', 'documentary'], CATEGORIES.MOVIES]
+];
 
 // 1337x's size cell has the size text followed by a nested duplicate
 // <span class="seeds">N</span> - strip nested elements to get just the
@@ -64,7 +66,7 @@ async function search(q) {
         size: parseSize(sizeText),
         seeds,
         leechers,
-        category: mapCategory(iconClass),
+        category: matchCategory(iconClass, CATEGORY_RULES),
         pubDate
       });
     });
@@ -73,15 +75,6 @@ async function search(q) {
   } finally {
     await page.close();
   }
-}
-
-function parseSize(str) {
-  const m = /^([\d.,]+)\s*(B|KB|MB|GB|TB)$/i.exec((str || '').trim());
-  if (!m) return 0;
-  const num = parseFloat(m[1].replace(',', ''));
-  const unit = m[2].toUpperCase();
-  const mult = { B: 1, KB: 1024, MB: 1024 ** 2, GB: 1024 ** 3, TB: 1024 ** 4 }[unit];
-  return Math.round(num * mult);
 }
 
 // 1337x embeds the magnet link directly on the torrent detail page - no

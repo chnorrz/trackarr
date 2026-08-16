@@ -1,7 +1,8 @@
 import crypto from 'crypto';
 import * as cheerio from 'cheerio';
 import { gotoCleared } from '../lib/browser.js';
-import { CATEGORIES } from '../lib/categories.js';
+import { CATEGORIES, matchCategory } from '../lib/categories.js';
+import { parseSize } from '../lib/parse.js';
 
 const BASE = 'https://ext.to';
 const MAGNET_ENDPOINT = `${BASE}/ajax/getSearchMagnet.php`;
@@ -10,27 +11,17 @@ function computeHMAC(torrentId, timestamp, token) {
   return crypto.createHash('sha256').update(`${torrentId}|${timestamp}|${token}`).digest('hex');
 }
 
-function parseSize(str) {
-  const m = /^([\d.,]+)\s*(B|KB|MB|GB|TB)$/i.exec((str || '').trim());
-  if (!m) return 0;
-  const num = parseFloat(m[1].replace(',', ''));
-  const unit = m[2].toUpperCase();
-  const mult = { B: 1, KB: 1024, MB: 1024 ** 2, GB: 1024 ** 3, TB: 1024 ** 4 }[unit];
-  return Math.round(num * mult);
-}
-
-function mapCategory(name) {
-  const n = (name || '').toLowerCase();
-  if (n.includes('tv') || n.includes('series')) return CATEGORIES.TV;
-  if (n.includes('anime')) return CATEGORIES.TV_ANIME;
-  if (n.includes('music') || n.includes('audio')) return CATEGORIES.AUDIO;
-  if (n.includes('game')) return CATEGORIES.PC;
-  if (n.includes('software') || n.includes('app')) return CATEGORIES.PC;
-  if (n.includes('book') || n.includes('ebook')) return CATEGORIES.BOOKS;
-  if (n.includes('xxx') || n.includes('adult')) return CATEGORIES.XXX;
-  if (n.includes('movie')) return CATEGORIES.MOVIES;
-  return CATEGORIES.OTHER;
-}
+// Matched against the breadcrumb text ("Movies", "Highres Movies", "TV").
+// Order matters - first match wins.
+const CATEGORY_RULES = [
+  [['tv', 'series'], CATEGORIES.TV],
+  [['anime'], CATEGORIES.TV_ANIME],
+  [['music', 'audio'], CATEGORIES.AUDIO],
+  [['game', 'software', 'app'], CATEGORIES.PC],
+  [['book', 'ebook'], CATEGORIES.BOOKS],
+  [['xxx', 'adult'], CATEGORIES.XXX],
+  [['movie'], CATEGORIES.MOVIES]
+];
 
 // Search results are scraped from /browse/?q=... . Magnet resolution reuses
 // the search-listing page's own magnet flow (getSearchMagnet.php) - no
@@ -77,7 +68,7 @@ async function search(q) {
         size: parseSize(sizeText),
         seeds,
         leechers,
-        category: mapCategory(categoryText),
+        category: matchCategory(categoryText, CATEGORY_RULES),
         pubDate
       });
     });
