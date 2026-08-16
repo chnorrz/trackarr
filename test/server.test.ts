@@ -7,6 +7,7 @@ import type { AddressInfo } from 'node:net';
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.resolve(__dirname, '..');
 const { createApp } = await import(path.join(ROOT, 'dist', 'server.js'));
+const { ProviderStatusTracker } = await import(path.join(ROOT, 'dist', 'lib', 'status.js'));
 
 const API_KEY = 'test-key-123';
 
@@ -208,4 +209,62 @@ test('download errors surface as 500 with the error message', async () => {
     assert.equal(res.status, 500);
     assert.match(await res.text(), /resolve failed/);
   });
+});
+
+// The rendered page's own <style> block contains ".badge-ok"/".badge-error"/
+// ".badge-unknown" as CSS class selectors, so a loose substring match for
+// any of those always "matches" regardless of actual state - assert against
+// the rendered <span> element itself instead.
+const badgeUnknown = /<span class="badge badge-unknown">UNKNOWN<\/span>/;
+const badgeOk = /<span class="badge badge-ok">OK<\/span>/;
+const badgeError = /<span class="badge badge-error">ERROR<\/span>/;
+
+test('GET / needs no apikey and lists a provider that has never been checked as unknown', async () => {
+  await withServer({ fake: fakeProvider() }, async (base) => {
+    const res = await fetch(`${base}/`);
+    assert.equal(res.status, 200);
+    assert.match(res.headers.get('content-type') ?? '', /html/);
+    const body = await res.text();
+    assert.match(body, /Fake Provider/);
+    assert.match(body, badgeUnknown);
+  });
+});
+
+test('GET / reflects a successful search as OK', async () => {
+  const statusTracker = new ProviderStatusTracker();
+  await withServer({ fake: fakeProvider() }, async (base) => {
+    await fetch(`${base}/fake/api?t=search&q=x&apikey=${API_KEY}`);
+    const body = await (await fetch(`${base}/`)).text();
+    assert.match(body, badgeOk);
+    assert.doesNotMatch(body, badgeUnknown);
+  }, { statusTracker });
+});
+
+test('GET / reflects a failed search as an error, with the message shown', async () => {
+  const statusTracker = new ProviderStatusTracker();
+  const provider = fakeProvider({ search: async () => { throw new Error('Cloudflare blocked'); } });
+  await withServer({ fake: provider }, async (base) => {
+    await fetch(`${base}/fake/api?t=search&q=x&apikey=${API_KEY}`);
+    const body = await (await fetch(`${base}/`)).text();
+    assert.match(body, badgeError);
+    assert.match(body, /Cloudflare blocked/);
+  }, { statusTracker });
+});
+
+test('GET / status reflects the most recent outcome, not the first', async () => {
+  const statusTracker = new ProviderStatusTracker();
+  let fail = true;
+  const provider = fakeProvider({
+    search: async () => {
+      if (fail) { fail = false; throw new Error('first attempt failed'); }
+      return [fakeItem()];
+    }
+  });
+  await withServer({ fake: provider }, async (base) => {
+    await fetch(`${base}/fake/api?t=search&q=a&apikey=${API_KEY}`); // fails
+    await fetch(`${base}/fake/api?t=search&q=b&apikey=${API_KEY}`); // succeeds (different q, so not cached)
+    const body = await (await fetch(`${base}/`)).text();
+    assert.match(body, badgeOk);
+    assert.doesNotMatch(body, /first attempt failed/);
+  }, { statusTracker });
 });

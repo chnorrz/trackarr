@@ -21,6 +21,7 @@ import express, { type Application, type Request, type Response } from 'express'
 import { closeBrowser, gotoCleared } from './lib/browser.js';
 import { CATEGORIES_XML } from './lib/categories.js';
 import { TTLCache } from './lib/cache.js';
+import { ProviderStatusTracker, renderStatusPage } from './lib/status.js';
 import { providerMap } from './providers/index.js';
 import type { MagnetRef, Provider, SearchItem } from './lib/types.js';
 
@@ -84,6 +85,11 @@ export interface AppOptions {
   apiKey?: string;
   searchCacheTtlMs?: number;
   magnetCacheTtlMs?: number;
+  // Shared with the keep-alive scheduler in production (see the isMain
+  // block at the bottom) so a provider's status reflects both background
+  // checks and real requests. Tests can inject their own to assert on it
+  // directly; otherwise each app gets its own, independent instance.
+  statusTracker?: ProviderStatusTracker;
 }
 
 // Factory rather than a module-level app: lets tests inject a fake
@@ -95,6 +101,7 @@ export function createApp(providers: Record<string, Provider>, opts: AppOptions 
   const apiKey = opts.apiKey ?? API_KEY;
   const searchCache = new TTLCache<SearchItem[]>(opts.searchCacheTtlMs ?? SEARCH_CACHE_TTL_MS);
   const magnetCache = new TTLCache<string>(opts.magnetCacheTtlMs ?? MAGNET_CACHE_TTL_MS);
+  const statusTracker = opts.statusTracker ?? new ProviderStatusTracker();
 
   function checkKey(req: Request, res: Response): boolean {
     if (queryString(req.query.apikey) !== apiKey) {
@@ -197,6 +204,13 @@ ${rows}
 
   const app = express();
 
+  // No apikey needed - same reasoning as ?t=caps: this exposes no torrent
+  // data and lets you do nothing, it's just a health dashboard meant to be
+  // pulled up directly in a browser.
+  app.get('/', (_req: Request, res: Response) => {
+    res.type('html').send(renderStatusPage(providers, statusTracker));
+  });
+
   function getProvider(req: Request, res: Response): Provider | null {
     const provider = providers[req.params.provider as string];
     if (!provider) {
@@ -223,10 +237,13 @@ ${rows}
       const q = queryString(req.query.q) || '';
       try {
         const items = await search(provider, q);
+        statusTracker.recordSuccess(provider.id);
         res.type('application/xml').send(buildRss(req, provider, items));
       } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        statusTracker.recordFailure(provider.id, message);
         console.error(`${provider.id} search error:`, err);
-        res.status(500).send(`Search failed: ${err instanceof Error ? err.message : String(err)}`);
+        res.status(500).send(`Search failed: ${message}`);
       }
       return;
     }
@@ -263,23 +280,26 @@ ${rows}
 // Visits a provider's keep-alive URL so its clearance cookie stays fresh.
 // gotoCleared() already solves only when challenged, so this is cheap while
 // the cookie is still valid.
-async function warmProvider(provider: Provider): Promise<void> {
+async function warmProvider(provider: Provider, statusTracker: ProviderStatusTracker): Promise<void> {
   const ka = provider.keepAlive;
   if (!ka) return;
   const started = Date.now();
   try {
     const page = await gotoCleared(ka.url, ka.proxy ? { proxy: ka.proxy } : {});
     await page.close();
+    statusTracker.recordSuccess(provider.id);
     console.error(`[keepalive] ${provider.id} ok (${Date.now() - started}ms)`);
   } catch (err) {
     // Never throw: a tracker being unreachable must not kill the scheduler.
-    console.error(`[keepalive] ${provider.id} failed: ${err instanceof Error ? err.message : String(err)}`);
+    const message = err instanceof Error ? err.message : String(err);
+    statusTracker.recordFailure(provider.id, message);
+    console.error(`[keepalive] ${provider.id} failed: ${message}`);
   }
 }
 
 let keepAliveTimer: ReturnType<typeof setTimeout> | null = null;
 
-function scheduleKeepAlive(): void {
+function scheduleKeepAlive(statusTracker: ProviderStatusTracker): void {
   if (!KEEPALIVE_INTERVAL_MS) {
     console.log('Keep-alive disabled (KEEPALIVE_INTERVAL_MS=0)');
     return;
@@ -290,7 +310,7 @@ function scheduleKeepAlive(): void {
     // Sequential, not parallel: solves are serialised anyway (XTEST input is
     // global), and this keeps at most one browser page open at a time.
     for (const provider of Object.values(providerMap)) {
-      await warmProvider(provider);
+      await warmProvider(provider, statusTracker);
     }
     // +/-20% jitter, so we're not hitting the trackers on an exact schedule.
     const next = KEEPALIVE_INTERVAL_MS * (0.8 + Math.random() * 0.4);
@@ -314,14 +334,18 @@ async function shutdown(): Promise<void> {
 // these side effects.
 const isMain = import.meta.url === `file://${process.argv[1]}`;
 if (isMain) {
-  const app = createApp(providerMap);
+  // Shared between the app's routes and the keep-alive scheduler, so the
+  // status page reflects both real requests and background checks.
+  const statusTracker = new ProviderStatusTracker();
+  const app = createApp(providerMap, { statusTracker });
   app.listen(PORT, () => {
     console.log(`Torznab server listening on http://localhost:${PORT}`);
+    console.log(`  status page: http://localhost:${PORT}/`);
     for (const provider of Object.values(providerMap)) {
       console.log(`  ${provider.name}: http://localhost:${PORT}/${provider.id}/api`);
     }
     console.log(`API key: ${API_KEY}${API_KEY === 'changeme' ? ' (set API_KEY env var to something real!)' : ''}`);
-    scheduleKeepAlive();
+    scheduleKeepAlive(statusTracker);
   });
 
   process.on('SIGINT', shutdown);

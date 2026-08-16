@@ -63,6 +63,10 @@ Prowlarr  ──HTTP──>  trackarr  ──> headless Firefox (Camoufox)  ─�
   ~20 s, and paying that during a Prowlarr search can make the search time
   out. A periodic task visits each tracker to keep the cookie fresh, so
   searches stay in the low seconds.
+- **A status page at `/`** shows every provider's current state (OK/error/
+  never checked), when it was last checked or used, and the error message if
+  it's failing - reflects both the background keep-alive and real Prowlarr
+  requests, whichever happened more recently. No apikey needed.
 
 `.cf-cookies.json` in the data volume holds the Cloudflare clearance, so
 restarts don't trigger a fresh challenge.
@@ -94,7 +98,8 @@ docker run -d --name trackarr \
   trackarr
 ```
 
-Check it's alive - this needs no API key:
+Check it's alive by opening `http://localhost:9117/` in a browser - the
+status page needs no API key. Or from the command line:
 
 ```bash
 curl "http://localhost:9117/ext-to/api?t=caps"
