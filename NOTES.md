@@ -97,60 +97,113 @@ Much lighter protection, and **no cookie needed**.
 - Dates are only relative strings; no exact-date attribute. `pubDate` falls
   back to now.
 
-### The IPv4 ban — and the fix
+### Reachability
 
-1337x has banned the **IPv4** address; the IPv6 is clean.
+1337x has banned our **IPv4** address; our IPv6 is clean. It therefore works
+in a desktop browser but not from the container, and needs the host proxy —
+see [section 4](#4-ipv4-bans-and-the-ipv6-proxy). It requests this itself via
+`gotoCleared(url, { proxy: '1337x' })`, so it only needs `PROXY_URL` set.
 
-| Path | Result |
-|---|---|
-| macOS host (prefers IPv6) | normal solvable challenge |
-| Host forced to IPv4 | `banned your IP`, Cloudflare error **1006** |
-| Container (no IPv6) | same ban page |
-| Container → host proxy → IPv6 | **works** |
+---
 
-**Colima's VM has no IPv6 at all** — no global addresses, no egress — so
-enabling IPv6 in the Docker daemon cannot help. The VM simply can't route it.
+## 4. IPv4 bans and the IPv6 proxy
 
-A 1006 page has **no widget**, so the Turnstile auto-solver is irrelevant
-here. Different failure, different fix.
+Some trackers ban an IPv4 address while leaving the IPv6 clean. The site then
+keeps working in your desktop browser (macOS prefers IPv6 per RFC 6724) but
+fails from the container, which looks convincingly like fingerprinting or a
+parser bug. **Check this first** - it cost hours of chasing the wrong thing.
 
-**Solution:** run **tinyproxy** on the macOS host (which has working IPv6) and
-tunnel the container through it. Because HTTP `CONNECT` only pipes bytes, TLS
-stays end-to-end and the browser's fingerprint is unchanged — only the egress
-address differs.
+### Symptoms
+
+- Cloudflare **error 1006**, `Access denied ... has banned your IP`. It is a
+  static page with **no Turnstile widget**, so the auto-solver cannot help.
+  Different failure, different fix.
+- The exact same URL loads fine in a normal browser on the same machine.
+- `isBlocked()` fires. Before that check existed this showed up as a silent
+  "0 results", which is far more confusing.
+
+### Diagnose
+
+**1. Does the target even have IPv6, and which family did the host use?**
+
+```bash
+dig +short AAAA <host>     # empty -> no IPv6 at all, this is not your problem
+curl -s -o /dev/null -m 15 -w '%{remote_ip}\n' https://<host>/
+```
+
+**2. Force each family on the host and compare.** This is the money shot:
+
+```bash
+UA="Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:153.0) Gecko/20100101 Firefox/153.0"
+for f in 4 6; do
+  body=$(curl -s -$f -m 20 -A "$UA" https://<host>/)
+  printf "IPv%s len=%s banned=%s\n" "$f" "${#body}" \
+    "$(grep -qc 'banned your IP' <<<"$body" && echo YES || echo no)"
+done
+```
+
+IPv4 banned + IPv6 clean confirms it. For a browser-level control (same
+binary, only the family differs):
+
+```js
+Camoufox({ headless: true, firefox_user_prefs: { 'network.dns.disableIPv6': true } })
+```
+
+**3. Confirm the container has no IPv6 of its own:**
+
+```bash
+docker run --rm <image> bash -c 'curl -s -6 -m 8 https://api64.ipify.org || echo "no IPv6"'
+colima ssh -- ip -6 addr show scope global      # expect empty
+```
+
+### Why enabling IPv6 in Docker does not help
+
+Colima's VM has no global IPv6 addresses and no IPv6 egress, so the Docker
+daemon has nothing to route. The traffic has to leave via the host instead.
+
+### Fix: proxy through the host
+
+Run **tinyproxy** on the host and tunnel the container through it. HTTP
+`CONNECT` only pipes bytes, so TLS stays end-to-end and the browser's
+fingerprint is unchanged - only the egress address differs.
 
 No IPv6-specific flag is needed: tinyproxy uses the system resolver, and macOS
-follows RFC 6724 (IPv6 first) — the same reason a normal browser here reaches
-1337x fine. (An earlier hand-rolled Node proxy *did* need an explicit
-`family: 6`, because Node's Happy Eyeballs kept picking the banned IPv4. That
-is a Node quirk, not a system one.)
+prefers IPv6. (A hand-rolled Node proxy *did* need an explicit `family: 6`,
+because Node's Happy Eyeballs kept picking the banned IPv4 - a Node quirk, not
+a system one.)
 
 ```bash
 brew install tinyproxy
 
-# must outlive the shell, hence launchctl
+# must outlive the shell, hence launchctl (see section 7)
 launchctl submit -l ext-tinyproxy -o /tmp/tp.log -e /tmp/tp.err \
   -- "$(which tinyproxy)" -d -c /path/to/tools/tinyproxy.conf
 
-# container reaches the host at host.docker.internal (192.168.5.2 under Colima)
+# host address from inside a container: 192.168.5.2 under Colima,
+# host.docker.internal elsewhere
 docker run ... -e PROXY_URL=http://192.168.5.2:8888 ...
 ```
 
 `tools/tinyproxy.conf` restricts access to localhost plus the Docker/Colima
-ranges — without those `Allow` lines it would be an open relay on the LAN.
+ranges. Without those `Allow` lines it is an open relay on the LAN.
 
-### Proxy configuration (env)
+### Configuration (env)
 
 | Var | Meaning |
 |---|---|
 | `PROXY_URL` | e.g. `http://192.168.5.2:8888`. **Unset = proxy disabled**, everything direct. |
-| `PROXY_PROVIDERS` | Comma-separated provider ids, overriding which use it. Unset = whichever ask in code. Set but **empty = none** (kill switch). |
+| `PROXY_PROVIDERS` | Comma-separated provider ids, overriding which use it. Unset = whichever ask in code. Set but **empty = none** (kill switch, no code change needed). |
 
-Providers ask per request with `gotoCleared(url, { proxy: '<id>' })`; passing
-the id is what lets `PROXY_PROVIDERS` target them. A provider asking for a
-proxy that isn't configured silently goes direct. Only the direct context's
-cookies are persisted, so a proxied context can't clobber ext.to's
-`cf_clearance`.
+Providers opt in per request with `gotoCleared(url, { proxy: '<id>' })`;
+passing the id is what lets `PROXY_PROVIDERS` target them. Asking for a proxy
+that isn't configured silently falls back to direct.
+
+Only the direct context's cookies are persisted, so a proxied context cannot
+clobber ext.to's `cf_clearance`.
+
+**Do not proxy a provider that works directly.** `cf_clearance` is bound to
+the egress IP (section 5), so routing ext.to through the proxy would
+invalidate its stored cookie.
 
 Verified behaviour:
 
@@ -162,7 +215,7 @@ Verified behaviour:
 
 ---
 
-## 4. Cloudflare: what is and isn't true
+## 5. Cloudflare: what is and isn't true
 
 ### Detection markers
 
@@ -221,7 +274,7 @@ the magnet POST, must run inside the browser page** via
 
 ---
 
-## 5. The auto-solver
+## 6. The auto-solver
 
 This is the fragile heart of the project. Three non-obvious requirements,
 all found empirically:
@@ -273,7 +326,7 @@ approach → click. The warm-up (~30 moves) is what unsticks "Verifying...".
 
 ---
 
-## 6. Environment gotchas
+## 7. Environment gotchas
 
 **Colima does not mount the host's `/tmp`.** `-v /tmp/x:/data` silently
 mounts a *VM-local* directory, which may hold stale files from earlier runs.
@@ -314,7 +367,7 @@ time; `server.js` now only caches non-empty results.
 
 ---
 
-## 7. Debugging playbook
+## 8. Debugging playbook
 
 **Never conclude "the site escalated / banned us" without running a control.**
 I did this twice and was wrong both times. Keep a known-good standalone
@@ -371,7 +424,7 @@ cf_clearance hides solver breakage entirely.
 
 ---
 
-## 8. Open issues
+## 9. Open issues
 
 **Concurrent solves are unserialised.** XTEST input is global to the display,
 so two simultaneous solves fight over one virtual mouse. Low risk under
