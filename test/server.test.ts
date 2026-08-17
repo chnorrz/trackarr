@@ -268,3 +268,52 @@ test('GET / status reflects the most recent outcome, not the first', async () =>
     assert.doesNotMatch(body, /first attempt failed/);
   }, { statusTracker });
 });
+
+test('GET / shows "no requests yet" before any search or download has happened', async () => {
+  await withServer({ fake: fakeProvider() }, async (base) => {
+    const body = await (await fetch(`${base}/`)).text();
+    assert.match(body, /no requests yet/);
+  });
+});
+
+test('GET / request stats count a cache hit as both served and cached', async () => {
+  const statusTracker = new ProviderStatusTracker();
+  await withServer({ fake: fakeProvider() }, async (base) => {
+    await fetch(`${base}/fake/api?t=search&q=same&apikey=${API_KEY}`); // live fetch
+    await fetch(`${base}/fake/api?t=search&q=same&apikey=${API_KEY}`); // cache hit
+    const body = await (await fetch(`${base}/`)).text();
+    assert.match(body, /2 served/);
+    assert.match(body, /2 ok \(50% cached\)/);
+    assert.match(body, /0 failed/);
+  }, { statusTracker });
+});
+
+test('GET / request stats count a failed search separately from successes', async () => {
+  const statusTracker = new ProviderStatusTracker();
+  let fail = true;
+  const provider = fakeProvider({
+    search: async () => {
+      if (fail) { fail = false; throw new Error('boom'); }
+      return [fakeItem()];
+    }
+  });
+  await withServer({ fake: provider }, async (base) => {
+    await fetch(`${base}/fake/api?t=search&q=a&apikey=${API_KEY}`); // fails
+    await fetch(`${base}/fake/api?t=search&q=b&apikey=${API_KEY}`); // succeeds
+    const body = await (await fetch(`${base}/`)).text();
+    assert.match(body, /2 served/);
+    assert.match(body, /1 ok/);
+    assert.match(body, /1 failed/);
+  }, { statusTracker });
+});
+
+test('GET / request stats also count download requests, not just search', async () => {
+  const statusTracker = new ProviderStatusTracker();
+  await withServer({ fake: fakeProvider() }, async (base) => {
+    await fetch(`${base}/fake/download?apikey=${API_KEY}&id=1`, { redirect: 'manual' }); // live
+    await fetch(`${base}/fake/download?apikey=${API_KEY}&id=1`, { redirect: 'manual' }); // cached
+    const body = await (await fetch(`${base}/`)).text();
+    assert.match(body, /2 served/);
+    assert.match(body, /2 ok \(50% cached\)/);
+  }, { statusTracker });
+});

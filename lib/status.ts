@@ -2,32 +2,79 @@ import type { Provider } from './types.js';
 
 export type ProviderState = 'ok' | 'error' | 'unknown';
 
+// Cumulative counters, never reset except by a process restart. `cached` is
+// a subset of `successful` (a cache hit is still a successful request), not
+// a separate outcome - so successful - cached is what actually hit the
+// tracker. `total` is `successful + failed`, kept as its own field only for
+// convenience when rendering.
+export interface ProviderStats {
+  total: number;
+  successful: number;
+  cached: number;
+  failed: number;
+}
+
 export interface ProviderStatus {
   state: ProviderState;
   lastCheckedAt: Date | null;
   lastError: string | null;
+  stats: ProviderStats;
 }
 
-const UNKNOWN: ProviderStatus = { state: 'unknown', lastCheckedAt: null, lastError: null };
+const EMPTY_STATS: ProviderStats = { total: 0, successful: 0, cached: 0, failed: 0 };
+const UNKNOWN: ProviderStatus = { state: 'unknown', lastCheckedAt: null, lastError: null, stats: EMPTY_STATS };
 
 // Tracks each provider's health, updated from two places: the background
-// keep-alive scheduler (server.ts's warmProvider) and real search requests
-// (server.ts's createApp). "Last checked/used" is deliberately one merged
-// timestamp rather than two - whichever happened more recently, background
-// check or real Prowlarr request, is what's shown.
+// keep-alive scheduler (server.ts's warmProvider) and real search/download
+// requests (server.ts's createApp). "Last checked/used" is deliberately one
+// merged timestamp rather than two - whichever happened more recently,
+// background check or real Prowlarr request, is what's shown.
 //
-// Not persisted - a restart resets everyone to 'unknown' until the next
-// check. That's fine: the keep-alive scheduler's boot-time warm-up (see
-// server.ts) fires within a few seconds, so the window is brief.
+// Request *counts* only come from recordRequest, never recordCheck - a
+// background keep-alive ping isn't a request Prowlarr made, and counting it
+// as one would make the stats reflect KEEPALIVE_INTERVAL_MS as much as
+// actual usage.
+//
+// Not persisted - a restart resets everyone to 'unknown' (and stats to
+// zero) until the next check. That's fine for state (the keep-alive
+// scheduler's boot-time warm-up fires within a few seconds), and stats
+// resetting on restart is expected for a simple in-memory counter like
+// this - it's meant for "is this provider healthy right now", not as a
+// long-term metrics store.
 export class ProviderStatusTracker {
   private readonly statuses = new Map<string, ProviderStatus>();
 
-  recordSuccess(providerId: string): void {
-    this.statuses.set(providerId, { state: 'ok', lastCheckedAt: new Date(), lastError: null });
+  private statsFor(providerId: string): ProviderStats {
+    return this.statuses.get(providerId)?.stats ?? EMPTY_STATS;
   }
 
-  recordFailure(providerId: string, error: string): void {
-    this.statuses.set(providerId, { state: 'error', lastCheckedAt: new Date(), lastError: error });
+  // Background keep-alive check - updates state/last-checked only, doesn't
+  // touch the request counters.
+  recordCheck(providerId: string, ok: boolean, error?: string): void {
+    this.statuses.set(providerId, {
+      state: ok ? 'ok' : 'error',
+      lastCheckedAt: new Date(),
+      lastError: ok ? null : (error ?? null),
+      stats: this.statsFor(providerId)
+    });
+  }
+
+  // A real search or download request - updates state/last-checked AND
+  // increments the request counters. `cached` only matters when ok is true.
+  recordRequest(providerId: string, ok: boolean, opts: { cached?: boolean; error?: string } = {}): void {
+    const prev = this.statsFor(providerId);
+    const stats: ProviderStats = {
+      total: prev.total + 1,
+      successful: prev.successful + (ok ? 1 : 0),
+      cached: prev.cached + (ok && opts.cached ? 1 : 0),
+      failed: prev.failed + (ok ? 0 : 1)
+    };
+    this.statuses.set(providerId, {
+      state: ok ? 'ok' : 'error',
+      lastCheckedAt: new Date(),
+      lastError: ok ? null : (opts.error ?? null),
+      stats
+    });
   }
 
   get(providerId: string): ProviderStatus {
@@ -61,6 +108,17 @@ function formatRelativeTime(date: Date | null): string {
 
 const STATE_LABEL: Record<ProviderState, string> = { ok: 'OK', error: 'ERROR', unknown: 'UNKNOWN' };
 
+function formatStats(stats: ProviderStats): string {
+  if (stats.total === 0) return 'no requests yet';
+  // % cached is of successful requests, not of total - a cache hit can only
+  // happen on what would otherwise have been a success, so "cached" and
+  // "failed" aren't comparable slices of the same pie.
+  const cachedPart = stats.successful > 0
+    ? ` (${Math.round((stats.cached / stats.successful) * 100)}% cached)`
+    : '';
+  return `${stats.total} served \u00b7 ${stats.successful} ok${cachedPart} \u00b7 ${stats.failed} failed`;
+}
+
 // Root-level status dashboard - not behind the apikey (nothing here is
 // torrent data or lets you do anything, same reasoning as ?t=caps needing
 // no key), meant to be pulled up in a browser for an at-a-glance check.
@@ -73,6 +131,7 @@ export function renderStatusPage(providers: Record<string, Provider>, tracker: P
     <td>${escapeHtml(provider.name)}</td>
     <td><span class="badge badge-${status.state}">${STATE_LABEL[status.state]}</span></td>
     <td title="${status.lastCheckedAt ? escapeHtml(status.lastCheckedAt.toISOString()) : ''}">${escapeHtml(formatRelativeTime(status.lastCheckedAt))}</td>
+    <td class="stats-cell">${escapeHtml(formatStats(status.stats))}</td>
     <td class="error-cell">${errorCell}</td>
   </tr>`;
     })
@@ -94,6 +153,7 @@ export function renderStatusPage(providers: Record<string, Provider>, tracker: P
   .badge-ok { background: #1f4d2c; color: #7fd99a; }
   .badge-error { background: #4d1f1f; color: #ff8a8a; }
   .badge-unknown { background: #3a3a3a; color: #aaa; }
+  .stats-cell { color: #aaa; font-size: 0.85rem; white-space: nowrap; }
   .error-cell { color: #ff8a8a; font-size: 0.85rem; font-family: ui-monospace, monospace; }
   footer { margin-top: 1.5rem; color: #666; font-size: 0.8rem; }
 </style>
@@ -101,7 +161,7 @@ export function renderStatusPage(providers: Record<string, Provider>, tracker: P
 <body>
 <h1>trackarr</h1>
 <table>
-  <tr><th>Provider</th><th>Status</th><th>Last checked/used</th><th>Error</th></tr>
+  <tr><th>Provider</th><th>Status</th><th>Last checked/used</th><th>Requests</th><th>Error</th></tr>
 ${rows}
 </table>
 <footer>Auto-refreshes every 30s.</footer>

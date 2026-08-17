@@ -111,7 +111,7 @@ export function createApp(providers: Record<string, Provider>, opts: AppOptions 
     return true;
   }
 
-  async function search(provider: Provider, q: string): Promise<SearchItem[]> {
+  async function search(provider: Provider, q: string): Promise<{ items: SearchItem[]; cached: boolean }> {
     // Prowlarr's "Test" button (and likely periodic health checks) queries
     // with an empty q, and requires a non-empty result set to let the
     // indexer be saved - an empty-but-valid response isn't enough
@@ -138,10 +138,10 @@ export function createApp(providers: Record<string, Provider>, opts: AppOptions 
     }
 
     const cacheKey = `${provider.id}:${q.toLowerCase().trim()}`;
-    const cached = searchCache.get(cacheKey);
-    if (cached) {
+    const cachedItems = searchCache.get(cacheKey);
+    if (cachedItems) {
       console.error(`[cache] search hit for ${provider.id} q=${JSON.stringify(q)}`);
-      return cached;
+      return { items: cachedItems, cached: true };
     }
 
     const items = await provider.search(q);
@@ -150,20 +150,20 @@ export function createApp(providers: Record<string, Provider>, opts: AppOptions 
     // for the full TTL and keep being served after the underlying problem
     // is fixed.
     if (items.length) searchCache.set(cacheKey, items);
-    return items;
+    return { items, cached: false };
   }
 
-  async function resolveMagnet(provider: Provider, ref: MagnetRef): Promise<string> {
+  async function resolveMagnet(provider: Provider, ref: MagnetRef): Promise<{ magnet: string; cached: boolean }> {
     const cacheKey = `${provider.id}:${ref.id ?? ref.url}`;
-    const cached = magnetCache.get(cacheKey);
-    if (cached) {
+    const cachedMagnet = magnetCache.get(cacheKey);
+    if (cachedMagnet) {
       console.error(`[cache] magnet hit for ${provider.id} ${JSON.stringify(ref)}`);
-      return cached;
+      return { magnet: cachedMagnet, cached: true };
     }
 
     const magnet = await provider.resolveMagnet(ref);
     magnetCache.set(cacheKey, magnet);
-    return magnet;
+    return { magnet, cached: false };
   }
 
   function buildRss(req: Request, provider: Provider, items: SearchItem[]): string {
@@ -236,12 +236,12 @@ ${rows}
     if (t === 'search' || t === 'movie-search' || t === 'tv-search') {
       const q = queryString(req.query.q) || '';
       try {
-        const items = await search(provider, q);
-        statusTracker.recordSuccess(provider.id);
+        const { items, cached } = await search(provider, q);
+        statusTracker.recordRequest(provider.id, true, { cached });
         res.type('application/xml').send(buildRss(req, provider, items));
       } catch (err) {
         const message = err instanceof Error ? err.message : String(err);
-        statusTracker.recordFailure(provider.id, message);
+        statusTracker.recordRequest(provider.id, false, { error: message });
         console.error(`${provider.id} search error:`, err);
         res.status(500).send(`Search failed: ${message}`);
       }
@@ -266,11 +266,14 @@ ${rows}
     }
 
     try {
-      const magnet = await resolveMagnet(provider, { id, url });
+      const { magnet, cached } = await resolveMagnet(provider, { id, url });
+      statusTracker.recordRequest(provider.id, true, { cached });
       res.redirect(302, magnet);
     } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      statusTracker.recordRequest(provider.id, false, { error: message });
       console.error(`${provider.id} download error:`, err);
-      res.status(500).send(`Download failed: ${err instanceof Error ? err.message : String(err)}`);
+      res.status(500).send(`Download failed: ${message}`);
     }
   });
 
@@ -287,12 +290,12 @@ async function warmProvider(provider: Provider, statusTracker: ProviderStatusTra
   try {
     const page = await gotoCleared(ka.url, ka.proxy ? { proxy: ka.proxy } : {});
     await page.close();
-    statusTracker.recordSuccess(provider.id);
+    statusTracker.recordCheck(provider.id, true);
     console.error(`[keepalive] ${provider.id} ok (${Date.now() - started}ms)`);
   } catch (err) {
     // Never throw: a tracker being unreachable must not kill the scheduler.
     const message = err instanceof Error ? err.message : String(err);
-    statusTracker.recordFailure(provider.id, message);
+    statusTracker.recordCheck(provider.id, false, message);
     console.error(`[keepalive] ${provider.id} failed: ${message}`);
   }
 }
