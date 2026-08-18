@@ -1,6 +1,6 @@
 import crypto from 'crypto';
 import * as cheerio from 'cheerio';
-import { gotoCleared } from '../lib/browser.js';
+import { fetchCfProtectedPage } from '../lib/browser.js';
 import { CATEGORIES, matchCategory, type CategoryRule } from '../lib/categories.js';
 import { fetchMergedBrowse, fetchPagedWindow } from '../lib/paging.js';
 import { parseSize } from '../lib/parse.js';
@@ -34,12 +34,16 @@ const CATEGORY_RULES: CategoryRule[] = [
   [['/tv/'], CATEGORIES.TV],
   [['/anime/'], CATEGORIES.TV_ANIME],
   // Live subcategory slug is /books/audio-books/ - hyphenated, plural.
-  [['audio-book'], CATEGORIES.AUDIOBOOKS],
+  [['/books/audio-books/'], CATEGORIES.AUDIOBOOKS],
   [['/music/'], CATEGORIES.AUDIO],
   // Live subcategories under /games/ - must stay above the generic
   // /games/ fallback below, same reasoning as audio-book above /books/.
   [['/games/pc-games/'], CATEGORIES.PC_GAMES],
   [['/games/other-games/'], CATEGORIES.CONSOLE_OTHER],
+  // Unrecognized /games/ subcategory (neither of the two above) - closer
+  // to a PC game than anything else on offer, so that's the fallback
+  // rather than generic PC software.
+  [['/games/'], CATEGORIES.PC_GAMES],
   // Real top-level slug is /applications/, not /apps/ - confirmed live.
   // Mac/Android are their own subcategories; Windows has none (falls
   // through to the generic /applications/ rule below, which is correct -
@@ -47,10 +51,6 @@ const CATEGORY_RULES: CategoryRule[] = [
   [['/applications/mac/'], CATEGORIES.PC_MAC],
   [['/applications/android/'], CATEGORIES.PC_MOBILE_ANDROID],
   [['/applications/'], CATEGORIES.PC],
-  // Unrecognized /games/ subcategory (neither of the two above) - closer
-  // to a PC game than anything else on offer, so that's the fallback
-  // rather than generic PC software.
-  [['/games/'], CATEGORIES.PC_GAMES],
   // Live subcategory slug is /books/ebooks/ - must stay above the generic
   // /books/ fallback, same reasoning as audio-book/pc-games above.
   [['/books/ebooks/'], CATEGORIES.BOOKS_EBOOK],
@@ -161,12 +161,8 @@ function parseListing(html: string, knownCategory?: number): ListingPage {
 }
 
 async function fetchListingPage(url: string, knownCategory?: number): Promise<ListingPage> {
-  const page = await gotoCleared(url);
-  try {
-    return parseListing(await page.content(), knownCategory);
-  } finally {
-    await page.close();
-  }
+  const html = await fetchCfProtectedPage(url);
+  return parseListing(html, knownCategory);
 }
 
 function browsePage(target: BrowseTarget, categoryId: number, sitePage: number): Promise<ListingPage> {
@@ -229,11 +225,6 @@ async function search(q: string, opts: SearchOptions): Promise<SearchResult> {
   );
 }
 
-interface MagnetPostResult {
-  status: number;
-  text: string;
-}
-
 // Resolves a magnet URI for a given torrent id using the search-listing
 // page's magnet flow. `id` is the torrent id from search() - `url` is
 // ignored, ext.to doesn't need the detail page at all.
@@ -242,58 +233,54 @@ async function resolveMagnet({ id }: MagnetRef): Promise<string> {
 
   // Bare /browse/ (no query) doesn't render searchPageToken - needs an
   // actual results listing. A very short/single-char query seems to trip a
-  // stricter WAF rule, so use a realistic-looking query string here.
-  const page = await gotoCleared(`${BASE}/browse/?q=yify`);
+  // stricter WAF rule, so use a realistic-looking query string here. This
+  // is the exact same URL keepAlive pings, so the HTML is very often
+  // already warm in fetchCfProtectedPage's own cache - no page interaction
+  // at all in that case, not even a fast-path fetch.
+  const html = await fetchCfProtectedPage(`${BASE}/browse/?q=yify`);
+
+  const pageTokenMatch = html.match(/searchPageToken\s*=\s*['"]([^'"]+)['"]/);
+  if (!pageTokenMatch || !pageTokenMatch[1]) throw new Error('Could not find window.searchPageToken on page.');
+  const pageToken = pageTokenMatch[1];
+
+  const csrfMatch = html.match(/<meta name="csrf-token" content="([^"]+)"/);
+  if (!csrfMatch || !csrfMatch[1]) throw new Error('Could not find csrf-token meta tag on page.');
+  const sessid = csrfMatch[1];
+
+  const timestamp = Math.floor(Date.now() / 1000);
+  const hmac = computeHMAC(id, timestamp, pageToken);
+
+  // The actual lookup is a POST, same as the read above just with a verb -
+  // fetchCfProtectedPage runs it through the same persistent page/session,
+  // no separate live-page handling needed. Its own cache is a no-op here
+  // in practice (timestamp/hmac make the body unique on every call), which
+  // is fine - correctness (never serving one torrent's response for
+  // another's request) is what the cache key guards, not a hit rate.
+  const responseText = await fetchCfProtectedPage(MAGNET_ENDPOINT, {
+    method: 'POST',
+    headers: { 'X-Requested-With': 'XMLHttpRequest', 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: new URLSearchParams({
+      torrent_id: String(id),
+      hash: '',
+      name: '',
+      timestamp: String(timestamp),
+      hmac,
+      sessid
+    }).toString()
+  });
+
+  let json: { success?: boolean; url?: string };
   try {
-    const html = await page.content();
-
-    const pageTokenMatch = html.match(/searchPageToken\s*=\s*['"]([^'"]+)['"]/);
-    if (!pageTokenMatch || !pageTokenMatch[1]) throw new Error('Could not find window.searchPageToken on page.');
-    const pageToken = pageTokenMatch[1];
-
-    const csrfMatch = html.match(/<meta name="csrf-token" content="([^"]+)"/);
-    if (!csrfMatch || !csrfMatch[1]) throw new Error('Could not find csrf-token meta tag on page.');
-    const sessid = csrfMatch[1];
-
-    const timestamp = Math.floor(Date.now() / 1000);
-    const hmac = computeHMAC(id, timestamp, pageToken);
-
-    const result = await page.evaluate<MagnetPostResult, { endpoint: string; torrentId: number; timestamp: number; hmac: string; sessid: string }>(
-      async ({ endpoint, torrentId, timestamp, hmac, sessid }) => {
-        const body = new URLSearchParams({
-          torrent_id: String(torrentId),
-          hash: '',
-          name: '',
-          timestamp: String(timestamp),
-          hmac,
-          sessid
-        });
-        const res = await fetch(endpoint, {
-          method: 'POST',
-          headers: { 'X-Requested-With': 'XMLHttpRequest' },
-          body
-        });
-        const text = await res.text();
-        return { status: res.status, text };
-      },
-      { endpoint: MAGNET_ENDPOINT, torrentId: id, timestamp, hmac, sessid }
-    );
-
-    let json: { success?: boolean; url?: string };
-    try {
-      json = JSON.parse(result.text);
-    } catch {
-      throw new Error(`Non-JSON response (status ${result.status}): ${result.text.slice(0, 300)}`);
-    }
-
-    if (!json.success || !json.url || typeof json.url !== 'string' || !json.url.startsWith('magnet:')) {
-      throw new Error(`No magnet in response: ${JSON.stringify(json)}`);
-    }
-
-    return json.url;
-  } finally {
-    await page.close();
+    json = JSON.parse(responseText);
+  } catch {
+    throw new Error(`Non-JSON response: ${responseText.slice(0, 300)}`);
   }
+
+  if (!json.success || !json.url || typeof json.url !== 'string' || !json.url.startsWith('magnet:')) {
+    throw new Error(`No magnet in response: ${JSON.stringify(json)}`);
+  }
+
+  return json.url;
 }
 
 export default {
@@ -303,22 +290,9 @@ export default {
   // doesn't render searchPageToken, and the challenge lives on the listing
   // path rather than the homepage.
   keepAlive: { url: `${BASE}/browse/?q=yify` },
-  // No XXX or Mobile-iOS here - ext.to doesn't offer either.
-  categories: [
-    CATEGORIES.MOVIES,
-    CATEGORIES.TV,
-    CATEGORIES.TV_ANIME,
-    CATEGORIES.AUDIO,
-    CATEGORIES.AUDIOBOOKS,
-    CATEGORIES.PC,
-    CATEGORIES.PC_MAC,
-    CATEGORIES.PC_MOBILE_ANDROID,
-    CATEGORIES.PC_GAMES,
-    CATEGORIES.CONSOLE_OTHER,
-    CATEGORIES.BOOKS,
-    CATEGORIES.BOOKS_EBOOK,
-    CATEGORIES.OTHER
-  ],
+  // No XXX or Mobile-iOS here - ext.to doesn't offer either. The whole
+  // browsable category set is exactly what CATEGORY_BROWSE can route.
+  categories: Object.keys(CATEGORY_BROWSE).map(Number),
   search,
   resolveMagnet
 } satisfies Provider;

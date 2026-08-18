@@ -54,7 +54,7 @@ Adding a tracker: write `providers/<id>.ts`, register in
 | files | `td[2]` |
 | age | `td[3] span:last` — **`title` attr** holds the exact date; the text is relative ("5 days ago") |
 | seeds / leechers | `td[4]` / `td[5]` |
-| category | `.related-posted a[href^="/"]:not([href^="/user/"])` **hrefs**, both breadcrumb levels, matched against `CATEGORY_RULES` (real search only — blank-query browsing already knows its category, see section 10) |
+| category | `.related-posted a[href^="/"]:not([href^="/user/"])` **hrefs**, both breadcrumb levels, matched against `CATEGORY_RULES` (real search only — blank-query browsing already knows its category, see section 11) |
 
 **Category gotcha, and it has already drifted:** `.related-posted` also
 contains an *uploader* link, which needs filtering out or you silently
@@ -81,10 +81,12 @@ reasons this matters, both found the hard way:
    only the first breadcrumb link, like the code used to, can never find
    it.
 
-`CATEGORY_RULES` in `providers/ext-to.ts` is keyed on href fragments now
-(`/tv/`, `/music/`, `audio-book`, etc), not words. Order still matters:
-`audio-book` must stay above the generic `/books/` rule, since `/books/
-audio-books/` also contains `/books/`. `parseListing()` also gained an
+`CATEGORY_RULES` in `providers/ext-to.ts` is keyed on full, delimited href
+segments now (`/tv/`, `/music/`, `/books/audio-books/`, etc), not bare
+words - every keyword is the complete path fragment, not a loose substring
+of it, for the same precision reason as 1337x's rules (section 3). Order
+still matters: `/books/audio-books/` must stay above the generic `/books/`
+rule, since it also contains `/books/`. `parseListing()` also gained an
 optional `knownCategory` param (mirrors 1337x's fix in section 3) so
 blank-query browsing - which already knows its category from the URL it
 built - never depends on this breadcrumb detection at all; only real
@@ -147,14 +149,13 @@ Much lighter protection, and **no cookie needed**.
 - Seeds / leechers: `td.coll-2.seeds` / `td.coll-3.leeches`
 - Size: `td.coll-4.size` — contains a **nested duplicate span**; strip child
   elements or you get `"2.2 GB28818"`
-- Category: primarily from the sub-category id embedded in
-  `td.coll-1.name a.icon`'s `href` (`/sub/<id>/...`) via `SUB_ID_CATEGORY`
-  in `providers/1337x.ts` — the icon **CSS class** (`flaticon-movies`,
-  `flaticon-tv`, ...) is only a fallback for an unlisted sub id, since it's
-  been observed to drift (live TV rows render `flaticon-hd`, identical to
-  HD movies — see section 3's own "Category drift" note below and section
-  10's `knownCategory` design for how blank-query browsing sidesteps this
-  entirely by already knowing which category it asked for).
+- Category: from the sub-category id embedded in `td.coll-1.name a.icon`'s
+  `href` (`/sub/<id>/...`) — the icon **CSS class** (`flaticon-movies`,
+  `flaticon-tv`, ...) isn't used at all any more, since it's been observed
+  to drift (live TV rows render `flaticon-hd`, identical to HD movies —
+  see section 3's own "Category drift" note below, and section 11's
+  `knownCategory` design for how blank-query browsing sidesteps category
+  detection entirely by already knowing which category it asked for).
 - Magnet: embedded directly on the detail page as `a[href^="magnet:"]` — no
   HMAC dance
 - Dates are only relative strings; no exact-date attribute. `pubDate` falls
@@ -173,18 +174,36 @@ a `flaticon-lossless` class no rule matched at all, falling through to
 
 The fix: every row's icon `<a>` also links to `/sub/<id>/<page>/` — a
 numeric 1337x-internal subcategory id, which turned out to be a far more
-stable signal than the CSS class. `providers/1337x.ts` has a
-`SUB_ID_CATEGORY: Partial<Record<number, number>>` table (~70 entries,
-transcribed from 1337x's own live category sidebar HTML for every top-level
-category — Movies/TV/Anime/Music/XXX/Games/Apps/Other) mapping each sub id
-to its Torznab category. `CATEGORY_RULES` (icon class) is now only a
-fallback for a sub id not yet in the table, or a row with no icon href at
-all. A handful of 1337x's "Other"-bucket sub-categories have no clean 1:1
-Torznab equivalent and were mapped by judgment call (e.g. Comics -> Books,
-Emulation -> Console/Other, Nulled Script -> generic PC) — check
-`SUB_ID_CATEGORY`'s comments if a new one needs adding.
+stable signal than the CSS class. `providers/1337x.ts` matches this the
+same way ext.to matches its own category breadcrumb (`CATEGORY_RULES` +
+`matchCategory()` - see section 2), for consistency between the two
+providers rather than two different lookup mechanisms: the href is first
+trimmed with a regex down to just the `/sub/<id>/` segment (dropping the
+trailing page number, `/sub/19/0/` -> `/sub/19/`), so what reaches
+`matchCategory()` is exactly the meaningful part and nothing else -
+`CATEGORY_RULES`' ~70 entries are then each a single fully-delimited
+keyword (`['/sub/19/'], CATEGORIES.PC_MAC`), so the match is a clean 1:1
+lookup rather than a fuzzy substring search: `/sub/19/` can never be a
+substring of `/sub/190/` (the character after "19" would have to be `/`,
+not another digit), so this has zero collision risk despite using the same
+substring-matching primitive ext.to's rules use, and rule order genuinely
+doesn't matter here (unlike ext.to's, which need specific-before-generic
+ordering for ambiguous text keywords) since every keyword already
+identifies exactly one id. Table transcribed from 1337x's own live category
+sidebar HTML for every top-level category — Movies/TV/Anime/Music/XXX/
+Games/Apps/Other. A handful of "Other"-bucket sub-categories have no clean
+1:1 Torznab equivalent and were mapped by judgment call (e.g. Comics ->
+Books, Emulation -> Console/Other, Nulled Script -> generic PC) — check
+`CATEGORY_RULES`' comments if a new one needs adding.
 
-Live-verified after the fix: the no-cat browse snapshot (see section 10)
+**The icon-class fallback was removed entirely**, not just demoted - it's
+what drifted in the first place, so falling back to it for an unrecognized
+sub id risks the exact same silent misclassification. `matchCategory()`
+itself already defaults to `CATEGORIES.OTHER` (8000) when nothing matches,
+so a sub id not yet in the table (a future 1337x subcategory) lands there
+automatically rather than needing an explicit fallback.
+
+Live-verified after the fix: the no-cat browse snapshot (see section 11)
 went from 37/0/0/32+11 (Movies/TV/Anime/Other, badly misclassified) to an
 exactly correct 20/20/-/20 split across Movies/TV/Music/Other.
 
@@ -334,6 +353,21 @@ isBlocked   = html.includes('Access denied') && html.includes('Cloudflare')
 - Wrap `page.content()` in try/catch — it throws mid-navigation during
   Cloudflare's redirect chain.
 
+**A Cloudflare failure is often transient** - live-observed a request fail
+with "Blocked by Cloudflare (IP ban/rate limit)" and then succeed on a
+plain retry a few seconds later, with nothing else changed. Looks more
+like short-lived rate-limiting than an actual ban. Surfacing that as a
+client-visible failure means Prowlarr has to notice and retry the whole
+request itself - instead, `navigateAndClear()` in `lib/browser.ts` retries
+the entire navigation once, inline, on any Cloudflare-related failure
+(challenge that didn't clear, or a hard block): fresh `page.goto`, fresh
+challenge/block check, fresh solve attempt if needed. Only surfaces an
+error to the caller if that retry ALSO fails. This covers both
+`gotoCleared()` and `fetchCfProtectedPage()`'s slow path, since both
+funnel through the same function. A genuinely persistent failure still
+surfaces as an error after the one retry - this doesn't paper over that,
+it only absorbs the transient case observed live.
+
 ### Ruled out as discriminators (all measured, all negative)
 
 Our automation is **byte-identical** to a real Firefox at every inspectable
@@ -439,7 +473,7 @@ a stale cache, and it isn't either. `gotoCleared` now waits for
 ### Concurrent navigations hang - `page.goto` needs serializing too
 
 Multi-category requests (`fetchMergedBrowse`, 1337x's no-cat 4-category
-snapshot - see section 10) fire several `gotoCleared()` calls at once via
+snapshot - see section 11) fire several `gotoCleared()` calls at once via
 `Promise.all`. Live-tested against 1337x through the proxy: a single
 concurrent navigation works fine, 2+ concurrent navigations to the same
 Cloudflare-protected host reliably hang until the 60 s `page.goto` timeout -
@@ -574,7 +608,7 @@ cf_clearance hides solver breakage entirely.
 
 Prowlarr's Test button (and Save - Save genuinely fails, red exclamation
 mark, if Test's result set is empty) searches with a **blank** `q`. There is
-no `testQuery` substitution any more (see section 10) - a blank `q` is
+no `testQuery` substitution any more (see section 11) - a blank `q` is
 passed straight to `provider.search('', opts)`, and every provider must
 implement a real "browse latest uploads" path for that case, keyed off
 `opts.category`.
@@ -613,8 +647,11 @@ A solve costs ~20 s. Landing that inside a Prowlarr search risks the search
 timing out, so a background task periodically visits each provider's
 `keepAlive.url` to keep its clearance warm.
 
-It **checks rather than solves**: `gotoCleared()` only solves when actually
-challenged, so a visit with a valid cookie is cheap. Measured on a fresh
+It **checks rather than solves**: calls the same `fetchCfProtectedPage()`
+a real listing-page fetch would (see section 10 for the full design) -
+solving only happens when actually challenged, so a visit with a valid
+cookie/session is cheap. This doubles as warming the provider's persistent
+page for real traffic, not just a throwaway check. Measured on a fresh
 volume with a 1 min interval:
 
 | Tick | ext.to | 1337x | Solve? |
@@ -635,7 +672,145 @@ request path, lower it.
 
 ---
 
-## 10. Pagination, blank-query browsing, and per-provider categories
+## 10. Caching: `fetchCfProtectedPage()` instead of a top-level result cache
+
+`server.ts` used to cache whole `SearchResult`s, keyed on
+`provider:q:sortedCat:offset:limit`. That's gone. Pagination made it a bad
+fit: every distinct `offset`/`limit` was its own cache entry with zero
+sharing between adjacent pages of the *same* query - a client walking
+several offset pages within the TTL window (exactly the scenario that
+originally motivated depth-capping in section 11) re-fetched/re-scraped the
+same underlying site pages repeatedly instead of reusing them. Worst case
+was ext.to/1337x's real-search-with-`cat` filtering (`fetchFilteredWindow`
+in `lib/paging.ts`), which always restarts scanning from site page 1 on
+every call regardless of `offset` - and EZTV's real keyword search, which
+re-scraped the *entire* site on every single offset call, no reuse at all.
+
+### The fix: cache each fetch itself, not the assembled result, via one general function
+
+`gotoCleared()` is **gone entirely** - `lib/browser.ts` now exports a
+single function, `fetchCfProtectedPage(url, opts?)`, that every provider
+uses for everything: listing/search pages, magnet resolution, even POST
+endpoints (ext.to's HMAC magnet lookup, EZTV's wlinks-reveal). `opts`
+extends the standard `RequestInit` (`method`/`headers`/`body`, same shape
+as the global `fetch()`) plus two extras (`timeoutMs`, `proxy`) - it's a
+drop-in-ish replacement for `fetch()` that resolves the body text directly
+(never a live `Response`/`Page` - nothing needs one any more, confirmed by
+grepping for `page.evaluate`/`gotoCleared` across every provider: zero
+hits).
+
+No `providerId` parameter either - the persistent page (below) is keyed by
+`new URL(url).hostname`, derived automatically rather than passed in and
+kept in sync by every caller. Every current provider only ever talks to
+one hostname, so this partitions identically to the old id-keying while
+removing a redundant parameter.
+
+Results are cached (`TTLCache<string>`, same `SEARCH_CACHE_TTL_MS` env
+var/default as the old result cache, 5 min), keyed by a **hash of
+method+url+body**, not just the URL - a GET is idempotent so the URL alone
+would be a fine key, but a POST's response depends on its body too (ext.to's
+magnet POST carries a different torrent id and a fresh per-call HMAC on
+every request to the *same* endpoint URL - caching by URL alone would serve
+one torrent's magnet response for a completely different torrent). In
+practice this makes the magnet-POST cache a permanent no-op (the body's
+never identical twice) - accepted, since correctness is what the cache key
+guards here, not a hit rate. A coarser "release -> magnet" cache is a
+plausible future addition; `server.ts`'s separate `magnetCache` (id-keyed,
+1 h TTL) already covers the common case of *re-requesting the same grab*.
+
+**One persistent, already-cleared page per hostname** (not a fresh
+`context.newPage()` per call), reused across many requests:
+
+1. **Fast path**: try `page.evaluate(() => fetch(url, init))` through that
+   persistent page's own live session - same-origin `fetch()` carries its
+   cookies and runs through the real browser's network stack (same TLS
+   fingerprint), which is exactly why this is safe against Cloudflare.
+   Skips the full navigation/render cost of `page.goto()` entirely when
+   the session's still good.
+2. **Slow path** (fetch failed outright, or the response looks like a
+   challenge/block page): navigate to re-establish the session, via
+   `navigateAndClear()` (the shared challenge-detect/XTEST-auto-solve
+   logic, still behind the existing `serializeSolve`/`serializeNav`
+   mutexes so two requests hitting a stale session at once don't both try
+   to solve it) - **then always do a fresh `fetch()` for the actual
+   target afterward**. The recovery navigation's own returned HTML is
+   *never* trusted directly, for GET or otherwise - a page fresh off a
+   solved challenge can still be mid-redirect/mid-render in ways the
+   `networkidle` wait inside `navigateAndClear` doesn't always fully close
+   out (this used to be trusted for the GET case specifically; changed
+   after reasoning through the risk generally, not from a caught live
+   bug). What to navigate *to* differs by method:
+   - **GET**: the target `url` itself - also gives the page real same-path
+     context some endpoints require (see EZTV below), not just cookies.
+   - **Anything else**: `url` may be a POST-only AJAX endpoint that isn't
+     navigable at all, so reload wherever the page's already sitting
+     instead - falling back to the request's own origin root if it has no
+     real history yet (`about:blank`, a brand-new persistent page whose
+     very first call happens to be non-GET).
+
+Recovery is **per-request, not tied to the keep-alive schedule** - if a
+session goes stale between keep-alive ticks, the very next real request
+self-heals inline via the slow path instead of waiting for the next
+scheduled check. Keep-alive (section 9) is just this same function called
+proactively on a timer, warming the same persistent page real traffic uses.
+
+### EZTV's reveal-POST needs a real prior GET to the same page - live-caught bug
+
+`searchByKeyword()`'s reveal POST (`layout=def_wlinks` back to
+`/search/?q1=...`) does return the full page with magnet links unlocked in
+one shot when the session already has real context from having visited
+`/search/` itself - confirmed live. But dropping the priming GET entirely
+(relying on the POST's own fast/slow path to self-heal) broke on a live
+cold-session test: the fast path failed, the generic recovery reloaded
+wherever the page was *currently* sitting (the homepage, from keep-alive's
+last visit - not `/search/`), and the retried POST still failed even after
+that reload. Unlike ext.to's magnet endpoint (any same-origin page's
+cookies are enough), EZTV's reveal POST apparently needs the page to have
+actually navigated to `/search/` itself first - a referer/session-context
+check, not just a cookie check.
+
+Fixed by restoring an explicit `await fetchCfProtectedPage(searchUrl)` (a
+plain GET, result discarded - only its side effect of putting the page on
+the right path matters) immediately before the reveal POST. This also
+means the POST's own recovery path (if it ever fires) reloads `searchUrl`
+too, since that's now genuinely where the page was left.
+
+`browseLatest()` still doesn't go through `fetchCfProtectedPage()` at all -
+EZTV's JSON API isn't Cloudflare-protected to begin with, so a plain
+server-side `fetch()` is fine and cheaper. Both `searchByKeyword()` and
+`browseLatest()` keep their own small local caches on top
+(`keywordSearchCache`, keyed by `q`, caching the whole parsed result list -
+this is what actually fixes EZTV's worst-case "re-scrape everything per
+offset page" problem; `apiCache`, keyed by the exact `/api/get-torrents`
+URL) since neither fits being cached at the single-fetch level the way a
+plain listing GET does.
+
+### Known tradeoff: the status page's "cached" stat
+
+`server.ts` can no longer tell whether a request was served from a lower-
+level cache - that visibility only existed because caching used to happen
+at the top level. The status page's "X% cached" stat (`lib/status.ts`'s
+`ProviderStatusTracker`) is therefore now always 0% for **search**
+requests, even when the underlying fetch was a cache hit. **Downloads are
+unaffected** - `server.ts`'s separate `magnetCache` (1 h TTL, unrelated to
+any of the above) still works exactly as before, and still reports real
+cache-hit stats.
+
+### Verify concurrency live before trusting it
+
+Multiple concurrent fast-path `page.evaluate(fetch(...))` calls against the
+*same* persistent page (e.g. `fetchMergedBrowse`'s parallel category
+fetches) are same-origin AJAX, not navigation - a fundamentally different
+thing from the concurrent-navigation hang fixed earlier (section 6's
+`serializeNav`). Expected to be safe by the same reasoning that already
+justified the magnet-POST/wlinks-POST pattern, but that reasoning alone did
+NOT catch the navigation-concurrency bug either, nor the EZTV reveal-POST
+bug above - only live Docker testing caught both. Don't trust any change
+here is safe against the real sites without the same live verification.
+
+---
+
+## 11. Pagination, blank-query browsing, and per-provider categories
 
 ### Why `testQuery` was removed
 
@@ -734,7 +909,7 @@ per-source concatenation - a pre-existing constraint, not something the merge
 itself got wrong.
 
 **`<opensearch:totalResults>` is never actually parsed by Prowlarr.** It's
-rendered for spec-compliance only (see section 11); the real fix for runaway
+rendered for spec-compliance only (see section 12); the real fix for runaway
 pagination is the depth cap plus returning short/empty item lists once a
 provider's browse listing is exhausted, which `fetchPagedWindow` and each
 provider's own listing parser already do.
@@ -755,7 +930,7 @@ provider was asking.
 
 ---
 
-## 11. Torznab spec compliance
+## 12. Torznab spec compliance
 
 Audited against the official Torznab v1.3 draft spec
 (https://torznab.github.io/spec-1.3-draft/torznab/Specification-v1.3.html).
@@ -800,7 +975,7 @@ Findings and fixes:
 
 ---
 
-## 12. Testing
+## 13. Testing
 
 `npm test` (builds first, then runs `node --experimental-test-module-mocks
 --test "test/**/*.test.ts"`). `npm run typecheck` type-checks source +
@@ -909,7 +1084,7 @@ phantom passing test.
 
 ---
 
-## 13. Open issues
+## 14. Open issues
 
 **Brittleness.** The solver depends on the widget DOM shape and the `+22px`
 checkbox offset. Cloudflare can invalidate either at any time. Expect it, and

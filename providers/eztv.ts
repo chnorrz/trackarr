@@ -1,6 +1,7 @@
 import * as cheerio from 'cheerio';
-import { gotoCleared } from '../lib/browser.js';
+import { fetchCfProtectedPage } from '../lib/browser.js';
 import { CATEGORIES } from '../lib/categories.js';
+import { TTLCache } from '../lib/cache.js';
 import { parseSize } from '../lib/parse.js';
 import type { MagnetRef, Provider, SearchItem, SearchOptions, SearchResult } from '../lib/types.js';
 
@@ -9,6 +10,13 @@ const BASE = 'https://eztvx.to';
 // query. This, not <opensearch:totalResults>, is what actually stops
 // Prowlarr's pagination - see server.ts.
 const DEPTH_CAP = 200;
+
+// browseLatest() below still doesn't go through fetchCfProtectedPage() -
+// EZTV's JSON API isn't Cloudflare-protected to begin with (a plain
+// server-side fetch() is fine and cheaper than a browser page), so it gets
+// its own small cache instead, same TTL/env var as fetchCfProtectedPage's
+// for consistency.
+const CACHE_TTL_MS = Number(process.env.SEARCH_CACHE_TTL_MS) || 5 * 60 * 1000;
 
 // EZTV also has an official, unauthenticated JSON API
 // (https://eztvx.to/api/get-torrents) - but it only supports pagination and
@@ -41,77 +49,93 @@ function rememberMagnet(detailUrl: string, magnet: string): void {
   magnetCache.set(detailUrl, magnet);
 }
 
-interface WlinksResult {
-  status: number;
-  text: string;
+// Caches the whole parsed result list per keyword - searchByKeyword()
+// always fetches the entire matching set in one page (no pagination of its
+// own), so this is what actually fixes the previously-noted inefficiency
+// of every distinct offset re-scraping the whole site from scratch: real
+// pagination just slices this cached list.
+const keywordSearchCache = new TTLCache<SearchItem[]>(CACHE_TTL_MS);
+
+function parseSearchRows(html: string): SearchItem[] {
+  const $ = cheerio.load(html);
+  const items: SearchItem[] = [];
+
+  $('tr[name="hover"].forum_header_border').each((_, el) => {
+    const $tr = $(el);
+    const titleLink = $tr.find('a.epinfo').first();
+    const href = titleLink.attr('href');
+    if (!href) return;
+    const detailUrl = new URL(href, BASE).toString();
+
+    // The visible anchor text is truncated with "..."; the title attr has
+    // the full release name plus a " (176 MB)" size suffix appended -
+    // strip that off rather than depend on a size <td>'s fixed column
+    // position, which shifts on rows that render an extra "Show links"
+    // button cell (before the reveal POST below).
+    const titleAttr = titleLink.attr('title') || titleLink.text();
+    const sizeMatch = titleAttr.match(/\(([\d.,]+\s*(?:B|KB|MB|GB|TB))\)\s*$/i);
+    const title = (sizeMatch && sizeMatch.index !== undefined ? titleAttr.slice(0, sizeMatch.index) : titleAttr).trim();
+    const size = sizeMatch && sizeMatch[1] ? parseSize(sizeMatch[1]) : 0;
+
+    const magnet = $tr.find('a.magnet[href^="magnet:"]').first().attr('href');
+    if (magnet) rememberMagnet(detailUrl, magnet);
+
+    items.push({
+      title,
+      detailUrl,
+      id: null,
+      size,
+      // Search rows don't show seed/leech counts (just "-"); the detail
+      // page's numbers are chart-widget-driven, not plain HTML, so not
+      // reliably scrapable either. Default to 0 rather than guess.
+      seeds: 0,
+      leechers: 0,
+      // The whole site is TV-only, no per-row genre/category signal in
+      // the search results markup.
+      category: CATEGORIES.TV,
+      // No exact-date attribute on the search page (just relative text
+      // like "1 mo"), so same best-effort fallback as 1337x.
+      pubDate: new Date()
+    });
+  });
+
+  return items;
 }
 
 async function searchByKeyword(q: string): Promise<SearchItem[]> {
+  const cached = keywordSearchCache.get(q);
+  if (cached) return cached;
+
   const searchUrl = `${BASE}/search/?q1=${encodeURIComponent(q)}`;
-  const page = await gotoCleared(searchUrl);
-  try {
-    // Reveal the per-row magnet links (see comment above). Runs inside the
-    // page via fetch, not Node's own fetch, for the same TLS/cookie-
-    // consistency reason as ext.to's magnet POST.
-    const wlinks = await page.evaluate<WlinksResult, string>(async (url) => {
-      const res = await fetch(url, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-        body: new URLSearchParams({ layout: 'def_wlinks' }).toString()
-      });
-      return { status: res.status, text: await res.text() };
-    }, searchUrl);
 
-    // Fall back to the plain (magnet-less) page rather than fail the whole
-    // search if the reveal POST itself has a problem - resolveMagnet()'s
-    // detail-page fallback still covers grabs either way.
-    const html = wlinks.status === 200 ? wlinks.text : await page.content();
-    const $ = cheerio.load(html);
-    const items: SearchItem[] = [];
+  // GET first - confirmed live this is required, not just a nice-to-have.
+  // The reveal POST (see comment above search()) does return the FULL
+  // page with magnet links unlocked, not just a fragment, when the page's
+  // session already has real prior context from visiting /search/ itself.
+  // But fetchCfProtectedPage()'s generic recovery path (used whenever the
+  // fast path fails) reloads wherever the page is CURRENTLY sitting, which
+  // - without this GET - can be some unrelated page (e.g. keepAlive's
+  // homepage visit), and the reveal POST then fails outright even after
+  // that reload. A GET to searchUrl itself guarantees the page has real
+  // /search/ context before the POST ever runs, whether via this call's
+  // own fast path or its own recovery. Result discarded on purpose - only
+  // its side effect (a correctly-primed page) matters here.
+  await fetchCfProtectedPage(searchUrl);
 
-    $('tr[name="hover"].forum_header_border').each((_, el) => {
-      const $tr = $(el);
-      const titleLink = $tr.find('a.epinfo').first();
-      const href = titleLink.attr('href');
-      if (!href) return;
-      const detailUrl = new URL(href, BASE).toString();
+  const html = await fetchCfProtectedPage(searchUrl, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: new URLSearchParams({ layout: 'def_wlinks' }).toString()
+  });
 
-      // The visible anchor text is truncated with "..."; the title attr has
-      // the full release name plus a " (176 MB)" size suffix appended -
-      // strip that off rather than depend on a size <td>'s fixed column
-      // position, which shifts on rows that render an extra "Show links"
-      // button cell (before the reveal-click above).
-      const titleAttr = titleLink.attr('title') || titleLink.text();
-      const sizeMatch = titleAttr.match(/\(([\d.,]+\s*(?:B|KB|MB|GB|TB))\)\s*$/i);
-      const title = (sizeMatch && sizeMatch.index !== undefined ? titleAttr.slice(0, sizeMatch.index) : titleAttr).trim();
-      const size = sizeMatch && sizeMatch[1] ? parseSize(sizeMatch[1]) : 0;
+  const items = parseSearchRows(html);
 
-      const magnet = $tr.find('a.magnet[href^="magnet:"]').first().attr('href');
-      if (magnet) rememberMagnet(detailUrl, magnet);
-
-      items.push({
-        title,
-        detailUrl,
-        id: null,
-        size,
-        // Search rows don't show seed/leech counts (just "-"); the detail
-        // page's numbers are chart-widget-driven, not plain HTML, so not
-        // reliably scrapable either. Default to 0 rather than guess.
-        seeds: 0,
-        leechers: 0,
-        // The whole site is TV-only, no per-row genre/category signal in
-        // the search results markup.
-        category: CATEGORIES.TV,
-        // No exact-date attribute on the search page (just relative text
-        // like "1 mo"), so same best-effort fallback as 1337x.
-        pubDate: new Date()
-      });
-    });
-
-    return items;
-  } finally {
-    await page.close();
-  }
+  // Never cache an empty result - could be a transient scrape failure
+  // rather than a genuinely zero-result search, and freezing that in for
+  // the full TTL would keep serving it after the underlying problem's
+  // fixed (same reasoning the old top-level search cache used to apply).
+  if (items.length) keywordSearchCache.set(q, items);
+  return items;
 }
 
 interface EztvApiTorrent {
@@ -141,12 +165,22 @@ function slugify(title: string): string {
 // EZTV's JSON API (https://eztvx.to/api/get-torrents) supports pagination
 // but no free-text search, so it's only usable for the blank-query "latest"
 // path (see searchByKeyword() above for real queries). Fetched with a plain
-// server-side fetch rather than gotoCleared()/the browser - this endpoint
+// server-side fetch rather than fetchCfProtectedPage()/the browser - this endpoint
 // isn't behind the site's Cloudflare challenge (same as the homepage - only
 // /search/ is protected), and a plain fetch is much cheaper than spinning
 // up a browser page for it. If that ever changes and this endpoint gets
 // protected too, this will start failing outright rather than degrading -
 // accepted risk (see NOTES.md).
+//
+// Cached by the exact API URL (which already encodes limit+page) - its own
+// apiPage math already avoids overlapping fetches across an offset walk
+// (see the comment below), so this isn't fixing a redundant-fetch problem
+// the way the other two caches in this file are. It's here so an identical
+// repeated request (e.g. Prowlarr's periodic RSS poll hitting the same
+// offset/limit) is still a no-op, now that server.ts no longer has a
+// top-level cache doing that job.
+const apiCache = new TTLCache<EztvApiResponse>(CACHE_TTL_MS);
+
 async function browseLatest(opts: SearchOptions): Promise<SearchResult> {
   const limit = opts.limit;
   const cappedEnd = Math.min(opts.offset + limit, DEPTH_CAP);
@@ -157,11 +191,19 @@ async function browseLatest(opts: SearchOptions): Promise<SearchResult> {
   // stays a multiple of limit across one pagination sequence - true for
   // both Prowlarr's paginated search and its RSS sync (see NOTES.md).
   const apiPage = Math.floor(opts.offset / limit) + 1;
+  const apiUrl = `${BASE}/api/get-torrents?limit=${limit}&page=${apiPage}`;
 
-  const res = await fetch(`${BASE}/api/get-torrents?limit=${limit}&page=${apiPage}`);
-  if (!res.ok) throw new Error(`eztv API request failed: ${res.status}`);
-  const data = (await res.json()) as EztvApiResponse;
+  let data = apiCache.get(apiUrl);
+  if (!data) {
+    const res = await fetch(apiUrl);
+    if (!res.ok) throw new Error(`eztv API request failed: ${res.status}`);
+    data = (await res.json()) as EztvApiResponse;
+    apiCache.set(apiUrl, data);
+  }
 
+  // Runs on every call, cache hit or not - rememberMagnet() must repopulate
+  // magnetCache regardless, since that's a separate (non-TTL, LRU-ish)
+  // cache that download requests depend on.
   const items: SearchItem[] = (data.torrents || []).map((t) => {
     const title = t.title || t.filename;
     // Not necessarily the site's real canonical URL for this episode (that
@@ -213,17 +255,12 @@ async function resolveMagnet({ url }: MagnetRef): Promise<string> {
   if (cached) return cached;
 
   // Fallback: magnet is also embedded directly on the episode detail page -
-  // no AJAX/HMAC dance, same as 1337x.
-  const page = await gotoCleared(url);
-  try {
-    const html = await page.content();
-    const $ = cheerio.load(html);
-    const magnet = $('a[href^="magnet:"]').first().attr('href');
-    if (!magnet) throw new Error('Could not find a magnet link on the episode page.');
-    return magnet;
-  } finally {
-    await page.close();
-  }
+  // no AJAX/HMAC dance, same as 1337x. Pure read, no live page needed.
+  const html = await fetchCfProtectedPage(url);
+  const $ = cheerio.load(html);
+  const magnet = $('a[href^="magnet:"]').first().attr('href');
+  if (!magnet) throw new Error('Could not find a magnet link on the episode page.');
+  return magnet;
 }
 
 export default {

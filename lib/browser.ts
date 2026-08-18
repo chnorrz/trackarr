@@ -1,9 +1,11 @@
+import crypto from 'crypto';
 import fs from 'fs';
 import path from 'path';
 import { execFileSync } from 'child_process';
 import { fileURLToPath } from 'url';
 import { Camoufox } from 'camoufox-js';
 import type { Browser, BrowserContext, Cookie, Page } from 'playwright-core';
+import { TTLCache } from './cache.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 // DATA_DIR is configurable so it can point at a mounted volume in Docker -
@@ -66,7 +68,7 @@ let proxyBrowser: Browser | null = null;
 let proxyContext: BrowserContext | null = null;
 
 // In-flight launch promises, so concurrent first calls (e.g. the 4 parallel
-// gotoCleared() calls from a multi-category browse) await the same launch
+// fetchCfProtectedPage() calls from a multi-category browse) await the same launch
 // instead of each seeing sharedContext/proxyContext still null and racing to
 // start their own browser. That race was observed live: 4 simultaneous
 // "launching proxied browser" logs, 4 separate Camoufox/Firefox instances
@@ -93,7 +95,8 @@ function serializeSolve<T>(task: () => Promise<T>): Promise<T> {
 
 // Concurrent navigations to the same browser context/egress IP get treated
 // as suspicious by Cloudflare: multi-category browsing (fetchMergedBrowse,
-// 1337x's no-cat snapshot) fires several gotoCleared() calls at once, and
+// 1337x's no-cat snapshot) fires several fetchCfProtectedPage() slow-path
+// navigations at once, and
 // live-testing found that 2+ concurrent navigations to the same
 // Cloudflare-protected host reliably hang until the 60s page.goto timeout,
 // even though each one succeeds fine on its own. Queuing navigations one at
@@ -123,8 +126,9 @@ function serializeNav<T>(usingProxy: boolean, task: () => Promise<T>): Promise<T
 //                    proxy is disabled entirely and everything goes direct.
 //   PROXY_PROVIDERS  comma-separated provider ids allowed to use it. Unset
 //                    or empty = none - a provider asking for the proxy in
-//                    code (gotoCleared(url, {proxy: 'id'})) is not enough on
-//                    its own, it must be explicitly allow-listed here too.
+//                    code (fetchCfProtectedPage(url, {proxy: 'id'})) is not
+//                    enough on its own, it must be explicitly allow-listed
+//                    here too.
 //                    This is deliberately opt-in rather than opt-out: adding
 //                    a new provider that happens to ask for a proxy should
 //                    never silently start routing traffic through one an
@@ -312,89 +316,236 @@ async function launchProxyContext(): Promise<BrowserContext | null> {
   return context;
 }
 
-export interface GotoOptions {
+// fetchCfProtectedPage()'s options - a standard RequestInit (method/headers/
+// body/etc, same as the global fetch()) plus two extras of our own, so the
+// function is otherwise a drop-in replacement for fetch() minus getting a
+// live Response back (this always resolves the body text directly instead -
+// see fetchCfProtectedPage's own doc comment for why).
+export interface FetchOptions extends RequestInit {
   timeoutMs?: number;
   /** Route through PROXY_URL. Pass the provider's id (so PROXY_PROVIDERS can
    * target it) or `true` for an unnamed request. */
   proxy?: boolean | string;
 }
 
-// Navigates a fresh page (in the shared headless context) to `url` and
-// returns it once past Cloudflare. Throws if the challenge doesn't clear
-// within the timeout - caller/Prowlarr is expected to retry later. Caller
-// is responsible for closing the returned page (but NOT the shared
-// browser/context).
-//
-// opts.proxy asks to route through PROXY_URL. Pass the provider's id (so
-// PROXY_PROVIDERS can target it) or `true` for an unnamed request. Whether
-// it actually happens is decided by the env vars above - a provider asking
-// for a proxy that isn't configured silently goes direct.
-export async function gotoCleared(url: string, opts: GotoOptions | number = {}): Promise<Page> {
-  const { timeoutMs = 30000, proxy = false } = typeof opts === 'number' ? { timeoutMs: opts, proxy: false as const } : opts;
+// Shared by fetchCfProtectedPage()'s slow path: navigates
+// `page` to `url` and waits/solves until past Cloudflare, returning the
+// cleared HTML. Throws (does NOT close the page - caller's responsibility)
+// if the challenge doesn't clear within the timeout or the site hard-blocks
+// us. Doesn't open/close pages or pick a context itself, just the
+// navigate+wait+solve+verify dance, so both callers - one using a fresh
+// page, the other a long-lived persistent one - share identical behavior.
+async function navigateOnce(page: Page, url: string, timeoutMs: number): Promise<string> {
+  await page.goto(url, { waitUntil: 'load', timeout: 60000 });
+
+  const waitUntilCleared = async (ms: number): Promise<string> => {
+    const deadline = Date.now() + ms;
+    let html = await safeContent(page);
+    while ((isChallenge(html) || !html) && Date.now() < deadline) {
+      await new Promise((r) => setTimeout(r, 1000));
+      html = await safeContent(page);
+    }
+    return html;
+  };
+
+  // A stored cf_clearance cookie usually means no challenge at all, so give
+  // it a short pass first before spending time on the solve routine.
+  let html = await waitUntilCleared(8000);
+
+  if (isChallenge(html) || !html) {
+    if (await serializeSolve(() => autoSolveChallenge(page))) {
+      html = await waitUntilCleared(timeoutMs);
+
+      // Clearing the challenge only means the interstitial is gone. Cloudflare
+      // then redirects to the URL we actually asked for, and returning before
+      // that lands hands the caller a blank page - which looks exactly like
+      // "the site returned 0 results".
+      await page.waitForLoadState('networkidle', { timeout: 20000 }).catch(() => {});
+      html = await safeContent(page);
+    }
+  }
+
+  if (isChallenge(html) || !html) {
+    console.error(`[cf] still challenged (challenge=${isChallenge(html)}, htmlLen=${html.length}).`);
+    throw new Error('Cloudflare challenge did not clear (auto-solve failed).');
+  }
+
+  if (isBlocked(html)) {
+    console.error(`[cf] hard blocked (Cloudflare access denied page, htmlLen=${html.length}).`);
+    throw new Error('Blocked by Cloudflare (IP ban/rate limit) - not a solvable challenge, needs a different IP or time to cool down.');
+  }
+
+  return html;
+}
+
+// A Cloudflare failure - challenge that didn't clear, or a hard block -
+// has been observed live to sometimes be transient: a request that fails
+// once can succeed again moments later with nothing else changed
+// (confirmed: a hard-blocked request recovered on a plain retry a few
+// seconds afterwards). Rather than surface that as a client-visible
+// failure and rely on the caller (Prowlarr) to notice and retry the whole
+// request itself, retry the whole navigation once, inline, right here -
+// fresh page.goto, fresh challenge/block check, fresh solve attempt if
+// needed. Only surfaces an error if that retry ALSO fails.
+async function navigateAndClear(page: Page, url: string, timeoutMs: number): Promise<string> {
+  try {
+    const html = await navigateOnce(page, url, timeoutMs);
+    console.error('[cf] cleared.');
+    return html;
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    console.error(`[cf] navigation failed (${message}), retrying once...`);
+    const html = await navigateOnce(page, url, timeoutMs);
+    console.error('[cf] cleared on retry.');
+    return html;
+  }
+}
+
+// Resolves which context (direct vs proxy) a request should use, and
+// whether that's actually the proxy context (a provider can ask for the
+// proxy and still end up direct, if it isn't allow-listed - see
+// proxyEnabledFor above). Used by getOrCreatePersistentPage() so every
+// fetchCfProtectedPage() call for a given hostname picks its context the
+// same way.
+async function resolveContext(proxy: boolean | string): Promise<{ context: BrowserContext; usingProxy: boolean }> {
   const wants = typeof proxy === 'string' ? proxy : proxy ? '*' : null;
   const useProxy = proxyEnabledFor(wants);
-
-  console.error(`[cf] gotoCleared: ${url}${useProxy ? ` (via proxy ${PROXY_URL})` : ''}`);
-
   const context = (useProxy ? await getProxyContext() : null) || (await getPersistentContext());
   const usingProxy = useProxy && context === proxyContext;
   if (wants && !usingProxy) {
     console.error(`[cf] proxy not enabled for '${wants}', using a direct connection.`);
   }
+  return { context, usingProxy };
+}
 
-  return serializeNav(usingProxy, async () => {
-    const page = await context.newPage();
-    await page.goto(url, { waitUntil: 'load', timeout: 60000 });
+// One already-cleared, long-lived page per hostname, reused across many
+// requests instead of opening/closing a fresh page per call - lets
+// listing-page fetches skip full navigation (see fetchCfProtectedPage).
+// Keyed by hostname rather than a caller-supplied provider id - every
+// current provider only ever talks to one hostname, so this partitions
+// exactly the same way while removing a redundant parameter every caller
+// would otherwise have to pass and keep in sync with the URLs it fetches.
+const persistentPages = new Map<string, { page: Page; usingProxy: boolean }>();
 
-    const waitUntilCleared = async (ms: number): Promise<string> => {
-      const deadline = Date.now() + ms;
-      let html = await safeContent(page);
-      while ((isChallenge(html) || !html) && Date.now() < deadline) {
-        await new Promise((r) => setTimeout(r, 1000));
-        html = await safeContent(page);
-      }
-      return html;
-    };
+async function getOrCreatePersistentPage(hostname: string, proxy: boolean | string): Promise<{ page: Page; usingProxy: boolean }> {
+  const existing = persistentPages.get(hostname);
+  if (existing && !existing.page.isClosed()) return existing;
 
-    // A stored cf_clearance cookie usually means no challenge at all, so give
-    // it a short pass first before spending time on the solve routine.
-    let html = await waitUntilCleared(8000);
+  const { context, usingProxy } = await resolveContext(proxy);
+  const page = await context.newPage();
+  const entry = { page, usingProxy };
+  persistentPages.set(hostname, entry);
+  return entry;
+}
 
-    if (isChallenge(html) || !html) {
-      if (await serializeSolve(() => autoSolveChallenge(page))) {
-        html = await waitUntilCleared(timeoutMs);
+// Tries to fetch `url` through an already-cleared persistent page's own
+// live session (same-origin fetch() carries its cookies, and runs through
+// the real browser's network stack - same reasoning as the magnet-POST/
+// wlinks-POST flows that already did this). Returns null (never throws) on
+// any failure - the caller falls back to a real navigation instead of
+// treating a fetch error as fatal.
+async function tryFetch(page: Page, url: string, init: RequestInit): Promise<string | null> {
+  if (page.isClosed()) return null;
+  try {
+    return await page.evaluate<string, { url: string; init: RequestInit }>(async ({ url, init }) => {
+      const res = await fetch(url, init);
+      return await res.text();
+    }, { url, init });
+  } catch {
+    return null;
+  }
+}
 
-        // Clearing the challenge only means the interstitial is gone. Cloudflare
-        // then redirects to the URL we actually asked for, and returning before
-        // that lands hands the caller a blank page - which looks exactly like
-        // "the site returned 0 results".
-        await page.waitForLoadState('networkidle', { timeout: 20000 }).catch(() => {});
-        html = await safeContent(page);
-      }
-    }
+// Cache for fetchCfProtectedPage()'s results. Separate cache from the
+// search-result cache that used to live in server.ts (removed - this one,
+// sitting right at the fetch itself, is what now makes a repeat request
+// for the same site page a no-op, regardless of which offset/limit window
+// the caller asked for it under). Keyed by a hash of method+url+body, not
+// just the URL - a GET is idempotent so the URL alone would be a fine key,
+// but a POST's response depends on its body too (e.g. ext.to's magnet POST
+// carries a different torrent id and a fresh per-call HMAC on every
+// request to the *same* endpoint URL - caching by URL alone would serve
+// one torrent's magnet response for a completely different torrent).
+const PAGE_CACHE_TTL_MS = Number(process.env.SEARCH_CACHE_TTL_MS) || 5 * 60 * 1000;
+const pageCache = new TTLCache<string>(PAGE_CACHE_TTL_MS);
 
-    if (isChallenge(html) || !html) {
-      console.error(`[cf] still challenged (challenge=${isChallenge(html)}, htmlLen=${html.length}).`);
-      await page.close();
-      throw new Error('Cloudflare challenge did not clear (auto-solve failed).');
-    }
+// General-purpose Cloudflare-aware fetch: no live page is handed back,
+// just the response text, and it's cached. The in-page fetch() itself can
+// be any method (opts.method/headers/body) - this covers AJAX endpoints
+// that need real cookies/origin (e.g. ext.to's magnet POST, EZTV's
+// wlinks-reveal POST) just as well as plain listing-page GETs, as long as
+// the caller accepts a cached response is possible for a repeated
+// identical call (see the cache key note above).
+//
+// Fast path: try the fetch through the hostname's already-cleared
+// persistent page instead of a fresh navigation - skips the full page
+// load/render cost of page.goto() entirely when the session's still good.
+// Slow path (fetch failed outright, or came back challenged/blocked - the
+// session needs refreshing): for a GET, navigate that SAME persistent page
+// directly to `url` - this both re-solves the session AND gets the real
+// content we wanted in one step, no need to fetch() again afterwards. For
+// anything else (a POST to an AJAX endpoint isn't a page you can
+// meaningfully navigate to), instead reload wherever the page currently is
+// to re-solve the session, then retry the original fetch once - clearing a
+// challenge is a session-wide cookie fix, not tied to which specific page
+// on the origin you're looking at.
+//
+// This recovery is per-request, not tied to the periodic keep-alive tick -
+// if the session goes stale between ticks, the very next real request
+// self-heals inline instead of waiting for the next scheduled check.
+// Concurrent recovery attempts still queue behind serializeNav/serializeSolve,
+// so two requests hitting a stale session at once don't both try to solve it.
+export async function fetchCfProtectedPage(url: string, opts: FetchOptions = {}): Promise<string> {
+  const { timeoutMs = 30000, proxy = false, method = 'GET', headers, body } = opts;
+  const init: RequestInit = { method, headers, body };
+  const isGet = method.toUpperCase() === 'GET';
+  const cacheKey = crypto.createHash('sha256').update(`${method}:${url}:${body ?? ''}`).digest('hex');
 
-    if (isBlocked(html)) {
-      console.error(`[cf] hard blocked (Cloudflare access denied page, htmlLen=${html.length}).`);
-      await page.close();
-      throw new Error('Blocked by Cloudflare (IP ban/rate limit) - not a solvable challenge, needs a different IP or time to cool down.');
-    }
+  const cached = pageCache.get(cacheKey);
+  if (cached !== undefined) return cached;
 
-    console.error('[cf] cleared.');
-    // Only the direct context's cookies are persisted - the cookie file holds
-    // ext.to's cf_clearance, and saving the proxied context over it would
-    // clobber it with another site's cookies.
-    if (!usingProxy) saveCookies(await context.cookies());
-    return page;
-  });
+  const { page, usingProxy } = await getOrCreatePersistentPage(new URL(url).hostname, proxy);
+
+  const fast = await tryFetch(page, url, init);
+  if (fast !== null && !isChallenge(fast) && !isBlocked(fast)) {
+    pageCache.set(cacheKey, fast);
+    return fast;
+  }
+
+  console.error(`[cf] fetchCfProtectedPage: fast path unavailable for ${url}, recovering session.`);
+
+  // Navigate purely to clear the challenge / re-establish session cookies -
+  // for a GET this is the target url itself (which also gives the page
+  // real same-path context some endpoints apparently require - confirmed
+  // live for EZTV's reveal POST, see providers/eztv.ts). For anything else,
+  // `url` isn't necessarily something you can navigate to at all (an AJAX
+  // POST endpoint) - reload wherever the page is already sitting instead,
+  // falling back to the request's own origin root if it has no real
+  // history yet (about:blank - a brand new persistent page whose very
+  // first call happens to be a non-GET).
+  //
+  // Either way, the navigation's own returned HTML is discarded on
+  // purpose and never treated as the answer - only a fresh fetch()
+  // afterward is trusted. A page fresh off a solved challenge can still be
+  // mid-redirect/mid-render in ways the networkidle wait inside
+  // navigateAndClear doesn't always fully close out; a real subsequent
+  // fetch() for the exact thing we actually asked for is the only thing
+  // that's unambiguously safe to hand back, whether that's a GET or not.
+  const currentUrl = page.url();
+  const navigateTarget = isGet ? url : currentUrl && currentUrl !== 'about:blank' ? currentUrl : new URL(url).origin + '/';
+  await serializeNav(usingProxy, () => navigateAndClear(page, navigateTarget, timeoutMs));
+  if (!usingProxy) saveCookies(await page.context().cookies());
+
+  const retried = await tryFetch(page, url, init);
+  if (retried === null || isChallenge(retried) || isBlocked(retried)) {
+    throw new Error(`fetchCfProtectedPage: fetch failed for ${url} even after session recovery.`);
+  }
+  pageCache.set(cacheKey, retried);
+  return retried;
 }
 
 export async function closeBrowser(): Promise<void> {
+  persistentPages.clear();
   if (proxyBrowser) await proxyBrowser.close().catch(() => {});
   proxyBrowser = null;
   proxyContext = null;

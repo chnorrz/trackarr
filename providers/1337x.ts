@@ -1,5 +1,5 @@
 import * as cheerio from 'cheerio';
-import { gotoCleared, type GotoOptions } from '../lib/browser.js';
+import { fetchCfProtectedPage, type FetchOptions } from '../lib/browser.js';
 import { CATEGORIES, matchCategory, type CategoryRule } from '../lib/categories.js';
 import { fetchMergedBrowse, fetchPagedWindow } from '../lib/paging.js';
 import { parseSize } from '../lib/parse.js';
@@ -23,102 +23,98 @@ const DEPTH_CAP = 200;
 // several Movies/TV/Anime subcats share "flaticon-divx", etc) and drift
 // over time (a "flaticon-lossless" class showed up for Music that no older
 // rule accounted for).
-const SUB_ID_CATEGORY: Partial<Record<number, number>> = {
-  // Movies
-  66: CATEGORIES.MOVIES, // 3D
-  73: CATEGORIES.MOVIES, // Bollywood
-  2: CATEGORIES.MOVIES, // Divx/Xvid
-  4: CATEGORIES.MOVIES, // Dubs/Dual Audio
-  1: CATEGORIES.MOVIES, // DVD
-  54: CATEGORIES.MOVIES, // h.264/x264
-  42: CATEGORIES.MOVIES, // HD
-  70: CATEGORIES.MOVIES, // HEVC/x265
-  55: CATEGORIES.MOVIES, // Mp4
-  3: CATEGORIES.MOVIES, // SVCD/VCD
-  76: CATEGORIES.MOVIES, // UHD
-  // TV
-  74: CATEGORIES.TV, // Cartoon
-  6: CATEGORIES.TV, // Divx/Xvid
-  5: CATEGORIES.TV, // DVD
-  41: CATEGORIES.TV, // HD
-  71: CATEGORIES.TV, // HEVC/x265
-  75: CATEGORIES.TV, // SD
-  7: CATEGORIES.TV, // SVCD/VCD
-  // Anime
-  28: CATEGORIES.TV_ANIME,
-  78: CATEGORIES.TV_ANIME, // Dual Audio
-  79: CATEGORIES.TV_ANIME, // Dubbed
-  81: CATEGORIES.TV_ANIME, // Raw
-  80: CATEGORIES.TV_ANIME, // Subbed
-  // Music
-  69: CATEGORIES.AUDIO, // AAC
-  53: CATEGORIES.AUDIO, // Album
-  58: CATEGORIES.AUDIO, // Box Set
-  68: CATEGORIES.AUDIO, // Concerts
-  59: CATEGORIES.AUDIO, // Discography
-  24: CATEGORIES.AUDIO, // DVD
-  23: CATEGORIES.AUDIO, // Lossless
-  22: CATEGORIES.AUDIO, // MP3
-  27: CATEGORIES.AUDIO, // Other
-  26: CATEGORIES.AUDIO, // Radio
-  60: CATEGORIES.AUDIO, // Single
-  25: CATEGORIES.AUDIO, // Video
-  // XXX
-  67: CATEGORIES.XXX, // Games
-  51: CATEGORIES.XXX, // Hentai
-  50: CATEGORIES.XXX, // Magazine
-  49: CATEGORIES.XXX, // Picture
-  48: CATEGORIES.XXX, // Video
-  // Games
-  72: CATEGORIES.CONSOLE_3DS,
-  45: CATEGORIES.CONSOLE_NDS, // DS
-  17: CATEGORIES.CONSOLE_OTHER,
-  10: CATEGORIES.PC_GAMES, // PC Game
-  43: CATEGORIES.CONSOLE_PS3,
-  77: CATEGORIES.CONSOLE_PS4,
-  12: CATEGORIES.CONSOLE_PSP,
-  44: CATEGORIES.CONSOLE_WII,
-  13: CATEGORIES.CONSOLE_XBOX,
-  14: CATEGORIES.CONSOLE_XBOX360,
-  // No dedicated Torznab id for these consoles - nearest catch-all bucket.
-  16: CATEGORIES.CONSOLE_OTHER, // Dreamcast
-  11: CATEGORIES.CONSOLE_OTHER, // PS2
-  15: CATEGORIES.CONSOLE_OTHER, // PS1
-  46: CATEGORIES.CONSOLE_OTHER, // GameCube
-  82: CATEGORIES.CONSOLE_OTHER, // Switch
-  // Apps
-  56: CATEGORIES.PC_MOBILE_ANDROID,
-  57: CATEGORIES.PC_MOBILE_IOS,
-  19: CATEGORIES.PC_MAC,
-  20: CATEGORIES.PC, // Linux
-  21: CATEGORIES.PC, // Other
-  18: CATEGORIES.PC, // PC Software
-  // Other
-  52: CATEGORIES.AUDIOBOOKS,
-  36: CATEGORIES.BOOKS_EBOOK, // E-Books
-  39: CATEGORIES.BOOKS, // Comics
-  33: CATEGORIES.CONSOLE_OTHER, // Emulation
-  37: CATEGORIES.OTHER, // Images
-  38: CATEGORIES.OTHER, // Mobile Phone (not necessarily apps)
-  47: CATEGORIES.PC, // Nulled Script
-  40: CATEGORIES.OTHER,
-  35: CATEGORIES.OTHER, // Sounds
-  34: CATEGORIES.OTHER // Tutorials
-};
-
-// Fallback only for a row whose sub id isn't in SUB_ID_CATEGORY (a future
-// subcategory 1337x adds that we haven't listed) or has no icon href at
-// all. Order matters - first match wins, and "hd" must stay below "tv" so
-// an HD TV episode isn't filed as a movie if it ever falls through to here.
+//
+// Matched against the icon href via matchCategory() - same mechanism
+// ext.to uses for its own category resolution (see providers/ext-to.ts).
+// Each keyword is the *full* delimited path segment ("/sub/19/", both
+// slashes), not the bare id - "/sub/19/" can never be a substring of
+// "/sub/190/" (the character after "19" would have to be "/", not another
+// digit), so this is exactly as precise as a dictionary lookup with none of
+// the substring-collision risk a bare number would have. Since every
+// keyword here is already a unique, fully-delimited id, rule order doesn't
+// matter (unlike ext.to's rules, which do need specific-before-generic
+// ordering for ambiguous text keywords).
 const CATEGORY_RULES: CategoryRule[] = [
-  [['tv'], CATEGORIES.TV],
-  [['anime'], CATEGORIES.TV_ANIME],
-  [['music', 'lossless'], CATEGORIES.AUDIO],
-  [['games', 'apps'], CATEGORIES.PC],
-  [['audiobook'], CATEGORIES.AUDIOBOOKS],
-  [['book'], CATEGORIES.BOOKS],
-  [['xxx'], CATEGORIES.XXX],
-  [['movie', 'hd', 'documentary'], CATEGORIES.MOVIES]
+  // Movies
+  [['/sub/66/'], CATEGORIES.MOVIES], // 3D
+  [['/sub/73/'], CATEGORIES.MOVIES], // Bollywood
+  [['/sub/2/'], CATEGORIES.MOVIES], // Divx/Xvid
+  [['/sub/4/'], CATEGORIES.MOVIES], // Dubs/Dual Audio
+  [['/sub/1/'], CATEGORIES.MOVIES], // DVD
+  [['/sub/54/'], CATEGORIES.MOVIES], // h.264/x264
+  [['/sub/42/'], CATEGORIES.MOVIES], // HD
+  [['/sub/70/'], CATEGORIES.MOVIES], // HEVC/x265
+  [['/sub/55/'], CATEGORIES.MOVIES], // Mp4
+  [['/sub/3/'], CATEGORIES.MOVIES], // SVCD/VCD
+  [['/sub/76/'], CATEGORIES.MOVIES], // UHD
+  // TV
+  [['/sub/74/'], CATEGORIES.TV], // Cartoon
+  [['/sub/6/'], CATEGORIES.TV], // Divx/Xvid
+  [['/sub/5/'], CATEGORIES.TV], // DVD
+  [['/sub/41/'], CATEGORIES.TV], // HD
+  [['/sub/71/'], CATEGORIES.TV], // HEVC/x265
+  [['/sub/75/'], CATEGORIES.TV], // SD
+  [['/sub/7/'], CATEGORIES.TV], // SVCD/VCD
+  // Anime
+  [['/sub/28/'], CATEGORIES.TV_ANIME],
+  [['/sub/78/'], CATEGORIES.TV_ANIME], // Dual Audio
+  [['/sub/79/'], CATEGORIES.TV_ANIME], // Dubbed
+  [['/sub/81/'], CATEGORIES.TV_ANIME], // Raw
+  [['/sub/80/'], CATEGORIES.TV_ANIME], // Subbed
+  // Music
+  [['/sub/69/'], CATEGORIES.AUDIO], // AAC
+  [['/sub/53/'], CATEGORIES.AUDIO], // Album
+  [['/sub/58/'], CATEGORIES.AUDIO], // Box Set
+  [['/sub/68/'], CATEGORIES.AUDIO], // Concerts
+  [['/sub/59/'], CATEGORIES.AUDIO], // Discography
+  [['/sub/24/'], CATEGORIES.AUDIO], // DVD
+  [['/sub/23/'], CATEGORIES.AUDIO], // Lossless
+  [['/sub/22/'], CATEGORIES.AUDIO], // MP3
+  [['/sub/27/'], CATEGORIES.AUDIO], // Other
+  [['/sub/26/'], CATEGORIES.AUDIO], // Radio
+  [['/sub/60/'], CATEGORIES.AUDIO], // Single
+  [['/sub/25/'], CATEGORIES.AUDIO], // Video
+  // XXX
+  [['/sub/67/'], CATEGORIES.XXX], // Games
+  [['/sub/51/'], CATEGORIES.XXX], // Hentai
+  [['/sub/50/'], CATEGORIES.XXX], // Magazine
+  [['/sub/49/'], CATEGORIES.XXX], // Picture
+  [['/sub/48/'], CATEGORIES.XXX], // Video
+  // Games
+  [['/sub/72/'], CATEGORIES.CONSOLE_3DS],
+  [['/sub/45/'], CATEGORIES.CONSOLE_NDS], // DS
+  [['/sub/17/'], CATEGORIES.CONSOLE_OTHER],
+  [['/sub/10/'], CATEGORIES.PC_GAMES], // PC Game
+  [['/sub/43/'], CATEGORIES.CONSOLE_PS3],
+  [['/sub/77/'], CATEGORIES.CONSOLE_PS4],
+  [['/sub/12/'], CATEGORIES.CONSOLE_PSP],
+  [['/sub/44/'], CATEGORIES.CONSOLE_WII],
+  [['/sub/13/'], CATEGORIES.CONSOLE_XBOX],
+  [['/sub/14/'], CATEGORIES.CONSOLE_XBOX360],
+  // No dedicated Torznab id for these consoles - nearest catch-all bucket.
+  [['/sub/16/'], CATEGORIES.CONSOLE_OTHER], // Dreamcast
+  [['/sub/11/'], CATEGORIES.CONSOLE_OTHER], // PS2
+  [['/sub/15/'], CATEGORIES.CONSOLE_OTHER], // PS1
+  [['/sub/46/'], CATEGORIES.CONSOLE_OTHER], // GameCube
+  [['/sub/82/'], CATEGORIES.CONSOLE_OTHER], // Switch
+  // Apps
+  [['/sub/56/'], CATEGORIES.PC_MOBILE_ANDROID],
+  [['/sub/57/'], CATEGORIES.PC_MOBILE_IOS],
+  [['/sub/19/'], CATEGORIES.PC_MAC],
+  [['/sub/20/'], CATEGORIES.PC], // Linux
+  [['/sub/21/'], CATEGORIES.PC], // Other
+  [['/sub/18/'], CATEGORIES.PC], // PC Software
+  // Other
+  [['/sub/52/'], CATEGORIES.AUDIOBOOKS],
+  [['/sub/36/'], CATEGORIES.BOOKS_EBOOK], // E-Books
+  [['/sub/39/'], CATEGORIES.BOOKS], // Comics
+  [['/sub/33/'], CATEGORIES.CONSOLE_OTHER], // Emulation
+  [['/sub/37/'], CATEGORIES.OTHER], // Images
+  [['/sub/38/'], CATEGORIES.OTHER], // Mobile Phone (not necessarily apps)
+  [['/sub/47/'], CATEGORIES.PC], // Nulled Script
+  [['/sub/40/'], CATEGORIES.OTHER],
+  [['/sub/35/'], CATEGORIES.OTHER], // Sounds
+  [['/sub/34/'], CATEGORIES.OTHER], // Tutorials
 ];
 
 // Maps a Torznab category id to a 1337x listing path (either a top-level
@@ -126,33 +122,35 @@ const CATEGORY_RULES: CategoryRule[] = [
 // blank-query "latest" path (a real keyword search isn't filtered
 // server-side at all, see SearchOptions' doc comment). Ids with no
 // dedicated 1337x subcategory (PS1/PS2/GameCube/Dreamcast/Switch, Linux
-// apps, PC software) fall back to their nearest catch-all bucket.
+// apps, PC software) fall back to their nearest catch-all bucket. Stored
+// with both slashes (not a bare fragment) - the page number that gets
+// appended after it is the only piece any call site still supplies.
 const CATEGORY_BROWSE: Partial<Record<number, string>> = {
-  [CATEGORIES.MOVIES]: 'cat/Movies',
-  [CATEGORIES.TV]: 'cat/TV',
-  [CATEGORIES.TV_ANIME]: 'cat/Anime',
-  [CATEGORIES.AUDIO]: 'cat/Music',
-  [CATEGORIES.XXX]: 'cat/XXX',
-  [CATEGORIES.PC]: 'cat/Apps',
-  [CATEGORIES.PC_MAC]: 'sub/19',
-  [CATEGORIES.PC_MOBILE_IOS]: 'sub/57',
-  [CATEGORIES.PC_MOBILE_ANDROID]: 'sub/56',
-  [CATEGORIES.PC_GAMES]: 'sub/10',
-  [CATEGORIES.CONSOLE_NDS]: 'sub/45',
-  [CATEGORIES.CONSOLE_PSP]: 'sub/12',
-  [CATEGORIES.CONSOLE_WII]: 'sub/44',
-  [CATEGORIES.CONSOLE_XBOX]: 'sub/13',
-  [CATEGORIES.CONSOLE_XBOX360]: 'sub/14',
-  [CATEGORIES.CONSOLE_PS3]: 'sub/43',
-  [CATEGORIES.CONSOLE_3DS]: 'sub/72',
-  [CATEGORIES.CONSOLE_PS4]: 'sub/77',
-  [CATEGORIES.CONSOLE_OTHER]: 'sub/17',
-  [CATEGORIES.BOOKS_EBOOK]: 'sub/36',
-  [CATEGORIES.AUDIOBOOKS]: 'sub/52',
+  [CATEGORIES.MOVIES]: '/cat/Movies/',
+  [CATEGORIES.TV]: '/cat/TV/',
+  [CATEGORIES.TV_ANIME]: '/cat/Anime/',
+  [CATEGORIES.AUDIO]: '/cat/Music/',
+  [CATEGORIES.XXX]: '/cat/XXX/',
+  [CATEGORIES.PC]: '/cat/Apps/',
+  [CATEGORIES.PC_MAC]: '/sub/19/',
+  [CATEGORIES.PC_MOBILE_IOS]: '/sub/57/',
+  [CATEGORIES.PC_MOBILE_ANDROID]: '/sub/56/',
+  [CATEGORIES.PC_GAMES]: '/sub/10/',
+  [CATEGORIES.CONSOLE_NDS]: '/sub/45/',
+  [CATEGORIES.CONSOLE_PSP]: '/sub/12/',
+  [CATEGORIES.CONSOLE_WII]: '/sub/44/',
+  [CATEGORIES.CONSOLE_XBOX]: '/sub/13/',
+  [CATEGORIES.CONSOLE_XBOX360]: '/sub/14/',
+  [CATEGORIES.CONSOLE_PS3]: '/sub/43/',
+  [CATEGORIES.CONSOLE_3DS]: '/sub/72/',
+  [CATEGORIES.CONSOLE_PS4]: '/sub/77/',
+  [CATEGORIES.CONSOLE_OTHER]: '/sub/17/',
+  [CATEGORIES.BOOKS_EBOOK]: '/sub/36/',
+  [CATEGORIES.AUDIOBOOKS]: '/sub/52/',
   // 1337x has no bare "Books" listing, only the ebook/audiobook
   // subcategories - default an unspecific request to ebook.
-  [CATEGORIES.BOOKS]: 'sub/36',
-  [CATEGORIES.OTHER]: 'cat/Other'
+  [CATEGORIES.BOOKS]: '/sub/36/',
+  [CATEGORIES.OTHER]: '/cat/Other/'
 };
 
 // 1337x has no "all categories, newest first" listing (unlike ext.to/EZTV),
@@ -168,7 +166,7 @@ const NO_CAT_BROWSE: number[] = [CATEGORIES.MOVIES, CATEGORIES.TV, CATEGORIES.AU
 // has no IPv6 of its own - so ask to route through the host proxy (see
 // NOTES.md). Passing the provider id lets PROXY_PROVIDERS target it. Falls
 // back to a direct connection when no proxy is configured.
-const VIA_PROXY: GotoOptions = { proxy: '1337x' };
+const VIA_PROXY: FetchOptions = { proxy: '1337x' };
 
 interface ListingPage {
   items: SearchItem[];
@@ -195,10 +193,19 @@ function parseListing(html: string, knownCategory?: number): ListingPage {
     if (!title || !href) return;
     const detailUrl = new URL(href, BASE).toString();
 
-    const iconClass = nameCell.find('a.icon i').attr('class') || '';
-    const iconHref = nameCell.find('a.icon').attr('href') || '';
-    const subId = parseInt((iconHref.match(/^\/sub\/(\d+)\//) || [])[1] || '', 10);
-    const category = knownCategory ?? SUB_ID_CATEGORY[subId] ?? matchCategory(iconClass, CATEGORY_RULES);
+    // Trims the href down to just the "/sub/<id>/" segment, dropping the
+    // trailing page number ("/sub/19/0/" -> "/sub/19/") - so what gets
+    // passed to matchCategory() is exactly the meaningful part and nothing
+    // else, making the lookup below a clean 1:1 match against CATEGORY_RULES
+    // rather than a substring check against a longer, noisier string.
+    const iconHref = (nameCell.find('a.icon').attr('href') || '').match(/^\/sub\/\d+\//)?.[0] || '';
+    // Sub id is the only signal used - the icon CSS class it used to fall
+    // back to drifted live (see NOTES.md section 3's "Category drift"):
+    // TV rows started rendering the same class as HD movies. matchCategory()
+    // itself defaults to CATEGORIES.OTHER when nothing matches, so an
+    // unrecognized sub id (a future 1337x subcategory not yet listed) just
+    // lands in Other rather than risk a wrong guess.
+    const category = knownCategory ?? matchCategory(iconHref, CATEGORY_RULES);
 
     const seeds = parseInt($tr.find('td.coll-2.seeds').text().replace(/\D/g, ''), 10) || 0;
     const leechers = parseInt($tr.find('td.coll-3.leeches').text().replace(/\D/g, ''), 10) || 0;
@@ -239,12 +246,8 @@ function parseListing(html: string, knownCategory?: number): ListingPage {
 }
 
 async function fetchListingPage(url: string, knownCategory?: number): Promise<ListingPage> {
-  const page = await gotoCleared(url, VIA_PROXY);
-  try {
-    return parseListing(await page.content(), knownCategory);
-  } finally {
-    await page.close();
-  }
+  const html = await fetchCfProtectedPage(url, VIA_PROXY);
+  return parseListing(html, knownCategory);
 }
 
 async function search(q: string, opts: SearchOptions): Promise<SearchResult> {
@@ -258,7 +261,7 @@ async function search(q: string, opts: SearchOptions): Promise<SearchResult> {
     // newest-first already, no explicit sort param needed.
     if (!opts.categories || opts.categories.length === 0) {
       const pages = await Promise.all(
-        NO_CAT_BROWSE.map((id) => fetchListingPage(`${BASE}/${CATEGORY_BROWSE[id]}/1/`, id))
+        NO_CAT_BROWSE.map((id) => fetchListingPage(`${BASE}${CATEGORY_BROWSE[id]}1/`, id))
       );
       const items = pages.flatMap((p) => p.items);
       return { items: items.slice(opts.offset, opts.offset + opts.limit), total: items.length };
@@ -270,11 +273,11 @@ async function search(q: string, opts: SearchOptions): Promise<SearchResult> {
     if (targets.length === 0) return { items: [], total: 0 }; // all requested cats unknown to 1337x
     if (targets.length === 1) {
       const { id, path } = targets[0]!;
-      return fetchPagedWindow((sitePage) => fetchListingPage(`${BASE}/${path}/${sitePage}/`, id), paging);
+      return fetchPagedWindow((sitePage) => fetchListingPage(`${BASE}${path}${sitePage}/`, id), paging);
     }
 
     return fetchMergedBrowse(
-      targets.map(({ id, path }) => (sitePage: number) => fetchListingPage(`${BASE}/${path}/${sitePage}/`, id)),
+      targets.map(({ id, path }) => (sitePage: number) => fetchListingPage(`${BASE}${path}${sitePage}/`, id)),
       paging
     );
   }
@@ -291,16 +294,14 @@ async function search(q: string, opts: SearchOptions): Promise<SearchResult> {
 async function resolveMagnet({ url }: MagnetRef): Promise<string> {
   if (!url) throw new Error('1337x: resolveMagnet requires a url.');
 
-  const page = await gotoCleared(url, VIA_PROXY);
-  try {
-    const html = await page.content();
-    const $ = cheerio.load(html);
-    const magnet = $('a[href^="magnet:"]').first().attr('href');
-    if (!magnet) throw new Error('Could not find a magnet link on the torrent page.');
-    return magnet;
-  } finally {
-    await page.close();
-  }
+  // Pure read - the magnet link is right there in the detail page's static
+  // HTML, no POST needed - so this doesn't need a live page at all, just
+  // the fast-path/caching fetchListingPage's real searches already get.
+  const html = await fetchCfProtectedPage(url, VIA_PROXY);
+  const $ = cheerio.load(html);
+  const magnet = $('a[href^="magnet:"]').first().attr('href');
+  if (!magnet) throw new Error('Could not find a magnet link on the torrent page.');
+  return magnet;
 }
 
 export default {
@@ -309,30 +310,13 @@ export default {
   // Landing page is enough here - the challenge isn't path-specific, and it's
   // a cheaper page than a search. Needs the same proxy as everything else.
   keepAlive: { url: `${BASE}/`, proxy: '1337x' },
-  categories: [
-    CATEGORIES.MOVIES,
-    CATEGORIES.TV,
-    CATEGORIES.TV_ANIME,
-    CATEGORIES.AUDIO,
-    CATEGORIES.XXX,
-    CATEGORIES.PC,
-    CATEGORIES.PC_MAC,
-    CATEGORIES.PC_MOBILE_IOS,
-    CATEGORIES.PC_MOBILE_ANDROID,
-    CATEGORIES.PC_GAMES,
-    CATEGORIES.CONSOLE_NDS,
-    CATEGORIES.CONSOLE_PSP,
-    CATEGORIES.CONSOLE_WII,
-    CATEGORIES.CONSOLE_XBOX,
-    CATEGORIES.CONSOLE_XBOX360,
-    CATEGORIES.CONSOLE_PS3,
-    CATEGORIES.CONSOLE_3DS,
-    CATEGORIES.CONSOLE_PS4,
-    CATEGORIES.CONSOLE_OTHER,
-    CATEGORIES.BOOKS_EBOOK,
-    CATEGORIES.AUDIOBOOKS,
-    CATEGORIES.OTHER
-  ],
+  // Every category CATEGORY_BROWSE can route, except BOOKS: that entry is
+  // only a browse-routing fallback for an unspecific request, not a real
+  // category with its own content (1337x only ever classifies items as the
+  // more specific BOOKS_EBOOK/AUDIOBOOKS), so it shouldn't be advertised.
+  categories: Object.keys(CATEGORY_BROWSE)
+    .map(Number)
+    .filter((id) => id !== CATEGORIES.BOOKS),
   search,
   resolveMagnet
 } satisfies Provider;

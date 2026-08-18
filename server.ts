@@ -18,12 +18,12 @@
  */
 
 import express, { type Application, type Request, type Response } from 'express';
-import { closeBrowser, gotoCleared } from './lib/browser.js';
+import { closeBrowser, fetchCfProtectedPage } from './lib/browser.js';
 import { categoriesXml } from './lib/categories.js';
 import { TTLCache } from './lib/cache.js';
 import { ProviderStatusTracker, renderStatusPage } from './lib/status.js';
 import { providerMap } from './providers/index.js';
-import type { MagnetRef, Provider, SearchItem, SearchOptions, SearchResult } from './lib/types.js';
+import type { MagnetRef, Provider, SearchItem } from './lib/types.js';
 
 const PORT = process.env.PORT || 9117;
 const API_KEY = process.env.API_KEY || 'changeme';
@@ -40,10 +40,11 @@ const KEEPALIVE_INTERVAL_MS = process.env.KEEPALIVE_INTERVAL_MS === undefined
   ? 15 * 60 * 1000
   : Number(process.env.KEEPALIVE_INTERVAL_MS);
 
-// Search results change (new uploads, seed counts) so keep the cache short.
-// Magnet info hashes never change for a given torrent, so cache those much
-// longer - avoids hitting the tracker again if Prowlarr re-grabs/retries.
-const SEARCH_CACHE_TTL_MS = Number(process.env.SEARCH_CACHE_TTL_MS) || 5 * 60 * 1000;
+// Magnet info hashes never change for a given torrent, so cache those for a
+// good while - avoids hitting the tracker again if Prowlarr re-grabs/retries.
+// (Search results used to have their own cache here too - removed in favor
+// of caching each underlying page fetch itself, right where it happens, in
+// lib/browser.ts's fetchCfProtectedPage(). See NOTES.md.)
 const MAGNET_CACHE_TTL_MS = Number(process.env.MAGNET_CACHE_TTL_MS) || 60 * 60 * 1000;
 
 // Advertised in caps' <limits> and enforced on every search - Torznab: "the
@@ -99,7 +100,6 @@ ${categoriesXml(provider.categories)}
 
 export interface AppOptions {
   apiKey?: string;
-  searchCacheTtlMs?: number;
   magnetCacheTtlMs?: number;
   // Shared with the keep-alive scheduler in production (see the isMain
   // block at the bottom) so a provider's status reflects both background
@@ -115,7 +115,6 @@ export interface AppOptions {
 // - see the entrypoint guard at the bottom).
 export function createApp(providers: Record<string, Provider>, opts: AppOptions = {}): Application {
   const apiKey = opts.apiKey ?? API_KEY;
-  const searchCache = new TTLCache<SearchResult>(opts.searchCacheTtlMs ?? SEARCH_CACHE_TTL_MS);
   const magnetCache = new TTLCache<string>(opts.magnetCacheTtlMs ?? MAGNET_CACHE_TTL_MS);
   const statusTracker = opts.statusTracker ?? new ProviderStatusTracker();
 
@@ -136,24 +135,17 @@ export function createApp(providers: Record<string, Provider>, opts: AppOptions 
   // what it means (return latest uploads) instead of server.ts injecting a
   // keyword. See NOTES.md for the full history of why this existed and why
   // it was removed.
-  async function search(provider: Provider, q: string, opts: SearchOptions): Promise<SearchResult & { cached: boolean }> {
-    // Sorted so cat=2000,5000 and cat=5000,2000 hit the same cache entry.
-    const catKey = opts.categories?.length ? [...opts.categories].sort((a, b) => a - b).join(',') : '';
-    const cacheKey = `${provider.id}:${q.toLowerCase().trim()}:${catKey}:${opts.offset}:${opts.limit}`;
-    const cachedResult = searchCache.get(cacheKey);
-    if (cachedResult) {
-      console.error(`[cache] search hit for ${provider.id} q=${JSON.stringify(q)}`);
-      return { ...cachedResult, cached: true };
-    }
-
-    const result = await provider.search(q, opts);
-    // Never cache an empty result. A transient failure (proxy down,
-    // challenge not cleared, markup change) would otherwise be frozen in
-    // for the full TTL and keep being served after the underlying problem
-    // is fixed.
-    if (result.items.length) searchCache.set(cacheKey, result);
-    return { ...result, cached: false };
-  }
+  //
+  // No cache here any more - every search calls provider.search() fresh.
+  // That's fine: the expensive part (network/scrape fetches) is cached
+  // right where it happens, in lib/browser.ts's fetchCfProtectedPage(),
+  // keyed by the underlying site page's URL rather than by this request's
+  // exact q/cat/offset/limit - so a request for a different offset of the
+  // same query reuses already-fetched pages instead of missing entirely.
+  // Rebuilding the RSS response itself (merge/sort/slice/XML) is cheap.
+  // See NOTES.md for the full reasoning and the tradeoff this gives up
+  // (server.ts can no longer report per-request cache-hit stats - see the
+  // status page's "cached" counter, now magnet-download-only).
 
   async function resolveMagnet(provider: Provider, ref: MagnetRef): Promise<{ magnet: string; cached: boolean }> {
     const cacheKey = `${provider.id}:${ref.id ?? ref.url}`;
@@ -283,8 +275,8 @@ ${rows}
       limit = Math.min(limit, MAX_LIMIT);
 
       try {
-        const { items, total, cached } = await search(provider, q, { categories, offset, limit });
-        statusTracker.recordRequest(provider.id, true, { cached });
+        const { items, total } = await provider.search(q, { categories, offset, limit });
+        statusTracker.recordRequest(provider.id, true);
         res.type('application/xml').send(buildRss(req, provider, items, total));
       } catch (err) {
         const message = err instanceof Error ? err.message : String(err);
@@ -328,15 +320,16 @@ ${rows}
 }
 
 // Visits a provider's keep-alive URL so its clearance cookie stays fresh.
-// gotoCleared() already solves only when challenged, so this is cheap while
-// the cookie is still valid.
+// Goes through fetchCfProtectedPage() - same fast-fetch/slow-navigate-
+// recover path a real request would use - so this both warms the
+// per-provider persistent page and only pays for a real solve when
+// actually challenged, same as before.
 async function warmProvider(provider: Provider, statusTracker: ProviderStatusTracker): Promise<void> {
   const ka = provider.keepAlive;
   if (!ka) return;
   const started = Date.now();
   try {
-    const page = await gotoCleared(ka.url, ka.proxy ? { proxy: ka.proxy } : {});
-    await page.close();
+    await fetchCfProtectedPage(ka.url, ka.proxy ? { proxy: ka.proxy } : {});
     statusTracker.recordCheck(provider.id, true);
     console.error(`[keepalive] ${provider.id} ok (${Date.now() - started}ms)`);
   } catch (err) {

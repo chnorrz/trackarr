@@ -209,7 +209,11 @@ test('RSS output includes opensearch:totalResults from the provider', async () =
   });
 });
 
-test('search results are cached - a second identical search does not call the provider again', async () => {
+test('search results are not cached at the server level - each request calls the provider fresh', async () => {
+  // No top-level result cache any more - the expensive part (network/scrape
+  // fetches) is cached at the fetch itself instead, in lib/browser.ts's
+  // fetchCfProtectedPage(), keyed by the underlying site page's URL rather
+  // than the request's exact q/cat/offset/limit. See NOTES.md.
   let calls = 0;
   const provider = fakeProvider({
     search: async () => {
@@ -220,24 +224,7 @@ test('search results are cached - a second identical search does not call the pr
   await withServer({ fake: provider }, async (base) => {
     await fetch(`${base}/fake/api?t=search&q=same&apikey=${API_KEY}`);
     await fetch(`${base}/fake/api?t=search&q=same&apikey=${API_KEY}`);
-    assert.equal(calls, 1);
-  });
-});
-
-test('empty results are never cached - a transient failure recovers on retry', async () => {
-  let calls = 0;
-  const provider = fakeProvider({
-    search: async () => {
-      calls++;
-      return calls === 1 ? { items: [], total: 0 } : { items: [fakeItem()], total: 1 };
-    }
-  });
-  await withServer({ fake: provider }, async (base) => {
-    const first = await (await fetch(`${base}/fake/api?t=search&q=same&apikey=${API_KEY}`)).text();
-    assert.doesNotMatch(first, /<item>/);
-    const second = await (await fetch(`${base}/fake/api?t=search&q=same&apikey=${API_KEY}`)).text();
-    assert.match(second, /<item>/);
-    assert.equal(calls, 2); // proves the empty first result wasn't cached
+    assert.equal(calls, 2);
   });
 });
 
@@ -390,14 +377,14 @@ test('GET / shows "no requests yet" before any search or download has happened',
   });
 });
 
-test('GET / request stats count a cache hit as both served and cached', async () => {
+test('GET / request stats never show search requests as cached - server.ts has no search cache any more', async () => {
   const statusTracker = new ProviderStatusTracker();
   await withServer({ fake: fakeProvider() }, async (base) => {
-    await fetch(`${base}/fake/api?t=search&q=same&apikey=${API_KEY}`); // live fetch
-    await fetch(`${base}/fake/api?t=search&q=same&apikey=${API_KEY}`); // cache hit
+    await fetch(`${base}/fake/api?t=search&q=same&apikey=${API_KEY}`);
+    await fetch(`${base}/fake/api?t=search&q=same&apikey=${API_KEY}`); // identical, still not "cached" from server.ts's point of view
     const body = await (await fetch(`${base}/`)).text();
     assert.match(body, /2 served/);
-    assert.match(body, /2 ok \(50% cached\)/);
+    assert.match(body, /2 ok \(0% cached\)/);
     assert.match(body, /0 failed/);
   }, { statusTracker });
 });
