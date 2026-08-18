@@ -147,6 +147,11 @@ test('ext.to blank query with no categories uses the general (no cat param) brow
   assert.equal(items.length, 4);
   const url = fetchCfProtectedPage.mock.calls[fetchCfProtectedPage.mock.calls.length - 1]?.arguments[0] as string;
   assert.doesNotMatch(url, /[?&]cat=/);
+  // Without age=4, bare /browse/ renders a category-picker landing page
+  // instead of a results table (0 rows, no <table> at all) - confirmed
+  // live, this is what actually made Prowlarr's blank-query Test button
+  // fail with "no results were returned from your indexer".
+  assert.match(url, /[?&]age=4(&|$)/);
 });
 
 test('ext.to blank query with an unsupported category (e.g. XXX) returns empty', async () => {

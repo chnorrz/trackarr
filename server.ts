@@ -204,6 +204,18 @@ ${rows}
 
   const app = express();
 
+  // Logs every incoming request, including who made it - the client IP
+  // (which container/host) and User-Agent (which app - Prowlarr/Sonarr/
+  // Radarr identify themselves there). apikey is redacted from the URL -
+  // it's a query param, and logging it raw would land the real key in
+  // stdout/stderr and whatever log aggregator ends up storing it.
+  app.use((req: Request, _res: Response, next) => {
+    const url = req.originalUrl.replace(/([?&]apikey=)[^&]*/, '$1***');
+    const ua = req.get('user-agent') || 'unknown';
+    console.error(`[req] ${req.ip} "${ua}" ${req.method} ${url}`);
+    next();
+  });
+
   // No apikey needed - same reasoning as ?t=caps: this exposes no torrent
   // data and lets you do nothing, it's just a health dashboard meant to be
   // pulled up directly in a browser.

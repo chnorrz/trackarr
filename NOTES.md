@@ -44,6 +44,13 @@ Adding a tracker: write `providers/<id>.ts`, register in
   triggers a WAF challenge.
 - Bare `/browse/` without `?q=` does **not** render `searchPageToken`. If you
   just need a token, use a realistic query.
+- Bare `/browse/` with **no `q` and no `cat`** (the "all categories, newest"
+  general listing used by blank-query browsing - see section 11) also needs
+  `age=4` or it renders a category-picker landing page instead of a results
+  table entirely (0 rows, no `<table>` at all in the response) - confirmed
+  live. This is exactly what made Prowlarr's blank-query "Test" button fail
+  with "no results were returned from your indexer" until fixed.
+  `generalBrowsePage()` in `providers/ext-to.ts` sends it.
 - Rows: `table.search-table tbody > tr`
 
 | Field | Selector |
@@ -558,6 +565,22 @@ script; if it still clears, the fault is ours.
 **Screenshots are ground truth.** Widget state was twice misdiagnosed by
 inferring from frame URLs and `page.content()`. `page.screenshot()`, then
 `docker cp` it out and actually look at it.
+
+**Every request is logged** (`server.ts`, a global `app.use()` middleware
+before the routes): `[req] <client ip> "<User-Agent>" <method> <url>`,
+apikey redacted from the URL. Useful for confirming who's actually hitting
+the server (Prowlarr/Sonarr/Radarr all send an identifiable UA) and with
+what params, without needing to reproduce a request by hand.
+
+**Never `docker exec node -e "..."` a debug script against the live server
+container.** It's a brand new Node process - it imports `lib/browser.js`
+fresh and launches its *own* Camoufox browser, completely separate from the
+running server's. Two browsers fighting for CPU/Xvfb/disk on the same
+container causes exactly the kind of hang/timeout/false "still challenged"
+symptoms that look like a real bug (confirmed - wasted real debugging time
+on this twice). Use the real HTTP API (`curl` against the running
+container) to investigate a live server instead; use the "Fast iteration"
+long-lived debug container below only when you need a scratch script.
 
 **Fast iteration without rebuilds** (a rebuild is ~3 min, this is ~30 s):
 

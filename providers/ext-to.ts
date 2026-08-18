@@ -184,7 +184,11 @@ function browsePage(target: BrowseTarget, categoryId: number, sitePage: number):
 // knownCategory here - the listing genuinely mixes every category, so
 // per-row breadcrumb detection is unavoidable.
 function generalBrowsePage(sitePage: number): Promise<ListingPage> {
-  const params = new URLSearchParams({ sort: 'age', order: 'desc', page_size: String(SITE_PAGE_SIZE), page: String(sitePage) });
+  // Without `age`, bare /browse/ (no q, no cat) renders as a category-picker
+  // landing page instead of a results table - confirmed live (0 rows, no
+  // <table> at all in the response). `age=4` is what a real "sort by age,
+  // no other filter" link on the site itself uses - confirmed live too.
+  const params = new URLSearchParams({ sort: 'age', order: 'desc', age: '4', page_size: String(SITE_PAGE_SIZE), page: String(sitePage) });
   return fetchListingPage(`${BASE}/browse/?${params}`);
 }
 
