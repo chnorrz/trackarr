@@ -24,7 +24,8 @@ carrying a whole extra toolchain just to interpret TS on every start.
 | `server.ts` | Torznab endpoints: `/:provider/api`, `/:provider/download` |
 | `lib/browser.ts` | Camoufox session, Cloudflare clearing, auto-solve |
 | `lib/cache.ts` | TTL cache (search 5 min, magnets 1 h) |
-| `lib/categories.ts` | Shared Torznab category ids |
+| `lib/categories.ts` | Torznab category ids + `categoriesXml()` (per-provider caps rendering) |
+| `lib/paging.ts` | `fetchPagedWindow()` - offset/limit pagination with a depth cap |
 | `lib/parse.ts` | Shared size-string parsing |
 | `lib/types.ts` | `Provider`/`SearchItem`/`MagnetRef` shared interfaces |
 | `providers/*.ts` | Per-tracker, each `export default {...} satisfies Provider` |
@@ -97,12 +98,46 @@ Much lighter protection, and **no cookie needed**.
 - Seeds / leechers: `td.coll-2.seeds` / `td.coll-3.leeches`
 - Size: `td.coll-4.size` — contains a **nested duplicate span**; strip child
   elements or you get `"2.2 GB28818"`
-- Category: from the icon class `td.coll-1.name a.icon i` (`flaticon-movies`,
-  `flaticon-tv`, ...)
+- Category: primarily from the sub-category id embedded in
+  `td.coll-1.name a.icon`'s `href` (`/sub/<id>/...`) via `SUB_ID_CATEGORY`
+  in `providers/1337x.ts` — the icon **CSS class** (`flaticon-movies`,
+  `flaticon-tv`, ...) is only a fallback for an unlisted sub id, since it's
+  been observed to drift (live TV rows render `flaticon-hd`, identical to
+  HD movies — see section 3's own "Category drift" note below and section
+  10's `knownCategory` design for how blank-query browsing sidesteps this
+  entirely by already knowing which category it asked for).
 - Magnet: embedded directly on the detail page as `a[href^="magnet:"]` — no
   HMAC dance
 - Dates are only relative strings; no exact-date attribute. `pubDate` falls
   back to now.
+
+### Category drift — icon CSS class is not reliable, use the sub id
+
+Live-tested by browsing `cat/Movies/1/`, `cat/TV/1/`, `cat/Music/1/`
+directly and inspecting real rows: 1337x's markup has drifted from what the
+old icon-class matcher (`CATEGORY_RULES`, substring rules like `'tv'`,
+`'music'`, `'hd'`) expects. TV episode rows now render with icon class
+`flaticon-hd` — identical to HD movies, so the `'hd'` rule (meant for
+movies) silently absorbed every TV row into Movies. Music/lossless rows use
+a `flaticon-lossless` class no rule matched at all, falling through to
+`OTHER`.
+
+The fix: every row's icon `<a>` also links to `/sub/<id>/<page>/` — a
+numeric 1337x-internal subcategory id, which turned out to be a far more
+stable signal than the CSS class. `providers/1337x.ts` has a
+`SUB_ID_CATEGORY: Partial<Record<number, number>>` table (~70 entries,
+transcribed from 1337x's own live category sidebar HTML for every top-level
+category — Movies/TV/Anime/Music/XXX/Games/Apps/Other) mapping each sub id
+to its Torznab category. `CATEGORY_RULES` (icon class) is now only a
+fallback for a sub id not yet in the table, or a row with no icon href at
+all. A handful of 1337x's "Other"-bucket sub-categories have no clean 1:1
+Torznab equivalent and were mapped by judgment call (e.g. Comics -> Books,
+Emulation -> Console/Other, Nulled Script -> generic PC) — check
+`SUB_ID_CATEGORY`'s comments if a new one needs adding.
+
+Live-verified after the fix: the no-cat browse snapshot (see section 10)
+went from 37/0/0/32+11 (Movies/TV/Anime/Other, badly misclassified) to an
+exactly correct 20/20/-/20 split across Movies/TV/Music/Other.
 
 ### Reachability
 
@@ -352,6 +387,42 @@ solve, and correct results on the second.** It looks like a broken parser or
 a stale cache, and it isn't either. `gotoCleared` now waits for
 `networkidle` after a solve and re-reads the content.
 
+### Concurrent navigations hang - `page.goto` needs serializing too
+
+Multi-category requests (`fetchMergedBrowse`, 1337x's no-cat 4-category
+snapshot - see section 10) fire several `gotoCleared()` calls at once via
+`Promise.all`. Live-tested against 1337x through the proxy: a single
+concurrent navigation works fine, 2+ concurrent navigations to the same
+Cloudflare-protected host reliably hang until the 60 s `page.goto` timeout -
+reproduced deterministically. Two separate causes, both in `lib/browser.ts`:
+
+1. Only the xdotool **solve** step was serialized (the pre-existing
+   `serializeSolve()`/`solveChain` promise-chain mutex). `page.goto()`
+   itself was not - concurrent navigations to the same host raced each
+   other and Cloudflare appears to treat simultaneous connections from one
+   client as suspicious and gets stuck rather than erroring cleanly.
+2. `getPersistentContext()`/`getProxyContext()` were lazy singletons with no
+   guard against concurrent first calls - each could see the cache as still
+   empty and launch its own Camoufox browser instance simultaneously
+   (confirmed via logs: 4x `[cf] launching proxied browser` for one
+   request), starving the shared Xvfb display and causing
+   `NS_ERROR_NET_TIMEOUT`.
+
+Fix: `serializeNav()` - a second pair of promise-chain mutexes
+(`directNavChain`/`proxyNavChain`, keyed by whether the proxy is in use so
+direct and proxied navigation don't block each other) wrapping the whole
+`gotoCleared` body, mirroring `serializeSolve`'s existing pattern. Plus:
+`getPersistentContext()`/`getProxyContext()` now cache the **in-flight
+launch promise**, not just the resolved context, so concurrent callers
+await the same launch instead of racing (cache is cleared on launch
+failure so a later call can retry).
+
+Live-verified after the fix: a 4-fetch concurrent snapshot produces exactly
+one `[cf] launching proxied browser` line, one solve, and sequential
+navigations - completes in ~24 s instead of hanging. Tradeoff accepted:
+multi-category blank browsing is now ~N × single-fetch time instead of
+running in parallel.
+
 ---
 
 ## 7. Environment gotchas
@@ -450,45 +521,40 @@ curl -sD- -o/dev/null "localhost:9117/ext-to/download?apikey=k&id=<id>"         
 Use a **fresh volume** to exercise the cold-start solve; an existing
 cf_clearance hides solver breakage entirely.
 
-### Before calling a new provider done: verify `testQuery` actually returns results
+### Before calling a new provider done: verify blank-query browse actually returns results
 
 Prowlarr's Test button (and Save - Save genuinely fails, red exclamation
-mark, if Test's result set is empty) searches with a **blank** `q`. No
-provider has a real "browse everything" mode for that, so `server.ts`
-substitutes `provider.testQuery` (falling back to `'yify'` with a loud
-`console.error` warning if a provider doesn't set one).
+mark, if Test's result set is empty) searches with a **blank** `q`. There is
+no `testQuery` substitution any more (see section 10) - a blank `q` is
+passed straight to `provider.search('', opts)`, and every provider must
+implement a real "browse latest uploads" path for that case, keyed off
+`opts.category`.
 
-**This has already broken twice for the same underlying reason:** a
-provider's search term needs to actually be a good fit for what that
-tracker carries. `'yify'` is a movie-release-group tag - it silently
-returned **zero** results on EZTV (TV-only) even though the blank-query
-substitution mechanism itself was working correctly, reproducing the exact
-"Query successful, but no results were returned from your indexer"
-Prowlarr error that mechanism exists to prevent. It looks like a Prowlarr
-bug or a scraping bug; it's neither.
+**Historically this broke twice for the same underlying reason** (back when
+blank `q` was substituted with a fixed search term): a term that's a good
+fit for one tracker's catalog can return zero results on another. The new
+per-category browse design removes the term entirely, but the failure mode
+it's worth guarding against is now "this category has no `CATEGORY_BROWSE`
+mapping for this provider" - Prowlarr still needs *a* category param on
+Test/Save for this to produce anything.
 
-So: **before considering a new provider finished, run its `testQuery`
-directly and confirm it returns a non-trivial result count**, the same way
-you'd smoke-test anything else here:
+So: **before considering a new provider finished, run its blank-query browse
+directly for each category it claims to support (its `categories` array) and
+confirm each returns a non-trivial result count**:
 
 ```bash
 npm run build
 node -e "
 import('./dist/providers/<id>.js').then(async ({default: p}) => {
-  const items = await p.search(p.testQuery);
-  console.log(p.testQuery, '->', items.length, 'results');
-  if (items[0]) console.log('sample:', items[0].title);
+  for (const category of p.categories) {
+    const { items, total } = await p.search('', { category, offset: 0, limit: 10 });
+    console.log(category, '->', items.length, 'of', total);
+    if (items[0]) console.log('  sample:', items[0].title);
+  }
   process.exit(0);
 });
 "
 ```
-
-Prefer a **release-group tag over a specific title** where the tracker's
-content supports it (`'yify'` for general/movie trackers, `'MeGusta'` for
-EZTV's TV-only catalog) - broader, more perpetual hit surface than betting
-on one show/movie staying available forever. A specific well-known title
-(e.g. a long-running show name) is an acceptable fallback if the tracker
-has no equivalent tagging convention.
 
 ---
 
@@ -520,7 +586,171 @@ request path, lower it.
 
 ---
 
-## 10. Testing
+## 10. Pagination, blank-query browsing, and per-provider categories
+
+### Why `testQuery` was removed
+
+Originally a blank `q` (what Prowlarr's Test/Save always sends) was
+substituted with a fixed `provider.testQuery` string ('yify', 'MeGusta',
+etc). That's a hack: it only ever returns whatever that one term happens to
+match, ignores whatever category Prowlarr actually asked for, and provides
+no real pagination - Sonarr/Radarr's "search all" flows use blank `q` too,
+not just Prowlarr's Test button. It's gone. `server.ts` now passes `q`
+through to `provider.search(q, opts)` completely unchanged, blank or not;
+every provider implements a real "browse latest uploads for category X" path
+for the blank case.
+
+### `CATEGORY_BROWSE` tables and multi-category `cat`
+
+Each provider (`providers/ext-to.ts`, `providers/1337x.ts`) has its own
+`CATEGORY_BROWSE: Partial<Record<number, ...>>` mapping a Torznab category
+id to that tracker's browse URL/path for it (e.g. ext.to's
+`{cat, subCat?}` numeric pair vs 1337x's `cat/Movies` / `sub/36` path
+fragments).
+
+`SearchOptions.categories?: number[]` (renamed from a single `category`)
+holds every id from a comma-separated `cat=` param (spec: OR semantics -
+`cat=2000,5000` means either category). It drives two different things
+depending on whether `q` is blank:
+
+- **Blank `q` (browse):** each requested id is resolved through
+  `CATEGORY_BROWSE`; unresolvable ones (unknown to this tracker, e.g. XXX on
+  ext.to) are dropped. Zero resolved -> `{items:[],total:0}`. One resolved ->
+  the existing single-source `fetchPagedWindow`. Two or more resolved ->
+  `fetchMergedBrowse` (below), which fetches each category's listing
+  independently and merges them by `pubDate` descending. No `cat` at all ->
+  each provider's own general/no-cat browse (see below).
+- **Real keyword search:** `categories` becomes a `filter` predicate passed
+  into `fetchPagedWindow` (`item => categories.includes(item.category)`) -
+  applied to the tracker's own search results, since none of these trackers
+  support filtering by category server-side in their search UI.
+
+**No-`cat` blank-query browsing is per-provider, not uniform:**
+- ext.to and EZTV both have their own genuine "all categories, newest first"
+  listing (ext.to: `/browse/?sort=age&order=desc` with no `cat`/`sub_cat` at
+  all; EZTV: `/api/get-torrents` is TV-only anyway) - `fetchPagedWindow` runs
+  once against that.
+- 1337x has no such listing. Its no-`cat` case deliberately matches
+  **Prowlarr's own reference Cardigann definition**
+  (`Prowlarr/Indexers` repo, `definitions/v11/1337x.yml`) instead of
+  inventing new behavior: a fixed snapshot of exactly 4 categories -
+  `cat/Movies/1/`, `cat/TV/1/`, `cat/Music/1/`, `cat/Other/1/` - always page 1
+  only, concatenated with **no** cross-category date re-sort, `total` is the
+  exact combined count (the whole snapshot is always fully known, no depth-cap
+  estimate needed). This intentionally does not support real offset/limit
+  depth beyond that one fixed page per category, same as Prowlarr's own
+  definition doesn't.
+
+EZTV is TV-only and has no `CATEGORY_BROWSE` table at all - instead it has a
+single guard at the top of `search()`: if `categories` is non-empty and
+doesn't include `CATEGORIES.TV`, it returns `{items:[],total:0}` immediately,
+before any network/browser call (blank or keyword path). Otherwise it hits
+`https://eztvx.to/api/get-torrents?limit=N&page=M` directly with a plain
+`fetch()` (not `gotoCleared`/browser - accepted risk if Cloudflare ever
+starts protecting that endpoint) and always maps everything to
+`CATEGORIES.TV`.
+
+### `fetchPagedWindow`, `fetchMergedBrowse`, and the depth cap
+
+`lib/paging.ts` exports `fetchPagedWindow<T>()`: given a `fetchPage(sitePage)`
+callback and the caller's requested `{offset, limit, sitePageSize, depthCap,
+filter?}`, it fetches only as many of the tracker's own pages as needed to
+cover `[offset, offset+limit)`, slices the result to exactly that window, and
+returns `{items, total}`. `total` is capped at `depthCap` (200 for every
+provider) - Prowlarr's own client paginates by repeatedly requesting the next
+`offset`, and it was found to page indefinitely against real trackers with no
+natural stopping point (EZTV in particular kept paging for hundreds of
+requests). Capping `total` at a small constant makes Prowlarr's own
+"has-more" logic stop after a bounded number of pages, regardless of how
+`opensearch:totalResults` gets used downstream.
+
+With a `filter` (used for category-filtering real search results), it
+switches to a sequential scan from site page 1 instead of jumping to a
+computed page - filtered-item density per page is unknown up front - stopping
+once enough matches are collected, `depthCap` raw items have been scanned, or
+a page comes back short (source exhausted). `total` in that mode is the exact
+match count if the source ran out, otherwise `depthCap` - any `totalHint`
+from the unfiltered source is ignored since it would describe the wrong
+(unfiltered) set.
+
+`fetchMergedBrowse<T extends {pubDate: Date}>(sources, opts)` runs
+`fetchPagedWindow` independently per source (each bounded by the same
+`depthCap`), flattens all their items into one pool, sorts by `pubDate`
+descending, and slices `[offset, offset+limit)` out of the merged pool -
+used when 2+ categories are requested for a blank-query browse. Known
+limitation: 1337x's `parseListing()` always sets `pubDate: new Date()` (no
+real per-item date is parseable from the site), so merging multiple 1337x
+categories doesn't produce a meaningfully chronological order, just rough
+per-source concatenation - a pre-existing constraint, not something the merge
+itself got wrong.
+
+**`<opensearch:totalResults>` is never actually parsed by Prowlarr.** It's
+rendered for spec-compliance only (see section 11); the real fix for runaway
+pagination is the depth cap plus returning short/empty item lists once a
+provider's browse listing is exhausted, which `fetchPagedWindow` and each
+provider's own listing parser already do.
+
+### Per-provider `categories` and the caps XML fix
+
+`Provider.categories: number[]` (in `lib/types.ts`) declares exactly which
+Torznab category ids a provider's content can be classified into.
+`lib/categories.ts`'s `categoriesXml(ids)` renders only those ids (plus
+their parent `<category>` wrapper for any 1000-series console subcat, added
+automatically) into the `<categories>` block of `capsXml()` in `server.ts`.
+
+This replaced an earlier bug where every provider's caps advertised the same
+single global category list - e.g. EZTV (TV-only) was advertising Movies,
+Books, XXX, PC/Apps, etc it doesn't actually have, because `capsXml()` used
+to interpolate one shared `CATEGORIES_XML` constant regardless of which
+provider was asking.
+
+---
+
+## 11. Torznab spec compliance
+
+Audited against the official Torznab v1.3 draft spec
+(https://torznab.github.io/spec-1.3-draft/torznab/Specification-v1.3.html).
+Findings and fixes:
+
+- **`t=` query param values are unhyphenated.** `t=search`/`t=tvsearch`/
+  `t=movie` - not `tv-search`/`movie-search`. Those hyphenated forms are only
+  the caps `<tv-search>`/`<movie-search>` *element* names, a separate thing.
+  `server.ts`'s route handler was matching the wrong (element) names; fixed.
+- **`cat` is a comma-separated OR list**, not a single value - fixed (see
+  above section). Unknown category ids are silently dropped, not an error
+  (spec: "unknown categories must be silently ignored" - this governs
+  semantically-unknown ids, not syntax; we don't currently reject
+  non-numeric `cat` values as strict syntax errors the way the spec's
+  `^\d+(,\d+)*$` wording implies "must" - a known, accepted gap, not yet
+  raised as worth the extra strictness).
+- **`limit` is clamped to the caps-advertised max** (`MAX_LIMIT=100`) via
+  `Math.min` - was previously unbounded.
+- **`categories` XML nesting** follows the Newznab `X000`/`Xnnn` convention
+  uniformly (`lib/categories.ts`'s `CATEGORY_DEFS` sets `parent` on every
+  subcat, e.g. `5070->5000`, `3030->3000`, `4030/4050/4060/4070->4000`,
+  `7020->7000`), not just the console 1000-series.
+- **Error responses are spec-shaped XML, not plain HTTP status text.**
+  `server.ts`'s `sendError(res, code, description)` sends
+  `<?xml version="1.0" encoding="UTF-8"?><error code="N" description="..." />`
+  with **HTTP 200** - the newznab/torznab convention is that the error is
+  communicated entirely via the `<error>` document's `code`/`description`
+  attributes, which is what real clients parse, not the HTTP status.
+  Codes in use, from the standard newznab table: `100` bad apikey, `200`
+  missing parameter (e.g. no `id`/`url` on `/download`), `201` incorrect
+  parameter (invalid `offset`/`limit`), `203` no such function (unrecognized
+  `t=`), `900` unknown/internal error (caught exceptions during search or
+  magnet resolution - description includes the real error message for
+  debuggability). Unknown-provider 404s are intentionally left as plain HTTP
+  404 - that's routing, not a Torznab function-level parameter error.
+- **`offset`/`limit` are strictly validated.** Spec: "shall verify whether
+  both values are integers greater or equal to zero. Otherwise the error
+  201 ... must be returned." Non-integer or negative values now return
+  `<error code="201">` instead of silently falling back to defaults; absent
+  or empty values still default normally (offset 0, limit `DEFAULT_LIMIT`).
+
+---
+
+## 12. Testing
 
 `npm test` (builds first, then runs `node --experimental-test-module-mocks
 --test "test/**/*.test.ts"`). `npm run typecheck` type-checks source +
@@ -622,19 +852,29 @@ phantom passing test.
 3. Cover at minimum: a successful `search()` parse (title/size/category/etc),
    a malformed-row edge case, `resolveMagnet()` success, and its failure
    modes (missing id/url, no magnet found on the page).
-4. This does **not** replace the `testQuery`-against-the-real-site check in
-   section 8 - fixtures catch parsing regressions, not "the live site changed
-   its markup" or "this term returns zero results on this tracker".
+4. This does **not** replace the blank-query-browse-against-the-real-site
+   check in section 8 - fixtures catch parsing regressions, not "the live
+   site changed its markup" or "this category returns zero results on this
+   tracker".
 
 ---
 
-## 11. Open issues
+## 13. Open issues
 
 **Brittleness.** The solver depends on the widget DOM shape and the `+22px`
 checkbox offset. Cloudflare can invalidate either at any time. Expect it, and
 check a screenshot first when it breaks.
 
-**No pagination** — search returns page 1 only. Deliberate MVP scope.
+**ext.to's `totalHint` regex is unverified against the live site.** It
+generically matches `"X - Y from Z"` anywhere in the page text rather than a
+confirmed selector - low risk since `total` only feeds the non-load-bearing
+`opensearch:totalResults`, but worth checking if that field ever starts
+looking wrong.
+
+**EZTV's blank-query browse bypasses the browser entirely.** It calls
+`https://eztvx.to/api/get-torrents` with a plain `fetch()`, not
+`gotoCleared()`. If that endpoint ever gets put behind Cloudflare, browsing
+breaks (keyword search via the scrape flow would be unaffected).
 
 **`xdo()` swallows errors.** Not currently causing problems, but if the
 warm-up movement ever silently no-ops, the widget stays on "Verifying..." and

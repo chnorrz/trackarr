@@ -19,11 +19,11 @@
 
 import express, { type Application, type Request, type Response } from 'express';
 import { closeBrowser, gotoCleared } from './lib/browser.js';
-import { CATEGORIES_XML } from './lib/categories.js';
+import { categoriesXml } from './lib/categories.js';
 import { TTLCache } from './lib/cache.js';
 import { ProviderStatusTracker, renderStatusPage } from './lib/status.js';
 import { providerMap } from './providers/index.js';
-import type { MagnetRef, Provider, SearchItem } from './lib/types.js';
+import type { MagnetRef, Provider, SearchItem, SearchOptions, SearchResult } from './lib/types.js';
 
 const PORT = process.env.PORT || 9117;
 const API_KEY = process.env.API_KEY || 'changeme';
@@ -46,6 +46,11 @@ const KEEPALIVE_INTERVAL_MS = process.env.KEEPALIVE_INTERVAL_MS === undefined
 const SEARCH_CACHE_TTL_MS = Number(process.env.SEARCH_CACHE_TTL_MS) || 5 * 60 * 1000;
 const MAGNET_CACHE_TTL_MS = Number(process.env.MAGNET_CACHE_TTL_MS) || 60 * 60 * 1000;
 
+// Advertised in caps' <limits> and enforced on every search - Torznab: "the
+// service should automatically limit the value to the maximum".
+const DEFAULT_LIMIT = 50;
+const MAX_LIMIT = 100;
+
 // Express 5's req.query values are `string | string[] | ParsedQs | ParsedQs[]
 // | undefined` (from the `qs` package) - our params are always plain single
 // strings, so this narrows that down in one place rather than at every call
@@ -65,18 +70,29 @@ function xmlEscape(str: unknown): string {
   return String(str).replace(/[&<>"']/g, (c) => entities[c] as string);
 }
 
+// Newznab/Torznab error convention: a well-formed <error> document, not a
+// raw HTTP status. HTTP stays 200 - the error is communicated entirely via
+// the code/description attributes, which is what real newznab/torznab
+// clients (and Prowlarr) parse. Codes follow the standard newznab table:
+// 100 auth, 200 missing parameter, 201 incorrect parameter, 203 no such
+// function, 900 unknown/internal error.
+function sendError(res: Response, code: number, description: string): void {
+  res.type('application/xml').send(`<?xml version="1.0" encoding="UTF-8"?>
+<error code="${code}" description="${xmlEscape(description)}" />`);
+}
+
 function capsXml(provider: Provider): string {
   return `<?xml version="1.0" encoding="UTF-8"?>
 <caps>
   <server title="${xmlEscape(provider.name)}" strapline="${xmlEscape(provider.name)} Torznab proxy" />
-  <limits max="100" default="50" />
+  <limits max="${MAX_LIMIT}" default="${DEFAULT_LIMIT}" />
   <searching>
     <search available="yes" supportedParams="q" />
-    <movie-search available="yes" supportedParams="q" />
     <tv-search available="yes" supportedParams="q" />
+    <movie-search available="yes" supportedParams="q" />
   </searching>
   <categories>
-${CATEGORIES_XML}
+${categoriesXml(provider.categories)}
   </categories>
 </caps>`;
 }
@@ -99,58 +115,44 @@ export interface AppOptions {
 // - see the entrypoint guard at the bottom).
 export function createApp(providers: Record<string, Provider>, opts: AppOptions = {}): Application {
   const apiKey = opts.apiKey ?? API_KEY;
-  const searchCache = new TTLCache<SearchItem[]>(opts.searchCacheTtlMs ?? SEARCH_CACHE_TTL_MS);
+  const searchCache = new TTLCache<SearchResult>(opts.searchCacheTtlMs ?? SEARCH_CACHE_TTL_MS);
   const magnetCache = new TTLCache<string>(opts.magnetCacheTtlMs ?? MAGNET_CACHE_TTL_MS);
   const statusTracker = opts.statusTracker ?? new ProviderStatusTracker();
 
   function checkKey(req: Request, res: Response): boolean {
     if (queryString(req.query.apikey) !== apiKey) {
-      res.status(401).send('Invalid apikey');
+      sendError(res, 100, 'Incorrect user credentials');
       return false;
     }
     return true;
   }
 
-  async function search(provider: Provider, q: string): Promise<{ items: SearchItem[]; cached: boolean }> {
-    // Prowlarr's "Test" button (and likely periodic health checks) queries
-    // with an empty q, and requires a non-empty result set to let the
-    // indexer be saved - an empty-but-valid response isn't enough
-    // (confirmed: Save fails with a red exclamation mark otherwise). No
-    // provider has a real "browse everything" mode for a blank query, so
-    // substitute a term proven to return results for THIS SPECIFIC
-    // provider, rather than either returning nothing (which Prowlarr
-    // rejects) or fabricating a fake item (which would fail differently
-    // and more confusingly the moment anything tried to resolve its
-    // magnet link).
-    //
-    // This must be per-provider, not a single shared default: 'yify' is a
-    // movie-release-group tag with zero hits on a TV-only tracker like
-    // EZTV, which silently reproduced the exact same Prowlarr "no results"
-    // failure this substitution was meant to fix in the first place (see
-    // NOTES.md - this class of bug is why testQuery is checked before
-    // shipping a new provider now, not just assumed to inherit a working
-    // default).
-    if (!q || !q.trim()) {
-      if (!provider.testQuery) {
-        console.error(`[warn] ${provider.id} has no testQuery set, falling back to '' (empty) - verify this actually returns results for this provider.`);
-      }
-      q = provider.testQuery || '';
-    }
-
-    const cacheKey = `${provider.id}:${q.toLowerCase().trim()}`;
-    const cachedItems = searchCache.get(cacheKey);
-    if (cachedItems) {
+  // A blank q (Prowlarr's Test button, and every routine RSS/search sync -
+  // both look identical at the HTTP level, there's no reliable way to tell
+  // them apart) used to get a canned keyword substituted in. That meant
+  // Sonarr/Radarr's routine automatic discovery never saw real, fresh
+  // content - only whatever that fixed keyword happened to match, forever.
+  // Blank q now passes straight through unchanged; each provider decides
+  // what it means (return latest uploads) instead of server.ts injecting a
+  // keyword. See NOTES.md for the full history of why this existed and why
+  // it was removed.
+  async function search(provider: Provider, q: string, opts: SearchOptions): Promise<SearchResult & { cached: boolean }> {
+    // Sorted so cat=2000,5000 and cat=5000,2000 hit the same cache entry.
+    const catKey = opts.categories?.length ? [...opts.categories].sort((a, b) => a - b).join(',') : '';
+    const cacheKey = `${provider.id}:${q.toLowerCase().trim()}:${catKey}:${opts.offset}:${opts.limit}`;
+    const cachedResult = searchCache.get(cacheKey);
+    if (cachedResult) {
       console.error(`[cache] search hit for ${provider.id} q=${JSON.stringify(q)}`);
-      return { items: cachedItems, cached: true };
+      return { ...cachedResult, cached: true };
     }
 
-    const items = await provider.search(q);
+    const result = await provider.search(q, opts);
     // Never cache an empty result. A transient failure (proxy down,
     // challenge not cleared, markup change) would otherwise be frozen in
     // for the full TTL and keep being served after the underlying problem
     // is fixed.
-    if (items.length) searchCache.set(cacheKey, items);
-    return { items, cached: false };
+    if (result.items.length) searchCache.set(cacheKey, result);
+    return { ...result, cached: false };
   }
 
   async function resolveMagnet(provider: Provider, ref: MagnetRef): Promise<{ magnet: string; cached: boolean }> {
@@ -166,7 +168,7 @@ export function createApp(providers: Record<string, Provider>, opts: AppOptions 
     return { magnet, cached: false };
   }
 
-  function buildRss(req: Request, provider: Provider, items: SearchItem[]): string {
+  function buildRss(req: Request, provider: Provider, items: SearchItem[], total: number): string {
     const selfUrl = `${req.protocol}://${req.get('host')}${req.originalUrl}`;
     const rows = items
       .map((it) => {
@@ -192,11 +194,17 @@ export function createApp(providers: Record<string, Provider>, opts: AppOptions 
       })
       .join('\n');
 
+    // total is spec-compliance polish, not load-bearing: Prowlarr itself
+    // never parses opensearch:totalResults (confirmed from its source).
+    // What actually stops its pagination is items.length coming back
+    // shorter than the requested limit - see lib/paging.ts.
     return `<?xml version="1.0" encoding="UTF-8"?>
-<rss version="2.0" xmlns:atom="http://www.w3.org/2005/Atom" xmlns:torznab="http://torznab.com/schemas/2015/feed">
+<rss version="2.0" xmlns:atom="http://www.w3.org/2005/Atom" xmlns:torznab="http://torznab.com/schemas/2015/feed" xmlns:opensearch="http://a9.com/-/spec/opensearch/1.1/">
 <channel>
   <atom:link href="${xmlEscape(selfUrl)}" rel="self" type="application/rss+xml" />
   <title>${xmlEscape(provider.name)}</title>
+  <opensearch:totalResults>${total}</opensearch:totalResults>
+  <opensearch:itemsPerPage>${items.length}</opensearch:itemsPerPage>
 ${rows}
 </channel>
 </rss>`;
@@ -233,22 +241,58 @@ ${rows}
 
     if (!checkKey(req, res)) return;
 
-    if (t === 'search' || t === 'movie-search' || t === 'tv-search') {
+    // Torznab function names are unhyphenated (t=search/tvsearch/movie) -
+    // the hyphenated forms are only the caps <tv-search>/<movie-search>
+    // *element* names, a different thing.
+    if (t === 'search' || t === 'tvsearch' || t === 'movie') {
       const q = queryString(req.query.q) || '';
+      const catParam = queryString(req.query.cat);
+      // Comma-separated, OR'd (cat=2000,5000 -> either). Unknown/unparseable
+      // entries are silently dropped, not an error.
+      const categories = catParam
+        ? catParam
+            .split(',')
+            .map((c) => parseInt(c.trim(), 10))
+            .filter((n) => !Number.isNaN(n))
+        : undefined;
+      // Spec: both must be integers >= 0, otherwise error 201 - not a
+      // silent fallback. Empty/absent is fine and defaults normally.
+      const offsetParam = queryString(req.query.offset);
+      let offset = 0;
+      if (offsetParam) {
+        const parsed = Number(offsetParam);
+        if (!Number.isInteger(parsed) || parsed < 0) {
+          sendError(res, 201, 'Incorrect parameter: offset must be a non-negative integer');
+          return;
+        }
+        offset = parsed;
+      }
+      const limitParam = queryString(req.query.limit);
+      let limit = DEFAULT_LIMIT;
+      if (limitParam) {
+        const parsed = Number(limitParam);
+        if (!Number.isInteger(parsed) || parsed < 0) {
+          sendError(res, 201, 'Incorrect parameter: limit must be a non-negative integer');
+          return;
+        }
+        limit = parsed;
+      }
+      limit = Math.min(limit, MAX_LIMIT);
+
       try {
-        const { items, cached } = await search(provider, q);
+        const { items, total, cached } = await search(provider, q, { categories, offset, limit });
         statusTracker.recordRequest(provider.id, true, { cached });
-        res.type('application/xml').send(buildRss(req, provider, items));
+        res.type('application/xml').send(buildRss(req, provider, items, total));
       } catch (err) {
         const message = err instanceof Error ? err.message : String(err);
         statusTracker.recordRequest(provider.id, false, { error: message });
         console.error(`${provider.id} search error:`, err);
-        res.status(500).send(`Search failed: ${message}`);
+        sendError(res, 900, `Search failed: ${message}`);
       }
       return;
     }
 
-    res.status(400).send(`Unsupported t=${t}`);
+    sendError(res, 203, `Function not available: t=${t}`);
   });
 
   app.get('/:provider/download', async (req: Request, res: Response) => {
@@ -261,7 +305,7 @@ ${rows}
     const id = idParam ? parseInt(idParam, 10) : null;
     const url = queryString(req.query.url) || null;
     if (!id && !url) {
-      res.status(400).send('Missing id or url param');
+      sendError(res, 200, 'Missing parameter: id or url');
       return;
     }
 
@@ -273,7 +317,7 @@ ${rows}
       const message = err instanceof Error ? err.message : String(err);
       statusTracker.recordRequest(provider.id, false, { error: message });
       console.error(`${provider.id} download error:`, err);
-      res.status(500).send(`Download failed: ${message}`);
+      sendError(res, 900, `Download failed: ${message}`);
     }
   });
 

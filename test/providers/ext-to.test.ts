@@ -4,13 +4,17 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { fakePage } from '../helpers.ts';
+import type { GotoOptions } from '../../lib/browser.ts';
+import type { Page } from 'playwright-core';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.resolve(__dirname, '..', '..');
 const SEARCH_HTML = fs.readFileSync(path.join(ROOT, 'test', 'fixtures', 'ext-to-search.html'), 'utf8');
 const MAGNET_JSON = fs.readFileSync(path.join(ROOT, 'test', 'fixtures', 'ext-to-magnet.json'), 'utf8');
 
-const gotoCleared = mock.fn(async () => fakePage());
+// Typed explicitly (see 1337x.test.ts for why) so mock.calls[].arguments
+// infers the real (url, opts?) signature instead of a zero-arg one.
+const gotoCleared = mock.fn<(url: string, opts?: GotoOptions) => Promise<Page>>(async () => fakePage());
 mock.module(path.join(ROOT, 'dist', 'lib', 'browser.js'), {
   exports: { gotoCleared }
 });
@@ -19,7 +23,7 @@ const { default: provider } = await import(path.join(ROOT, 'dist', 'providers', 
 test('ext.to search() parses real row markup into SearchItem[]', async () => {
   gotoCleared.mock.mockImplementation(async () => fakePage({ content: SEARCH_HTML }));
 
-  const items = await provider.search('anything');
+  const { items } = await provider.search('anything', { offset: 0, limit: 50 });
 
   assert.equal(items.length, 4);
 
@@ -45,8 +49,41 @@ test('ext.to search() filters the uploader link out of the category breadcrumb',
   // instead of "Movies", which matchCategory would then map to Other (8000)
   // rather than Movies (2000).
   gotoCleared.mock.mockImplementation(async () => fakePage({ content: SEARCH_HTML }));
-  const items = await provider.search('anything');
+  const { items } = await provider.search('anything', { offset: 0, limit: 50 });
   assert.equal(items[0]?.category, 2000);
+});
+
+test('ext.to search() filters real keyword-search results by requested categories', async () => {
+  gotoCleared.mock.mockImplementation(async () => fakePage({ content: SEARCH_HTML }));
+
+  const { items, total } = await provider.search('anything', { categories: [2000], offset: 0, limit: 50 });
+  assert.equal(items.length, 1);
+  assert.equal(items[0]?.category, 2000);
+  assert.equal(total, 1); // the fixture page is short, so filtering ran to a proven exact count
+});
+
+test('ext.to blank query with no categories uses the general (no cat param) browse listing', async () => {
+  gotoCleared.mock.mockImplementation(async () => fakePage({ content: SEARCH_HTML }));
+
+  const { items } = await provider.search('', { offset: 0, limit: 50 });
+  assert.equal(items.length, 4);
+  const url = gotoCleared.mock.calls[gotoCleared.mock.calls.length - 1]?.arguments[0] as string;
+  assert.doesNotMatch(url, /[?&]cat=/);
+});
+
+test('ext.to blank query with an unsupported category (e.g. XXX) returns empty', async () => {
+  const { items, total } = await provider.search('', { categories: [6000], offset: 0, limit: 50 });
+  assert.deepEqual({ items, total }, { items: [], total: 0 });
+});
+
+test('ext.to blank query with several categories merges their browse listings', async () => {
+  gotoCleared.mock.mockImplementation(async () => fakePage({ content: SEARCH_HTML }));
+
+  const { items } = await provider.search('', { categories: [2000, 5000], offset: 0, limit: 50 });
+  // Both category browses hit the same mocked fixture (4 items each) -
+  // confirms the merge actually combines multiple sources rather than
+  // just picking one.
+  assert.equal(items.length, 8);
 });
 
 test('ext.to resolveMagnet() computes the HMAC and parses a real magnet response', async () => {

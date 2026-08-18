@@ -29,8 +29,8 @@ function fakeProvider(overrides: Record<string, unknown> = {}) {
   return {
     id: 'fake',
     name: 'Fake Provider',
-    testQuery: 'yify',
-    search: async () => [fakeItem()],
+    categories: [2000, 5000],
+    search: async () => ({ items: [fakeItem()], total: 1 }),
     resolveMagnet: async () => 'magnet:?xt=urn:btih:fake',
     ...overrides
   };
@@ -66,10 +66,23 @@ test('GET /:provider/api?t=caps needs no apikey and returns caps XML', async () 
   });
 });
 
-test('GET /:provider/api rejects a wrong apikey', async () => {
+test('caps only advertises the categories a provider actually declares', async () => {
+  // Movies (2000) + TV (5000) declared, nothing else - e.g. must not leak
+  // XXX/Books/PC/etc from other providers' schemes.
+  await withServer({ fake: fakeProvider({ categories: [2000, 5000] }) }, async (base) => {
+    const body = await (await fetch(`${base}/fake/api?t=caps`)).text();
+    assert.match(body, /<category id="2000" name="Movies" \/>/);
+    assert.match(body, /<category id="5000" name="TV" \/>/);
+    assert.doesNotMatch(body, /name="XXX"/);
+    assert.doesNotMatch(body, /name="Books"/);
+  });
+});
+
+test('GET /:provider/api rejects a wrong apikey with a torznab <error> document', async () => {
   await withServer({ fake: fakeProvider() }, async (base) => {
     const res = await fetch(`${base}/fake/api?t=search&apikey=wrong`);
-    assert.equal(res.status, 401);
+    assert.equal(res.status, 200);
+    assert.match(await res.text(), /<error code="100" description="[^"]*"\s*\/>/);
   });
 });
 
@@ -99,7 +112,7 @@ test('search returns a Torznab RSS document built from the provider items', asyn
 
 test('title/url special characters are XML-escaped in the RSS output', async () => {
   const item = fakeItem({ title: `A & B <C> "D"`, detailUrl: 'https://example.invalid/a&b' });
-  await withServer({ fake: fakeProvider({ search: async () => [item] }) }, async (base) => {
+  await withServer({ fake: fakeProvider({ search: async () => ({ items: [item], total: 1 }) }) }, async (base) => {
     const res = await fetch(`${base}/fake/api?t=search&q=x&apikey=${API_KEY}`);
     const body = await res.text();
     assert.match(body, /A &amp; B &lt;C&gt; &quot;D&quot;/);
@@ -107,19 +120,92 @@ test('title/url special characters are XML-escaped in the RSS output', async () 
   });
 });
 
-test('blank q substitutes testQuery, passed through to provider.search', async () => {
+test('blank q is passed through unchanged - no more testQuery substitution', async () => {
   const calls: string[] = [];
   const provider = fakeProvider({
-    testQuery: 'MeGusta',
     search: async (q: string) => {
       calls.push(q);
-      return [fakeItem()];
+      return { items: [fakeItem()], total: 1 };
     }
   });
   await withServer({ fake: provider }, async (base) => {
     const res = await fetch(`${base}/fake/api?t=search&q=&apikey=${API_KEY}`);
     assert.equal(res.status, 200);
-    assert.deepEqual(calls, ['MeGusta']);
+    assert.deepEqual(calls, ['']);
+  });
+});
+
+test('cat/offset/limit query params are parsed and forwarded to provider.search', async () => {
+  const calls: unknown[] = [];
+  const provider = fakeProvider({
+    search: async (q: string, opts: unknown) => {
+      calls.push(opts);
+      return { items: [fakeItem()], total: 1 };
+    }
+  });
+  await withServer({ fake: provider }, async (base) => {
+    await fetch(`${base}/fake/api?t=search&q=&cat=5000&offset=20&limit=10&apikey=${API_KEY}`);
+    assert.deepEqual(calls, [{ categories: [5000], offset: 20, limit: 10 }]);
+  });
+});
+
+test('cat accepts a comma-separated list, parsed into multiple ids', async () => {
+  const calls: unknown[] = [];
+  const provider = fakeProvider({
+    search: async (q: string, opts: unknown) => {
+      calls.push(opts);
+      return { items: [fakeItem()], total: 1 };
+    }
+  });
+  await withServer({ fake: provider }, async (base) => {
+    await fetch(`${base}/fake/api?t=search&q=&cat=2000,5000&apikey=${API_KEY}`);
+    assert.deepEqual(calls, [{ categories: [2000, 5000], offset: 0, limit: 50 }]);
+  });
+});
+
+test('t=tvsearch and t=movie (unhyphenated) are accepted, matching the spec function names', async () => {
+  await withServer({ fake: fakeProvider() }, async (base) => {
+    const tv = await fetch(`${base}/fake/api?t=tvsearch&q=x&apikey=${API_KEY}`);
+    assert.equal(tv.status, 200);
+    const movie = await fetch(`${base}/fake/api?t=movie&q=x&apikey=${API_KEY}`);
+    assert.equal(movie.status, 200);
+  });
+});
+
+test('limit is clamped to the caps-advertised max of 100', async () => {
+  const calls: unknown[] = [];
+  const provider = fakeProvider({
+    search: async (q: string, opts: unknown) => {
+      calls.push(opts);
+      return { items: [fakeItem()], total: 1 };
+    }
+  });
+  await withServer({ fake: provider }, async (base) => {
+    await fetch(`${base}/fake/api?t=search&q=x&limit=500&apikey=${API_KEY}`);
+    assert.deepEqual(calls, [{ categories: undefined, offset: 0, limit: 100 }]);
+  });
+});
+
+test('missing cat/offset/limit default to no category, offset 0, limit 50', async () => {
+  const calls: unknown[] = [];
+  const provider = fakeProvider({
+    search: async (q: string, opts: unknown) => {
+      calls.push(opts);
+      return { items: [fakeItem()], total: 1 };
+    }
+  });
+  await withServer({ fake: provider }, async (base) => {
+    await fetch(`${base}/fake/api?t=search&q=x&apikey=${API_KEY}`);
+    assert.deepEqual(calls, [{ categories: undefined, offset: 0, limit: 50 }]);
+  });
+});
+
+test('RSS output includes opensearch:totalResults from the provider', async () => {
+  const provider = fakeProvider({ search: async () => ({ items: [fakeItem()], total: 137 }) });
+  await withServer({ fake: provider }, async (base) => {
+    const body = await (await fetch(`${base}/fake/api?t=search&q=x&apikey=${API_KEY}`)).text();
+    assert.match(body, /<opensearch:totalResults>137<\/opensearch:totalResults>/);
+    assert.match(body, /xmlns:opensearch="http:\/\/a9\.com\/-\/spec\/opensearch\/1\.1\/"/);
   });
 });
 
@@ -128,7 +214,7 @@ test('search results are cached - a second identical search does not call the pr
   const provider = fakeProvider({
     search: async () => {
       calls++;
-      return [fakeItem()];
+      return { items: [fakeItem()], total: 1 };
     }
   });
   await withServer({ fake: provider }, async (base) => {
@@ -143,7 +229,7 @@ test('empty results are never cached - a transient failure recovers on retry', a
   const provider = fakeProvider({
     search: async () => {
       calls++;
-      return calls === 1 ? [] : [fakeItem()];
+      return calls === 1 ? { items: [], total: 0 } : { items: [fakeItem()], total: 1 };
     }
   });
   await withServer({ fake: provider }, async (base) => {
@@ -155,19 +241,33 @@ test('empty results are never cached - a transient failure recovers on retry', a
   });
 });
 
-test('search errors surface as 500 with the error message', async () => {
+test('search errors surface as a torznab <error code="900"> document with the error message', async () => {
   const provider = fakeProvider({ search: async () => { throw new Error('boom'); } });
   await withServer({ fake: provider }, async (base) => {
     const res = await fetch(`${base}/fake/api?t=search&q=x&apikey=${API_KEY}`);
-    assert.equal(res.status, 500);
-    assert.match(await res.text(), /boom/);
+    assert.equal(res.status, 200);
+    const body = await res.text();
+    assert.match(body, /<error code="900"/);
+    assert.match(body, /boom/);
   });
 });
 
-test('unsupported t value returns 400', async () => {
+test('unsupported t value returns a torznab <error code="203"> document', async () => {
   await withServer({ fake: fakeProvider() }, async (base) => {
     const res = await fetch(`${base}/fake/api?t=tvsearch2&apikey=${API_KEY}`);
-    assert.equal(res.status, 400);
+    assert.equal(res.status, 200);
+    assert.match(await res.text(), /<error code="203"/);
+  });
+});
+
+test('offset/limit reject non-integer or negative values with a torznab <error code="201"> document', async () => {
+  await withServer({ fake: fakeProvider() }, async (base) => {
+    const bad = ['offset=abc', 'offset=-1', 'offset=1.5', 'limit=abc', 'limit=-1'];
+    for (const param of bad) {
+      const res = await fetch(`${base}/fake/api?t=search&q=x&${param}&apikey=${API_KEY}`);
+      assert.equal(res.status, 200, `expected 200 for ${param}`);
+      assert.match(await res.text(), /<error code="201"/, `expected error 201 for ${param}`);
+    }
   });
 });
 
@@ -180,10 +280,11 @@ test('download redirects to the resolved magnet (302)', async () => {
   });
 });
 
-test('download without id or url returns 400', async () => {
+test('download without id or url returns a torznab <error code="200"> document', async () => {
   await withServer({ fake: fakeProvider() }, async (base) => {
     const res = await fetch(`${base}/fake/download?apikey=${API_KEY}`, { redirect: 'manual' });
-    assert.equal(res.status, 400);
+    assert.equal(res.status, 200);
+    assert.match(await res.text(), /<error code="200"/);
   });
 });
 
@@ -202,12 +303,14 @@ test('magnets are cached - a second identical download does not call resolveMagn
   });
 });
 
-test('download errors surface as 500 with the error message', async () => {
+test('download errors surface as a torznab <error code="900"> document with the error message', async () => {
   const provider = fakeProvider({ resolveMagnet: async () => { throw new Error('resolve failed'); } });
   await withServer({ fake: provider }, async (base) => {
     const res = await fetch(`${base}/fake/download?apikey=${API_KEY}&id=1`, { redirect: 'manual' });
-    assert.equal(res.status, 500);
-    assert.match(await res.text(), /resolve failed/);
+    assert.equal(res.status, 200);
+    const body = await res.text();
+    assert.match(body, /<error code="900"/);
+    assert.match(body, /resolve failed/);
   });
 });
 
@@ -257,7 +360,7 @@ test('GET / status reflects the most recent outcome, not the first', async () =>
   const provider = fakeProvider({
     search: async () => {
       if (fail) { fail = false; throw new Error('first attempt failed'); }
-      return [fakeItem()];
+      return { items: [fakeItem()], total: 1 };
     }
   });
   await withServer({ fake: provider }, async (base) => {
@@ -294,7 +397,7 @@ test('GET / request stats count a failed search separately from successes', asyn
   const provider = fakeProvider({
     search: async () => {
       if (fail) { fail = false; throw new Error('boom'); }
-      return [fakeItem()];
+      return { items: [fakeItem()], total: 1 };
     }
   });
   await withServer({ fake: provider }, async (base) => {

@@ -65,6 +65,15 @@ let sharedContext: BrowserContext | null = null;
 let proxyBrowser: Browser | null = null;
 let proxyContext: BrowserContext | null = null;
 
+// In-flight launch promises, so concurrent first calls (e.g. the 4 parallel
+// gotoCleared() calls from a multi-category browse) await the same launch
+// instead of each seeing sharedContext/proxyContext still null and racing to
+// start their own browser. That race was observed live: 4 simultaneous
+// "launching proxied browser" logs, 4 separate Camoufox/Firefox instances
+// fighting over one Xvfb display, and a page.goto NS_ERROR_NET_TIMEOUT.
+let persistentContextPromise: Promise<BrowserContext> | null = null;
+let proxyContextPromise: Promise<BrowserContext | null> | null = null;
+
 // XTEST input is global to the X display, so two solves running at once fight
 // over the same virtual mouse and both fail. Matters most with the background
 // keep-alive, which can otherwise collide with a search's solve.
@@ -79,6 +88,31 @@ function serializeSolve<T>(task: () => Promise<T>): Promise<T> {
     () => {},
     () => {}
   );
+  return run;
+}
+
+// Concurrent navigations to the same browser context/egress IP get treated
+// as suspicious by Cloudflare: multi-category browsing (fetchMergedBrowse,
+// 1337x's no-cat snapshot) fires several gotoCleared() calls at once, and
+// live-testing found that 2+ concurrent navigations to the same
+// Cloudflare-protected host reliably hang until the 60s page.goto timeout,
+// even though each one succeeds fine on its own. Queuing navigations one at
+// a time per context (direct vs proxied - they're separate browsers/IPs, so
+// they don't contend with each other) fixes it, at the cost of the rare
+// multi-category blank-browse case taking roughly N times as long as a
+// single-category one instead of running in parallel.
+let directNavChain: Promise<unknown> = Promise.resolve();
+let proxyNavChain: Promise<unknown> = Promise.resolve();
+
+function serializeNav<T>(usingProxy: boolean, task: () => Promise<T>): Promise<T> {
+  const chain = usingProxy ? proxyNavChain : directNavChain;
+  const run = chain.then(task, task);
+  const settled = run.then(
+    () => {},
+    () => {}
+  );
+  if (usingProxy) proxyNavChain = settled;
+  else directNavChain = settled;
   return run;
 }
 
@@ -206,6 +240,16 @@ async function autoSolveChallenge(page: Page): Promise<boolean> {
 // browser-startup cost per request.
 async function getPersistentContext(): Promise<BrowserContext> {
   if (sharedContext) return sharedContext;
+  if (!persistentContextPromise) {
+    persistentContextPromise = launchPersistentContext().catch((err) => {
+      persistentContextPromise = null;
+      throw err;
+    });
+  }
+  return persistentContextPromise;
+}
+
+async function launchPersistentContext(): Promise<BrowserContext> {
   // On Linux we run a real (non-headless) browser against the Xvfb display
   // in DISPLAY. Camoufox's own 'virtual' mode would also use Xvfb, but at
   // 1x1 resolution, leaving no room to render/click the Turnstile widget.
@@ -239,7 +283,20 @@ async function getPersistentContext(): Promise<BrowserContext> {
 async function getProxyContext(): Promise<BrowserContext | null> {
   if (proxyContext) return proxyContext;
   if (!PROXY_URL) return null;
-  console.error(`[cf] launching proxied browser via ${PROXY_URL}`);
+  if (!proxyContextPromise) {
+    proxyContextPromise = launchProxyContext().catch((err) => {
+      proxyContextPromise = null;
+      throw err;
+    });
+  }
+  return proxyContextPromise;
+}
+
+async function launchProxyContext(): Promise<BrowserContext | null> {
+  // Non-null: only called from getProxyContext(), which already checked
+  // PROXY_URL - narrowing just doesn't carry across the function boundary.
+  const proxyUrl = PROXY_URL!;
+  console.error(`[cf] launching proxied browser via ${proxyUrl}`);
   const headless = process.platform === 'linux' ? false : true;
   // A literal object argument at the call site (rather than a pre-built
   // `opts` variable) matters here: Camoufox()'s return type is generic on
@@ -247,8 +304,8 @@ async function getProxyContext(): Promise<BrowserContext | null> {
   // separately loses that inference, resolving to BrowserContext instead of
   // Browser.
   const browser = process.platform === 'linux'
-    ? await Camoufox({ headless, proxy: { server: PROXY_URL }, os: 'linux' })
-    : await Camoufox({ headless, proxy: { server: PROXY_URL } });
+    ? await Camoufox({ headless, proxy: { server: proxyUrl }, os: 'linux' })
+    : await Camoufox({ headless, proxy: { server: proxyUrl } });
   proxyBrowser = browser;
   const context = await browser.newContext();
   proxyContext = context;
@@ -285,54 +342,56 @@ export async function gotoCleared(url: string, opts: GotoOptions | number = {}):
     console.error(`[cf] proxy not enabled for '${wants}', using a direct connection.`);
   }
 
-  const page = await context.newPage();
-  await page.goto(url, { waitUntil: 'load', timeout: 60000 });
+  return serializeNav(usingProxy, async () => {
+    const page = await context.newPage();
+    await page.goto(url, { waitUntil: 'load', timeout: 60000 });
 
-  const waitUntilCleared = async (ms: number): Promise<string> => {
-    const deadline = Date.now() + ms;
-    let html = await safeContent(page);
-    while ((isChallenge(html) || !html) && Date.now() < deadline) {
-      await new Promise((r) => setTimeout(r, 1000));
-      html = await safeContent(page);
+    const waitUntilCleared = async (ms: number): Promise<string> => {
+      const deadline = Date.now() + ms;
+      let html = await safeContent(page);
+      while ((isChallenge(html) || !html) && Date.now() < deadline) {
+        await new Promise((r) => setTimeout(r, 1000));
+        html = await safeContent(page);
+      }
+      return html;
+    };
+
+    // A stored cf_clearance cookie usually means no challenge at all, so give
+    // it a short pass first before spending time on the solve routine.
+    let html = await waitUntilCleared(8000);
+
+    if (isChallenge(html) || !html) {
+      if (await serializeSolve(() => autoSolveChallenge(page))) {
+        html = await waitUntilCleared(timeoutMs);
+
+        // Clearing the challenge only means the interstitial is gone. Cloudflare
+        // then redirects to the URL we actually asked for, and returning before
+        // that lands hands the caller a blank page - which looks exactly like
+        // "the site returned 0 results".
+        await page.waitForLoadState('networkidle', { timeout: 20000 }).catch(() => {});
+        html = await safeContent(page);
+      }
     }
-    return html;
-  };
 
-  // A stored cf_clearance cookie usually means no challenge at all, so give
-  // it a short pass first before spending time on the solve routine.
-  let html = await waitUntilCleared(8000);
-
-  if (isChallenge(html) || !html) {
-    if (await serializeSolve(() => autoSolveChallenge(page))) {
-      html = await waitUntilCleared(timeoutMs);
-
-      // Clearing the challenge only means the interstitial is gone. Cloudflare
-      // then redirects to the URL we actually asked for, and returning before
-      // that lands hands the caller a blank page - which looks exactly like
-      // "the site returned 0 results".
-      await page.waitForLoadState('networkidle', { timeout: 20000 }).catch(() => {});
-      html = await safeContent(page);
+    if (isChallenge(html) || !html) {
+      console.error(`[cf] still challenged (challenge=${isChallenge(html)}, htmlLen=${html.length}).`);
+      await page.close();
+      throw new Error('Cloudflare challenge did not clear (auto-solve failed).');
     }
-  }
 
-  if (isChallenge(html) || !html) {
-    console.error(`[cf] still challenged (challenge=${isChallenge(html)}, htmlLen=${html.length}).`);
-    await page.close();
-    throw new Error('Cloudflare challenge did not clear (auto-solve failed).');
-  }
+    if (isBlocked(html)) {
+      console.error(`[cf] hard blocked (Cloudflare access denied page, htmlLen=${html.length}).`);
+      await page.close();
+      throw new Error('Blocked by Cloudflare (IP ban/rate limit) - not a solvable challenge, needs a different IP or time to cool down.');
+    }
 
-  if (isBlocked(html)) {
-    console.error(`[cf] hard blocked (Cloudflare access denied page, htmlLen=${html.length}).`);
-    await page.close();
-    throw new Error('Blocked by Cloudflare (IP ban/rate limit) - not a solvable challenge, needs a different IP or time to cool down.');
-  }
-
-  console.error('[cf] cleared.');
-  // Only the direct context's cookies are persisted - the cookie file holds
-  // ext.to's cf_clearance, and saving the proxied context over it would
-  // clobber it with another site's cookies.
-  if (!usingProxy) saveCookies(await context.cookies());
-  return page;
+    console.error('[cf] cleared.');
+    // Only the direct context's cookies are persisted - the cookie file holds
+    // ext.to's cf_clearance, and saving the proxied context over it would
+    // clobber it with another site's cookies.
+    if (!usingProxy) saveCookies(await context.cookies());
+    return page;
+  });
 }
 
 export async function closeBrowser(): Promise<void> {

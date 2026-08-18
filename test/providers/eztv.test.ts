@@ -20,7 +20,7 @@ test('eztv search() parses the wlinks-revealed markup, including inline magnets'
     fakePage({ content: 'unused for this path', evaluateResult: { status: 200, text: SEARCH_HTML } })
   );
 
-  const items = await provider.search('anything');
+  const { items } = await provider.search('anything', { offset: 0, limit: 50 });
 
   assert.equal(items.length, 3);
 
@@ -37,7 +37,7 @@ test('eztv resolveMagnet() serves from magnetCache after a prior search(), no se
   gotoCleared.mock.mockImplementation(async () =>
     fakePage({ content: 'unused for this path', evaluateResult: { status: 200, text: SEARCH_HTML } })
   );
-  const items = await provider.search('anything');
+  const { items } = await provider.search('anything', { offset: 0, limit: 50 });
   const detailUrl = items[0]?.detailUrl;
   assert.ok(detailUrl);
 
@@ -61,6 +61,27 @@ test('eztv resolveMagnet() throws without a url', async () => {
   await assert.rejects(() => provider.resolveMagnet({ id: null, url: null }), /requires a url/);
 });
 
+test('eztv search() returns empty for a category that excludes TV, without hitting the network', async () => {
+  const callsBefore = gotoCleared.mock.callCount();
+
+  const blank = await provider.search('', { categories: [2000], offset: 0, limit: 50 }); // Movies only
+  assert.deepEqual(blank, { items: [], total: 0 });
+
+  const keyword = await provider.search('anything', { categories: [2000], offset: 0, limit: 50 });
+  assert.deepEqual(keyword, { items: [], total: 0 });
+
+  assert.equal(gotoCleared.mock.callCount(), callsBefore); // short-circuited before any fetch/navigation
+});
+
+test('eztv search() still returns results when TV is among several requested categories', async () => {
+  gotoCleared.mock.mockImplementation(async () =>
+    fakePage({ content: 'unused for this path', evaluateResult: { status: 200, text: SEARCH_HTML } })
+  );
+
+  const { items } = await provider.search('anything', { categories: [2000, 5000], offset: 0, limit: 50 });
+  assert.equal(items.length, 3);
+});
+
 test('eztv search() falls back to the plain page when the wlinks reveal POST fails', async () => {
   // status !== 200 -> search() falls back to page.content() instead of the
   // evaluate() result (see the comment in providers/eztv.ts).
@@ -68,6 +89,6 @@ test('eztv search() falls back to the plain page when the wlinks reveal POST fai
     fakePage({ content: SEARCH_HTML, evaluateResult: { status: 500, text: 'error' } })
   );
 
-  const items = await provider.search('anything');
+  const { items } = await provider.search('anything', { offset: 0, limit: 50 });
   assert.equal(items.length, 3); // fixture's fallback content still has the rows (magnet-less in reality, but this fixture always embeds them)
 });
