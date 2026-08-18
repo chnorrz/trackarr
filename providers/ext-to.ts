@@ -23,19 +23,41 @@ function computeHMAC(torrentId: number, timestamp: number, token: string): strin
   return crypto.createHash('sha256').update(`${torrentId}|${timestamp}|${token}`).digest('hex');
 }
 
-// Matched against the breadcrumb text ("Movies", "Highres Movies", "TV").
-// Order matters - first match wins, and "audiobook" must stay above the
-// generic "book"/"ebook" rule or every audiobook would be filed as a plain
-// ebook.
+// Matched against the breadcrumb *hrefs* (both levels joined, e.g.
+// "/tv/ /tv/season-packs/"), not the link text - see parseListing. Text is
+// display copy and drifts/varies ("Audio books" vs "audiobook"); the path
+// slug is the same thing the site itself routes on, so it's the more
+// stable signal (same reasoning as 1337x's sub-id table in section 3).
+// Order matters - first match wins, and "audio-book" must stay above the
+// generic "/books/" rule or every audiobook is filed as a plain ebook.
 const CATEGORY_RULES: CategoryRule[] = [
-  [['tv', 'series'], CATEGORIES.TV],
-  [['anime'], CATEGORIES.TV_ANIME],
-  [['music', 'audio'], CATEGORIES.AUDIO],
-  [['game', 'software', 'app'], CATEGORIES.PC],
-  [['audiobook'], CATEGORIES.AUDIOBOOKS],
-  [['book', 'ebook'], CATEGORIES.BOOKS],
-  [['xxx', 'adult'], CATEGORIES.XXX],
-  [['movie'], CATEGORIES.MOVIES]
+  [['/tv/'], CATEGORIES.TV],
+  [['/anime/'], CATEGORIES.TV_ANIME],
+  // Live subcategory slug is /books/audio-books/ - hyphenated, plural.
+  [['audio-book'], CATEGORIES.AUDIOBOOKS],
+  [['/music/'], CATEGORIES.AUDIO],
+  // Live subcategories under /games/ - must stay above the generic
+  // /games/ fallback below, same reasoning as audio-book above /books/.
+  [['/games/pc-games/'], CATEGORIES.PC_GAMES],
+  [['/games/other-games/'], CATEGORIES.CONSOLE_OTHER],
+  // Real top-level slug is /applications/, not /apps/ - confirmed live.
+  // Mac/Android are their own subcategories; Windows has none (falls
+  // through to the generic /applications/ rule below, which is correct -
+  // Torznab's generic PC id already means Windows software).
+  [['/applications/mac/'], CATEGORIES.PC_MAC],
+  [['/applications/android/'], CATEGORIES.PC_MOBILE_ANDROID],
+  [['/applications/'], CATEGORIES.PC],
+  // Unrecognized /games/ subcategory (neither of the two above) - closer
+  // to a PC game than anything else on offer, so that's the fallback
+  // rather than generic PC software.
+  [['/games/'], CATEGORIES.PC_GAMES],
+  // Live subcategory slug is /books/ebooks/ - must stay above the generic
+  // /books/ fallback, same reasoning as audio-book/pc-games above.
+  [['/books/ebooks/'], CATEGORIES.BOOKS_EBOOK],
+  [['/books/'], CATEGORIES.BOOKS],
+  // No XXX rule - ext.to genuinely has no XXX category at all, confirmed
+  // twice (matches CATEGORY_BROWSE's lack of an XXX entry, see below).
+  [['/movies/'], CATEGORIES.MOVIES]
 ];
 
 interface BrowseTarget {
@@ -98,15 +120,22 @@ function parseListing(html: string, knownCategory?: number): ListingPage {
 
     // When we already picked this listing's URL by category (blank-query
     // browse - see browsePage/generalBrowsePage), trust that over the
-    // breadcrumb text entirely. It's known to drift: .related-posted also
-    // contains an uploader link, and its href shape has changed at least
-    // once (used to be "?source[]=N", now also seen as "/user/<name>/" for
-    // verified uploaders) - either shape can slip past a naive
-    // `a[href^="/"]` filter and get picked up as the "category" instead.
-    const category = knownCategory ?? matchCategory(
-      $tr.find('.related-posted a[href^="/"]:not([href^="/user/"]) strong').first().text().trim(),
-      CATEGORY_RULES
-    );
+    // breadcrumb entirely. .related-posted also contains an uploader link,
+    // and its href shape has changed at least once (used to be
+    // "?source[]=N", now also seen as "/user/<name>/" for verified
+    // uploaders) - either shape can slip past a naive `a[href^="/"]`
+    // filter and get picked up as the "category" instead.
+    //
+    // Match against the breadcrumb links' hrefs (both levels, e.g.
+    // "/tv/ /tv/season-packs/"), NOT the link text - text is display copy
+    // and drifts ("Audio books" vs "audiobook" - real bug, caught live).
+    // The href slug is what the site itself routes on.
+    const categoryHrefs = $tr
+      .find('.related-posted a[href^="/"]:not([href^="/user/"])')
+      .map((_, a) => $(a).attr('href') || '')
+      .get()
+      .join(' ');
+    const category = knownCategory ?? matchCategory(categoryHrefs, CATEGORY_RULES);
 
     items.push({
       title,

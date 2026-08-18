@@ -53,6 +53,83 @@ test('ext.to search() filters the uploader link out of the category breadcrumb',
   assert.equal(items[0]?.category, 2000);
 });
 
+// Builds a single-row fixture with a given breadcrumb (top + optional sub)
+// so category-matching tests below only need to vary the hrefs/text that
+// actually matter, not the whole row markup.
+function categoryRowHtml(id: number, topHref: string, topText: string, subHref?: string, subText?: string): string {
+  const sub = subHref ? ` - <a href="${subHref}"><strong>${subText}</strong></a>` : '';
+  return `<html><body><table class="search-table"><tbody>
+    <tr>
+      <td class="text-left">
+        <a href="/example-${id}/" class="torrent-title-link"><b>Example ${id}</b></a>
+        <div class="related-posted">
+          Posted by <a href="?source%5B%5D=3">FakeUploader</a>
+          in <a href="${topHref}"><strong>${topText}</strong></a>${sub}
+        </div>
+        <a class="dwn-btn search-magnet-btn" href="javascript:void(0);" data-id="${id}"></a>
+      </td>
+      <td class="nowrap-td hide-on-mob"><span class="add-block">Size</span><span>150.00 MB</span></td>
+      <td class="hide-on-mob"><span class="add-block">Files</span><span>1</span></td>
+      <td class="nowrap-td hide-on-mob"><span class="add-block">Age</span><span title="1 January 2024">1 year ago</span></td>
+      <td class="hide-on-mob"><span class="add-block">Seeds</span><span class="text-success">10</span></td>
+      <td class="hide-on-mob"><span class="add-block">Leechs</span><span class="text-danger">2</span></td>
+      <td class="hide-on-mob"><span class="add-block">Source</span></td>
+    </tr>
+  </tbody></table></body></html>`;
+}
+
+test('ext.to search() classifies audiobooks from the subcategory href, not the link text', async () => {
+  // A real audiobook lives under Books > "Audio books" (two words, no
+  // hyphen - confirmed live) - only the subcategory says so, and the
+  // *display text* ("Audio books") doesn't even contain "audiobook" as one
+  // word. Matching hrefs (/books/audio-books/), not text, is what makes
+  // this resolve correctly.
+  gotoCleared.mock.mockImplementation(async () =>
+    fakePage({ content: categoryRowHtml(10000005, '/books/', 'Books', '/books/audio-books/', 'Audio books') })
+  );
+  const { items } = await provider.search('anything', { offset: 0, limit: 50 });
+  assert.equal(items[0]?.category, 3030); // Audiobooks, not plain Books (7000) or Audio (3000)
+});
+
+test('ext.to search() classifies ebooks from the subcategory href, not just top-level "Books"', async () => {
+  gotoCleared.mock.mockImplementation(async () =>
+    fakePage({ content: categoryRowHtml(10000006, '/books/', 'Books', '/books/ebooks/', 'Ebooks') })
+  );
+  const { items } = await provider.search('anything', { offset: 0, limit: 50 });
+  assert.equal(items[0]?.category, 7020); // Books/EBook, not plain Books (7000)
+});
+
+test('ext.to search() classifies PC games and "other games" from the subcategory href', async () => {
+  gotoCleared.mock.mockImplementation(async () =>
+    fakePage({ content: categoryRowHtml(10000007, '/games/', 'Games', '/games/pc-games/', 'PC Games') })
+  );
+  const pcGames = await provider.search('anything', { offset: 0, limit: 50 });
+  assert.equal(pcGames.items[0]?.category, 4050); // PC/Games
+
+  gotoCleared.mock.mockImplementation(async () =>
+    fakePage({ content: categoryRowHtml(10000008, '/games/', 'Games', '/games/other-games/', 'Other Games') })
+  );
+  const otherGames = await provider.search('anything', { offset: 0, limit: 50 });
+  assert.equal(otherGames.items[0]?.category, 1090); // Console/Other
+});
+
+test('ext.to search() classifies Mac and Android apps from the subcategory href', async () => {
+  // Real top-level slug is /applications/, not /apps/ - Windows has no
+  // dedicated subcategory and falls through to the generic PC (4000) rule,
+  // which is covered by the main parse test's "Applications" row.
+  gotoCleared.mock.mockImplementation(async () =>
+    fakePage({ content: categoryRowHtml(10000009, '/applications/', 'Applications', '/applications/mac/', 'Mac') })
+  );
+  const mac = await provider.search('anything', { offset: 0, limit: 50 });
+  assert.equal(mac.items[0]?.category, 4030); // PC/Mac
+
+  gotoCleared.mock.mockImplementation(async () =>
+    fakePage({ content: categoryRowHtml(10000010, '/applications/', 'Applications', '/applications/android/', 'Android') })
+  );
+  const android = await provider.search('anything', { offset: 0, limit: 50 });
+  assert.equal(android.items[0]?.category, 4070); // PC/Mobile-Android
+});
+
 test('ext.to search() filters real keyword-search results by requested categories', async () => {
   gotoCleared.mock.mockImplementation(async () => fakePage({ content: SEARCH_HTML }));
 

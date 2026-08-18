@@ -54,23 +54,61 @@ Adding a tracker: write `providers/<id>.ts`, register in
 | files | `td[2]` |
 | age | `td[3] span:last` — **`title` attr** holds the exact date; the text is relative ("5 days ago") |
 | seeds / leechers | `td[4]` / `td[5]` |
-| category | `.related-posted a[href^="/"]:not([href^="/user/"]) strong` (real search only — blank-query browsing already knows its category, see section 10) |
+| category | `.related-posted a[href^="/"]:not([href^="/user/"])` **hrefs**, both breadcrumb levels, matched against `CATEGORY_RULES` (real search only — blank-query browsing already knows its category, see section 10) |
 
-**Category gotcha, and it has already drifted once:** `.related-posted` also
+**Category gotcha, and it has already drifted:** `.related-posted` also
 contains an *uploader* link, which needs filtering out or you silently
-scrape the uploader name and every result maps to "Other". The filter used
-to be just `[href^="/"]` on the assumption uploader links always start with
-`?` (`?source[]=N`) - **that assumption broke live**: verified uploaders now
-render as `<a class="verify-user-link ..." href="/user/<name>/">`, which
-also starts with `/` and sorts before the category links in the DOM, so
-`.first()` picked up the uploader's name instead. Confirmed live via a real
-`philadelphia` search result. Fixed by explicitly excluding `/user/` hrefs
-rather than trusting the leading-character heuristic. `parseListing()` in
-`providers/ext-to.ts` also gained an optional `knownCategory` param (mirrors
-1337x's fix in section 3) so blank-query browsing - which already knows its
-category from the URL it built - never depends on this breadcrumb-text
-detection at all; only real keyword search still needs it, since that
-listing genuinely mixes every category on one page.
+scrape the uploader as the "category". Its href shape isn't fixed -
+confirmed live in three forms: `?source[]=N` (DHT bot), `?user_nick=N`
+(external non-verified user), and `/user/<name>/` (verified uploader, which
+also starts with `/`, unlike the other two). Filtered by excluding
+`/user/` explicitly rather than trusting a leading-character heuristic.
+
+**Category matching uses the breadcrumb *hrefs*, not the link text**, and
+reads both levels (e.g. `/tv/ /tv/season-packs/`, `/books/
+/books/audio-books/`) - not just the top one. Two real, live-confirmed
+reasons this matters, both found the hard way:
+
+1. Display text drifts/varies independent of the URL - `/books/
+   audio-books/` renders as "Audio books" (two words, no hyphen), so a
+   text keyword of `'audiobook'` never matches it at all. The href slug is
+   what the site itself actually routes on, so it's the far more stable
+   signal to match against (same reasoning as 1337x's `/sub/<id>/` fix in
+   section 3).
+2. Some Torznab categories only exist at the *subcategory* level -
+   Audiobooks has no dedicated top-level breadcrumb of its own, it's
+   `/books/audio-books/` under the generic Books top category. Matching
+   only the first breadcrumb link, like the code used to, can never find
+   it.
+
+`CATEGORY_RULES` in `providers/ext-to.ts` is keyed on href fragments now
+(`/tv/`, `/music/`, `audio-book`, etc), not words. Order still matters:
+`audio-book` must stay above the generic `/books/` rule, since `/books/
+audio-books/` also contains `/books/`. `parseListing()` also gained an
+optional `knownCategory` param (mirrors 1337x's fix in section 3) so
+blank-query browsing - which already knows its category from the URL it
+built - never depends on this breadcrumb detection at all; only real
+keyword search still needs it, since that listing genuinely mixes every
+category on one page.
+
+**Confirmed real top-level paths and which subcategories actually matter**
+(only categories where our Torznab id set - `lib/categories.ts`'s
+`CATEGORIES` - has a *specific* id for the subcategory; otherwise it just
+collapses to the generic top-level rule, so there was no point tracking it):
+
+| Path | Torznab category | Subcategories that matter |
+|---|---|---|
+| `/tv/` | TV (5000) | none - no dedicated ids for season-packs/episodes-hd/etc |
+| `/movies/` | Movies (2000) | none - no dedicated ids for Bollywood/3D/UltraHD/etc |
+| `/music/` | Audio (3000) | none - no dedicated ids for MP3/Lossless/etc |
+| `/anime/` | TV/Anime (5070) | none - ext.to doesn't split anime by movie vs TV at all |
+| `/books/` | Books (7000) | `/books/audio-books/` → Audiobooks (3030); `/books/ebooks/` → Books/EBook (7020) |
+| `/games/` | PC/Games (4050, fallback) | `/games/pc-games/` → PC/Games (4050); `/games/other-games/` → Console/Other (1090) |
+| `/applications/` | PC (4000) | `/applications/mac/` → PC/Mac (4030); `/applications/android/` → PC/Mobile-Android (4070); `/applications/windows/` has no dedicated id, falls through to PC (4000) |
+| *(none)* | XXX | confirmed twice - ext.to has no XXX category at all |
+
+Note the real top-level Apps slug is `/applications/`, not `/apps/` -
+guessed wrong initially, corrected once confirmed live.
 
 ### Magnets
 
