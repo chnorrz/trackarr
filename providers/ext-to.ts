@@ -71,7 +71,7 @@ interface ListingPage {
   totalHint?: number;
 }
 
-function parseListing(html: string): ListingPage {
+function parseListing(html: string, knownCategory?: number): ListingPage {
   const $ = cheerio.load(html);
   const items: SearchItem[] = [];
 
@@ -92,13 +92,21 @@ function parseListing(html: string): ListingPage {
     const ageDate = ageSpan.attr('title');
     const seeds = parseInt($(tds[4]).text().replace(/\D/g, ''), 10) || 0;
     const leechers = parseInt($(tds[5]).text().replace(/\D/g, ''), 10) || 0;
-    // .related-posted also contains an uploader link (href starts with
-    // "?") before the category breadcrumb links (href starts with "/") -
-    // filter it out or we'd pick up the uploader name instead.
-    const categoryText = $tr.find('.related-posted a[href^="/"] strong').first().text().trim();
 
     const parsedDate = ageDate ? new Date(ageDate) : null;
     const pubDate = parsedDate && !isNaN(parsedDate.getTime()) ? parsedDate : new Date();
+
+    // When we already picked this listing's URL by category (blank-query
+    // browse - see browsePage/generalBrowsePage), trust that over the
+    // breadcrumb text entirely. It's known to drift: .related-posted also
+    // contains an uploader link, and its href shape has changed at least
+    // once (used to be "?source[]=N", now also seen as "/user/<name>/" for
+    // verified uploaders) - either shape can slip past a naive
+    // `a[href^="/"]` filter and get picked up as the "category" instead.
+    const category = knownCategory ?? matchCategory(
+      $tr.find('.related-posted a[href^="/"]:not([href^="/user/"]) strong').first().text().trim(),
+      CATEGORY_RULES
+    );
 
     items.push({
       title,
@@ -107,7 +115,7 @@ function parseListing(html: string): ListingPage {
       size: parseSize(sizeText),
       seeds,
       leechers,
-      category: matchCategory(categoryText, CATEGORY_RULES),
+      category,
       pubDate
     });
   });
@@ -123,16 +131,16 @@ function parseListing(html: string): ListingPage {
   return { items, totalHint };
 }
 
-async function fetchListingPage(url: string): Promise<ListingPage> {
+async function fetchListingPage(url: string, knownCategory?: number): Promise<ListingPage> {
   const page = await gotoCleared(url);
   try {
-    return parseListing(await page.content());
+    return parseListing(await page.content(), knownCategory);
   } finally {
     await page.close();
   }
 }
 
-function browsePage(target: BrowseTarget, sitePage: number): Promise<ListingPage> {
+function browsePage(target: BrowseTarget, categoryId: number, sitePage: number): Promise<ListingPage> {
   const params = new URLSearchParams({
     sort: 'age',
     order: 'desc',
@@ -141,13 +149,15 @@ function browsePage(target: BrowseTarget, sitePage: number): Promise<ListingPage
     page: String(sitePage)
   });
   if (target.subCat !== undefined) params.set('sub_cat', String(target.subCat));
-  return fetchListingPage(`${BASE}/browse/?${params}`);
+  return fetchListingPage(`${BASE}/browse/?${params}`, categoryId);
 }
 
 // Bare /browse/ with no cat/sub_cat param - ext.to's own "all categories,
 // newest first" listing. Only used for a blank query with no cat requested
 // at all (Torznab: absent cat -> return all categories); a specific cat (or
-// several) routes through CATEGORY_BROWSE/fetchMergedBrowse instead.
+// several) routes through CATEGORY_BROWSE/fetchMergedBrowse instead. No
+// knownCategory here - the listing genuinely mixes every category, so
+// per-row breadcrumb detection is unavoidable.
 function generalBrowsePage(sitePage: number): Promise<ListingPage> {
   const params = new URLSearchParams({ sort: 'age', order: 'desc', page_size: String(SITE_PAGE_SIZE), page: String(sitePage) });
   return fetchListingPage(`${BASE}/browse/?${params}`);
@@ -165,12 +175,17 @@ async function search(q: string, opts: SearchOptions): Promise<SearchResult> {
       return fetchPagedWindow(generalBrowsePage, paging);
     }
 
-    const targets = opts.categories.map((id) => CATEGORY_BROWSE[id]).filter((t): t is BrowseTarget => t !== undefined);
+    const targets = opts.categories
+      .map((id) => (CATEGORY_BROWSE[id] ? { id, target: CATEGORY_BROWSE[id] as BrowseTarget } : undefined))
+      .filter((t): t is { id: number; target: BrowseTarget } => t !== undefined);
     if (targets.length === 0) return { items: [], total: 0 }; // all requested cats unknown to ext.to (e.g. XXX)
-    if (targets.length === 1) return fetchPagedWindow((sitePage) => browsePage(targets[0] as BrowseTarget, sitePage), paging);
+    if (targets.length === 1) {
+      const only = targets[0] as { id: number; target: BrowseTarget };
+      return fetchPagedWindow((sitePage) => browsePage(only.target, only.id, sitePage), paging);
+    }
 
     return fetchMergedBrowse(
-      targets.map((target) => (sitePage: number) => browsePage(target, sitePage)),
+      targets.map(({ id, target }) => (sitePage: number) => browsePage(target, id, sitePage)),
       paging
     );
   }

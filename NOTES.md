@@ -54,12 +54,23 @@ Adding a tracker: write `providers/<id>.ts`, register in
 | files | `td[2]` |
 | age | `td[3] span:last` — **`title` attr** holds the exact date; the text is relative ("5 days ago") |
 | seeds / leechers | `td[4]` / `td[5]` |
-| category | `.related-posted a[href^="/"] strong` |
+| category | `.related-posted a[href^="/"]:not([href^="/user/"]) strong` (real search only — blank-query browsing already knows its category, see section 10) |
 
-**Category gotcha:** `.related-posted` also contains an *uploader* link. Its
-href starts with `?`, category links start with `/`. Without the
-`[href^="/"]` filter you silently scrape the uploader name and every result
-maps to "Other".
+**Category gotcha, and it has already drifted once:** `.related-posted` also
+contains an *uploader* link, which needs filtering out or you silently
+scrape the uploader name and every result maps to "Other". The filter used
+to be just `[href^="/"]` on the assumption uploader links always start with
+`?` (`?source[]=N`) - **that assumption broke live**: verified uploaders now
+render as `<a class="verify-user-link ..." href="/user/<name>/">`, which
+also starts with `/` and sorts before the category links in the DOM, so
+`.first()` picked up the uploader's name instead. Confirmed live via a real
+`philadelphia` search result. Fixed by explicitly excluding `/user/` hrefs
+rather than trusting the leading-character heuristic. `parseListing()` in
+`providers/ext-to.ts` also gained an optional `knownCategory` param (mirrors
+1337x's fix in section 3) so blank-query browsing - which already knows its
+category from the URL it built - never depends on this breadcrumb-text
+detection at all; only real keyword search still needs it, since that
+listing genuinely mixes every category on one page.
 
 ### Magnets
 
