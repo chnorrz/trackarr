@@ -766,12 +766,13 @@ Findings and fixes:
   the caps `<tv-search>`/`<movie-search>` *element* names, a separate thing.
   `server.ts`'s route handler was matching the wrong (element) names; fixed.
 - **`cat` is a comma-separated OR list**, not a single value - fixed (see
-  above section). Unknown category ids are silently dropped, not an error
-  (spec: "unknown categories must be silently ignored" - this governs
-  semantically-unknown ids, not syntax; we don't currently reject
-  non-numeric `cat` values as strict syntax errors the way the spec's
-  `^\d+(,\d+)*$` wording implies "must" - a known, accepted gap, not yet
-  raised as worth the extra strictness).
+  above section). Two distinct rules from the spec, both implemented:
+  syntax must be validated against `^\d+(,\d+)*$` (error `201` if it
+  isn't - e.g. `cat=abc`, `cat=2000,`, `cat=2000, 5000` all reject), while
+  semantically-*unknown* category ids (valid integers, just not ones any
+  provider recognizes) are silently ignored per "unknown categories must
+  be silently ignored" rather than erroring - a syntax problem and an
+  unknown-id problem are handled differently on purpose.
 - **`limit` is clamped to the caps-advertised max** (`MAX_LIMIT=100`) via
   `Math.min` - was previously unbounded.
 - **`categories` XML nesting** follows the Newznab `X000`/`Xnnn` convention

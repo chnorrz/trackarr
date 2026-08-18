@@ -271,6 +271,17 @@ test('offset/limit reject non-integer or negative values with a torznab <error c
   });
 });
 
+test('cat rejects non-numeric or malformed values with a torznab <error code="201"> document', async () => {
+  await withServer({ fake: fakeProvider() }, async (base) => {
+    const bad = ['cat=abc', 'cat=2000,abc', 'cat=2000,', 'cat=2000, 5000', 'cat=-1'];
+    for (const param of bad) {
+      const res = await fetch(`${base}/fake/api?t=search&q=x&${param}&apikey=${API_KEY}`);
+      assert.equal(res.status, 200, `expected 200 for ${param}`);
+      assert.match(await res.text(), /<error code="201"/, `expected error 201 for ${param}`);
+    }
+  });
+});
+
 test('download redirects to the resolved magnet (302)', async () => {
   const provider = fakeProvider({ resolveMagnet: async () => 'magnet:?xt=urn:btih:deadbeef' });
   await withServer({ fake: provider }, async (base) => {

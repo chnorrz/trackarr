@@ -247,14 +247,17 @@ ${rows}
     if (t === 'search' || t === 'tvsearch' || t === 'movie') {
       const q = queryString(req.query.q) || '';
       const catParam = queryString(req.query.cat);
-      // Comma-separated, OR'd (cat=2000,5000 -> either). Unknown/unparseable
-      // entries are silently dropped, not an error.
-      const categories = catParam
-        ? catParam
-            .split(',')
-            .map((c) => parseInt(c.trim(), 10))
-            .filter((n) => !Number.isNaN(n))
-        : undefined;
+      // Spec: cat must be verified as a comma-separated list of integers
+      // (^\d+(,\d+)*$), error 201 if it isn't - a *syntax* check, distinct
+      // from semantically-unknown category ids, which must be silently
+      // ignored instead (handled below by fetchPagedWindow/providers
+      // returning empty results for a category they don't recognize).
+      if (catParam && !/^\d+(,\d+)*$/.test(catParam)) {
+        sendError(res, 201, 'Incorrect parameter: cat must be a comma-separated list of non-negative integers');
+        return;
+      }
+      // Comma-separated, OR'd (cat=2000,5000 -> either).
+      const categories = catParam ? catParam.split(',').map((c) => parseInt(c, 10)) : undefined;
       // Spec: both must be integers >= 0, otherwise error 201 - not a
       // silent fallback. Empty/absent is fine and defaults normally.
       const offsetParam = queryString(req.query.offset);
