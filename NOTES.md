@@ -218,9 +218,10 @@ exactly correct 20/20/-/20 split across Movies/TV/Music/Other.
 
 1337x has banned our **IPv4** address; our IPv6 is clean. It therefore works
 in a desktop browser but not from the container, and needs the host proxy —
-see [section 4](#4-ipv4-bans-and-the-ipv6-proxy). It requests this itself via
-`gotoCleared(url, { proxy: '1337x' })`, but that alone isn't enough - it also
-needs `1337x` listed in `PROXY_PROVIDERS`, which isn't set by default.
+see [section 4](#4-ipv4-bans-and-the-ipv6-proxy). Unlike other providers,
+`providers/1337x.ts` requests nothing proxy-related itself - routing is
+decided entirely by `lib/browser.ts`'s `DOMAIN_OVER_PROXY` (unset by
+default), matched against the hostname of whatever URL is being fetched.
 
 ---
 
@@ -299,7 +300,7 @@ launchctl submit -l ext-tinyproxy -o /tmp/tp.log -e /tmp/tp.err \
 
 # host address from inside a container: 192.168.5.2 under Colima,
 # host.docker.internal elsewhere
-docker run ... -e PROXY_URL=http://192.168.5.2:8888 -e PROXY_PROVIDERS=1337x ...
+docker run ... -e PROXY_URL=http://192.168.5.2:8888 -e DOMAIN_OVER_PROXY=1337x.to ...
 ```
 
 `tools/tinyproxy.conf` restricts access to localhost plus the Docker/Colima
@@ -310,35 +311,121 @@ ranges. Without those `Allow` lines it is an open relay on the LAN.
 | Var | Meaning |
 |---|---|
 | `PROXY_URL` | e.g. `http://192.168.5.2:8888`. **Unset = proxy disabled**, everything direct. |
-| `PROXY_PROVIDERS` | Comma-separated provider ids allowed to use it. **Unset or empty = none.** |
+| `DOMAIN_OVER_PROXY` | Comma-separated hostnames routed through it (a listed entry matches itself and its subdomains). **Unset or empty = none.** |
 
-Deliberately opt-in, not opt-out: a provider asking for the proxy in code
-(`gotoCleared(url, { proxy: '<id>' })`) is not enough on its own - it must
-also be named in `PROXY_PROVIDERS`, or it goes direct regardless. `PROXY_URL`
-alone does nothing. Not baked into `docker-compose.yml`'s defaults either -
-needing this at all is specific to whichever tracker banned your IP, not
-something every deployment should silently opt into.
+Deliberately opt-in, not opt-out: `PROXY_URL` alone does nothing - a hostname
+has to be named in `DOMAIN_OVER_PROXY` too, or it goes direct regardless.
+Not baked into `docker-compose.yml`'s defaults either - needing this at all
+is specific to whichever tracker banned your IP, not something every
+deployment should silently opt into.
 
-Only the direct context's cookies are persisted, so a proxied context cannot
-clobber ext.to's `cf_clearance`.
+Routing is decided **per request**, not per provider. `lib/browser.ts`
+builds a PAC (Proxy Auto-Config) script from `DOMAIN_OVER_PROXY` and drives
+Firefox's own `network.proxy.type`/`network.proxy.autoconfig_url` prefs with
+it directly (bypassing Playwright's own `proxy` launch option entirely,
+which only supports the opposite shape - proxy-by-default with a `bypass`
+exception list, no way to express "direct by default, except these hosts").
+Firefox then evaluates the PAC script for *every* request it makes, main
+navigation and every embedded sub-resource alike - see the "Gotcha" below
+for why that per-request granularity, rather than a per-provider flag, is
+what actually matters here.
 
-**Do not proxy a provider that works directly.** `cf_clearance` is bound to
+Cookies are only persisted for hostnames not in `DOMAIN_OVER_PROXY`, so a
+proxied domain's `cf_clearance` (bound to the proxy's egress IP) cannot
+clobber a direct domain's like ext.to's.
+
+**Do not proxy a domain that works directly.** `cf_clearance` is bound to
 the egress IP (section 5), so routing ext.to through the proxy would
 invalidate its stored cookie.
 
-`proxyEnabledFor()`'s matching logic is covered by a standalone unit test (6
-cases: unset, empty, explicit match, non-match, no `PROXY_URL` regardless of
-`PROXY_PROVIDERS`, and a multi-value list) - all passing confirms the
-allow-list mechanism itself is correct. The original end-to-end Docker
-verification below predates this change (back when unset meant "whichever
-providers ask in code"), so it demonstrates the proxy path works at all, not
-this specific default.
+### Gotcha: a whole-context proxy strands Cloudflare's own challenge assets
 
-| Config | 1337x | ext.to |
-|---|---|---|
-| `PROXY_URL` set, `PROXY_PROVIDERS` unset (old default) | 20 results via proxy | 50, direct |
-| `PROXY_URL` set, `PROXY_PROVIDERS=` | hard blocked (direct) | unaffected |
-| no `PROXY_URL` | hard blocked (direct) | unaffected |
+The naive version of this feature - route a banned tracker's *entire*
+browser context through a `FORCE_IPV6`-bound tinyproxy - breaks on first
+contact with reality. Even with a genuinely working `Bind` (confirmed
+reaching the internet: a keepalive tick solved the Turnstile challenge and
+succeeded once), every *subsequent* attempt failed, tinyproxy logging:
+
+```
+ERROR opensock: Could not establish a connection to hagen.challenges.cloudflare.com:443
+```
+
+...surfacing up the stack as the browser's own `page.goto` timing out at
+60000ms, since the page's `load` event never fires while a render-blocking
+Cloudflare script hangs mid-request.
+
+**Cause**: a whole-context `Bind` forces *every* connection through tinyproxy
+onto IPv6 - not just the request to the banned tracker. 1337x.to itself
+embeds Cloudflare's own Turnstile widget, which loads its assets from a
+Cloudflare-owned challenge subdomain (in this case
+`hagen.challenges.cloudflare.com`). That subdomain can be **IPv4-only**:
+
+```bash
+dig AAAA hagen.challenges.cloudflare.com +short   # (nothing)
+dig A hagen.challenges.cloudflare.com +short      # 104.18.8.208, 104.18.9.208
+dig AAAA challenges.cloudflare.com +short         # has AAAA - the umbrella
+                                                   # domain is dual-stack,
+                                                   # but that's not the host
+                                                   # actually being requested
+dig AAAA 1337x.to +short                          # still has AAAA - the
+                                                   # tracker itself is fine
+```
+
+An IPv6-bound socket cannot connect to an IPv4-only destination, so the
+challenge widget's own asset fetch is permanently unroutable through the
+proxy - not flaky, not transient, every single attempt fails identically.
+The one early success was luck: that particular challenge instance happened
+to get routed to a dual-stack Cloudflare edge host that time; subsequent
+challenges got pinned to the IPv4-only one.
+
+Two fixes were tried and rejected before landing on the PAC approach
+described above:
+
+1. **App-level bypass list** (`proxy.bypass` in `lib/browser.ts`, hardcoding
+   Cloudflare's own domains to exclude). Works, but puts network-topology
+   knowledge in application code where it doesn't belong, and only covers
+   domains someone thought to list - a different, not-yet-seen IPv4-only
+   asset host reproduces the bug again.
+2. **Two chained tinyproxy instances** (`tinyproxy-edge` dual-stack +
+   `tinyproxy-v6` forced, with an `Upstream` rule chaining only the banned
+   domain to the forced one). Correctly scoped and validated working
+   end-to-end, but needs a second proxy process/container just to express a
+   routing decision Firefox can already make per-request on its own via PAC
+   - once that was confirmed working, the second instance became pure
+   overhead.
+
+Neither is what's actually deployed now (see "Configuration (env)" above) -
+kept here because the reasoning ruling them out is itself useful if this
+resurfaces for a different tracker.
+
+This also isn't the same as a generic "try IPv6, fall back to IPv4 if it
+fails" policy, which would not work for the banned host regardless of which
+layer implements it: 1337x.to's IPv4 *does* accept the TCP/TLS connection,
+Cloudflare just serves a block page over it, so a naive fallback would never
+even detect a failure worth falling back from - it would happily use the
+banned v4 path. `DOMAIN_OVER_PROXY` sidesteps that: the banned host is
+*always* forced onto v6 (no fallback, ever), while literally everything else
+gets normal dual-stack behavior with no special casing needed.
+
+Validated end-to-end with a real trackarr container against a genuinely
+IPv6-forced tinyproxy (bound to a real routable address, not Colima's
+non-routable one - see "Why enabling IPv6 in Docker does not help" above):
+without domain-scoped routing, tinyproxy logs `opensock: Could not establish
+a connection to hagen.challenges.cloudflare.com:443` on every run; with it
+(first via the two-instance chain, then confirmed identically via the PAC
+script talking to a single instance), that error never appears - confirmed
+across repeated trials, tinyproxy's own log used as ground truth for which
+hostnames actually reached it.
+
+**Caveat found during that same testing, still open**: even with this fixed,
+the Turnstile auto-solve step (`autoSolveChallenge()`) itself is separately
+flaky - `still challenged` / `Cloudflare challenge did not clear (auto-solve
+failed)` can still happen with zero proxy errors involved, i.e. the network
+path was fine and the click-based solve simply didn't register or Cloudflare
+didn't accept it. Possibly worse after repeated automated solves against the
+same tracker in a short window (bot-score creeping up), possibly just
+inherent Turnstile flakiness. Not something this fix addresses - if it
+persists after deploying, that needs its own investigation.
 
 ---
 
@@ -491,27 +578,26 @@ reproduced deterministically. Two separate causes, both in `lib/browser.ts`:
    itself was not - concurrent navigations to the same host raced each
    other and Cloudflare appears to treat simultaneous connections from one
    client as suspicious and gets stuck rather than erroring cleanly.
-2. `getPersistentContext()`/`getProxyContext()` were lazy singletons with no
-   guard against concurrent first calls - each could see the cache as still
-   empty and launch its own Camoufox browser instance simultaneously
-   (confirmed via logs: 4x `[cf] launching proxied browser` for one
-   request), starving the shared Xvfb display and causing
-   `NS_ERROR_NET_TIMEOUT`.
+2. `getPersistentContext()` was a lazy singleton with no guard against
+   concurrent first calls - each could see the cache as still empty and
+   launch its own Camoufox browser instance simultaneously (confirmed via
+   logs: multiple `[cf] launching browser` lines for one request), starving
+   the shared Xvfb display and causing `NS_ERROR_NET_TIMEOUT`.
 
-Fix: `serializeNav()` - a second pair of promise-chain mutexes
-(`directNavChain`/`proxyNavChain`, keyed by whether the proxy is in use so
-direct and proxied navigation don't block each other) wrapping the whole
+Fix: `serializeNav()` - a second promise-chain mutex wrapping the whole
 `gotoCleared` body, mirroring `serializeSolve`'s existing pattern. Plus:
-`getPersistentContext()`/`getProxyContext()` now cache the **in-flight
-launch promise**, not just the resolved context, so concurrent callers
-await the same launch instead of racing (cache is cleared on launch
-failure so a later call can retry).
+`getPersistentContext()` now caches the **in-flight launch promise**, not
+just the resolved context, so concurrent callers await the same launch
+instead of racing (cache is cleared on launch failure so a later call can
+retry). One browser now handles both direct and proxied traffic (routing is
+per-request via a PAC script - see section 4), so there's a single nav
+chain, not one per egress path as there briefly was.
 
 Live-verified after the fix: a 4-fetch concurrent snapshot produces exactly
-one `[cf] launching proxied browser` line, one solve, and sequential
-navigations - completes in ~24 s instead of hanging. Tradeoff accepted:
-multi-category blank browsing is now ~N × single-fetch time instead of
-running in parallel.
+one `[cf] launching browser` line, one solve, and sequential navigations -
+completes in ~24 s instead of hanging. Tradeoff accepted: multi-category
+blank browsing is now ~N × single-fetch time instead of running in
+parallel.
 
 ---
 
@@ -687,7 +773,7 @@ path, versus ~19 s cold.
 
 `KEEPALIVE_INTERVAL_MS` (default 15 min, `0` disables) with ±20% jitter so
 we're not hitting trackers on an exact schedule. Providers opt in by
-exporting `keepAlive: { url, proxy? }`.
+exporting `keepAlive: { url }`.
 
 **The interval is a guess.** The real clearance lifetime was never measured —
 only estimated at roughly 15–30 min. If challenges start appearing on the

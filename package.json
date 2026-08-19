@@ -1,6 +1,6 @@
 {
   "name": "trackarr",
-  "version": "0.1.0-alpha11",
+  "version": "0.1.0-alpha12",
   "private": true,
   "type": "module",
   "main": "dist/server.js",

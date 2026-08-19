@@ -45,11 +45,6 @@ test('1337x search() parses real row markup into SearchItem[]', async () => {
 
   assert.equal(tv.category, 5000); // flaticon-tv -> TV, must win over "hd"/"movie" substrings
   assert.equal(music.category, 3000); // flaticon-music -> Audio
-
-  // Confirms the proxy is actually requested (see NOTES.md section 4 - 1337x
-  // needs PROXY_PROVIDERS to include it), not just that search() runs at all.
-  const lastCall = fetchCfProtectedPage.mock.calls[fetchCfProtectedPage.mock.calls.length - 1];
-  assert.deepEqual(lastCall?.arguments[1], { proxy: '1337x' });
 });
 
 test('1337x search() skips rows with no href (malformed row)', async () => {

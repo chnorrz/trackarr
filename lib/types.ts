@@ -22,8 +22,6 @@ export interface MagnetRef {
 
 export interface KeepAliveTarget {
   url: string;
-  /** Provider id to route through PROXY_URL, matching fetchCfProtectedPage's opts.proxy. */
-  proxy?: string;
 }
 
 export interface SearchOptions {

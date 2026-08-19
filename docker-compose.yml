@@ -14,8 +14,9 @@
 #
 # If your host doesn't need the IPv6 workaround (only 1337x does, and only if
 # your IPv4 happens to be banned - see NOTES.md section 4 to check), delete
-# the tinyproxy service, the PROXY_URL env line, and the trackarr-net network,
-# and just put trackarr on your Prowlarr network directly.
+# the tinyproxy service, the PROXY_URL/DOMAIN_OVER_PROXY env lines, and the
+# trackarr-net network, and just put trackarr on your Prowlarr network
+# directly.
 
 services:
   trackarr:
@@ -27,10 +28,10 @@ services:
       # the same value when adding trackarr as an indexer in Prowlarr.
       API_KEY: changeme
       PROXY_URL: http://tinyproxy:8888
-      # PROXY_URL alone does nothing - no provider is proxied unless it's
-      # also explicitly named here. Not set by default since needing this at
-      # all is specific to your situation (see NOTES.md section 4) - add it
-      # yourself, e.g. PROXY_PROVIDERS: "1337x"
+      # PROXY_URL alone does nothing - no domain is proxied unless it's also
+      # explicitly named here. Not set by default since needing this at all
+      # is specific to your situation (see NOTES.md section 4) - add it
+      # yourself, e.g. DOMAIN_OVER_PROXY: "1337x.to"
     volumes:
       - trackarr-data:/data
     networks:
@@ -47,9 +48,13 @@ services:
       ALLOWED_SUBNET: 172.28.99.0/24
       # Only needed if 1337x's ban is on your IPv4 specifically and your host
       # has real IPv6 (see NOTES.md section 4) - forces tinyproxy's outgoing
-      # connections onto its own IPv6 address rather than letting IPv4/IPv6
-      # racing pick whichever connects first, with no awareness that IPv4
-      # leads to the ban. Set to "false" (or remove) if you don't need this.
+      # connections onto its own IPv6 address. Only ever reached for the
+      # hostname(s) trackarr's own DOMAIN_OVER_PROXY names - everything else
+      # a proxied page touches (e.g. Cloudflare's own challenge-widget
+      # assets, which can be IPv4-only) is routed direct by trackarr itself,
+      # per-request, before it would ever reach this container - see
+      # DOMAIN_OVER_PROXY above and NOTES.md section 4. Set to "false" (or
+      # remove) if you don't need this.
       FORCE_IPV6: "true"
     networks:
       - trackarr-net     # not on media_default - nothing else can reach it

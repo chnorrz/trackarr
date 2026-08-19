@@ -64,17 +64,14 @@ function loadUserAgent(): string | null {
 
 let sharedBrowser: Browser | null = null;
 let sharedContext: BrowserContext | null = null;
-let proxyBrowser: Browser | null = null;
-let proxyContext: BrowserContext | null = null;
 
-// In-flight launch promises, so concurrent first calls (e.g. the 4 parallel
-// fetchCfProtectedPage() calls from a multi-category browse) await the same launch
-// instead of each seeing sharedContext/proxyContext still null and racing to
-// start their own browser. That race was observed live: 4 simultaneous
-// "launching proxied browser" logs, 4 separate Camoufox/Firefox instances
-// fighting over one Xvfb display, and a page.goto NS_ERROR_NET_TIMEOUT.
+// In-flight launch promise, so concurrent first calls (e.g. the 4 parallel
+// fetchCfProtectedPage() calls from a multi-category browse) await the same
+// launch instead of each seeing sharedContext still null and racing to start
+// their own browser. That race was observed live: multiple simultaneous
+// "launching browser" attempts, several Camoufox/Firefox instances fighting
+// over one Xvfb display, and a page.goto NS_ERROR_NET_TIMEOUT.
 let persistentContextPromise: Promise<BrowserContext> | null = null;
-let proxyContextPromise: Promise<BrowserContext | null> | null = null;
 
 // XTEST input is global to the X display, so two solves running at once fight
 // over the same virtual mouse and both fail. Matters most with the background
@@ -96,52 +93,80 @@ function serializeSolve<T>(task: () => Promise<T>): Promise<T> {
 // Concurrent navigations to the same browser context/egress IP get treated
 // as suspicious by Cloudflare: multi-category browsing (fetchMergedBrowse,
 // 1337x's no-cat snapshot) fires several fetchCfProtectedPage() slow-path
-// navigations at once, and
-// live-testing found that 2+ concurrent navigations to the same
-// Cloudflare-protected host reliably hang until the 60s page.goto timeout,
-// even though each one succeeds fine on its own. Queuing navigations one at
-// a time per context (direct vs proxied - they're separate browsers/IPs, so
-// they don't contend with each other) fixes it, at the cost of the rare
-// multi-category blank-browse case taking roughly N times as long as a
-// single-category one instead of running in parallel.
-let directNavChain: Promise<unknown> = Promise.resolve();
-let proxyNavChain: Promise<unknown> = Promise.resolve();
+// navigations at once, and live-testing found that 2+ concurrent navigations
+// to the same Cloudflare-protected host reliably hang until the 60s
+// page.goto timeout, even though each one succeeds fine on its own. Queuing
+// navigations one at a time on the shared context fixes it, at the cost of
+// the rare multi-category blank-browse case taking roughly N times as long
+// as a single-category one instead of running in parallel. One browser now
+// handles both direct and proxied traffic (see DOMAIN_OVER_PROXY below), so
+// there's a single chain rather than one per egress path.
+let navChain: Promise<unknown> = Promise.resolve();
 
-function serializeNav<T>(usingProxy: boolean, task: () => Promise<T>): Promise<T> {
-  const chain = usingProxy ? proxyNavChain : directNavChain;
-  const run = chain.then(task, task);
-  const settled = run.then(
+function serializeNav<T>(task: () => Promise<T>): Promise<T> {
+  const run = navChain.then(task, task);
+  navChain = run.then(
     () => {},
     () => {}
   );
-  if (usingProxy) proxyNavChain = settled;
-  else directNavChain = settled;
   return run;
 }
 
-// Optional upstream proxy, for providers that can't be reached directly
-// (see NOTES.md - 1337x bans our IPv4, and the container has no IPv6).
+// Optional upstream proxy, for domains that can't be reached directly (see
+// NOTES.md - 1337x bans our IPv4, and the container has no IPv6 of its own).
 //
-//   PROXY_URL        e.g. http://host.docker.internal:8888. Unset = the
-//                    proxy is disabled entirely and everything goes direct.
-//   PROXY_PROVIDERS  comma-separated provider ids allowed to use it. Unset
-//                    or empty = none - a provider asking for the proxy in
-//                    code (fetchCfProtectedPage(url, {proxy: 'id'})) is not
-//                    enough on its own, it must be explicitly allow-listed
-//                    here too.
-//                    This is deliberately opt-in rather than opt-out: adding
-//                    a new provider that happens to ask for a proxy should
-//                    never silently start routing traffic through one an
-//                    operator hasn't reviewed/configured for it.
+//   PROXY_URL         e.g. http://tinyproxy:8888. Unset = the proxy is
+//                     disabled entirely and everything goes direct.
+//   DOMAIN_OVER_PROXY comma-separated hostnames routed through it (matches
+//                     the exact hostname or any of its subdomains). Unset or
+//                     empty = none - deliberately opt-in, not opt-out, so a
+//                     new domain never silently starts routing through a
+//                     proxy an operator hasn't reviewed/configured for it.
+//
+// Routing is per-request, not per-provider: a single persistent browser is
+// configured with a PAC script (see buildPacDataUri below) that Firefox
+// itself evaluates for every request it makes, main navigation and every
+// embedded sub-resource alike. That per-request granularity matters -
+// 1337x.to's own page embeds Cloudflare's Turnstile widget, which loads its
+// own assets from Cloudflare-owned hosts that can be IPv4-only; forcing
+// *everything* the page touches through an IPv6-only proxy broke those
+// unrelated hosts outright (see NOTES.md section 4). A provider-level flag
+// can't express "proxy this hostname, not that one, even though a single
+// page load touches both" - only a per-request decision inside the browser
+// itself can, which is what the PAC script gives us instead of a bypass
+// allowlist maintained here.
 const PROXY_URL = process.env.PROXY_URL || null;
-const PROXY_PROVIDERS = (process.env.PROXY_PROVIDERS || '')
+const DOMAIN_OVER_PROXY = (process.env.DOMAIN_OVER_PROXY || '')
   .split(',')
   .map((s) => s.trim())
   .filter(Boolean);
 
-function proxyEnabledFor(who: string | null): boolean {
-  if (!PROXY_URL || !who) return false;
-  return PROXY_PROVIDERS.includes(who);
+function domainUsesProxy(hostname: string): boolean {
+  if (!PROXY_URL || DOMAIN_OVER_PROXY.length === 0) return false;
+  return DOMAIN_OVER_PROXY.some((d) => hostname === d || hostname.endsWith(`.${d}`));
+}
+
+// Builds a data: URI PAC (Proxy Auto-Config) script routing DOMAIN_OVER_PROXY
+// through PROXY_URL and everything else direct. Playwright's own `proxy`
+// launch option only supports the opposite shape (proxy by default, with a
+// `bypass` exception list) - there's no way to express "direct by default,
+// except these hosts" through it, so this goes around Playwright entirely
+// and drives Firefox's native network.proxy.* prefs instead (see
+// launchPersistentContext). Returns null when no proxying is configured.
+function buildPacDataUri(): string | null {
+  if (!PROXY_URL || DOMAIN_OVER_PROXY.length === 0) return null;
+  const proxyHost = new URL(PROXY_URL).host; // PAC wants "host:port", no scheme
+  const pac = `function FindProxyForURL(url, host) {
+  var domains = ${JSON.stringify(DOMAIN_OVER_PROXY)};
+  for (var i = 0; i < domains.length; i++) {
+    var d = domains[i];
+    if (host === d || host.substring(host.length - d.length - 1) === '.' + d) {
+      return "PROXY ${proxyHost}";
+    }
+  }
+  return "DIRECT";
+}`;
+  return `data:application/x-ns-proxy-autoconfig;base64,${Buffer.from(pac).toString('base64')}`;
 }
 
 // Solves a Cloudflare Turnstile challenge by driving the mouse at the X
@@ -227,16 +252,49 @@ async function autoSolveChallenge(page: Page): Promise<boolean> {
   const cy = Math.round(geo.offY + geo.rect.y + geo.rect.h / 2);
   console.error(`[cf] clicking checkbox at screen ${cx},${cy}`);
 
-  for (const [dx, dy, wait] of [
-    [-150, -80, 350],
-    [-60, -25, 300],
-    [-12, -4, 250],
-    [0, 0, 500]
-  ] as const) {
-    xdo(['mousemove', String(cx + dx), String(cy + dy)]);
-    await new Promise((r) => setTimeout(r, wait));
+  const clickCheckbox = async (): Promise<void> => {
+    for (const [dx, dy, wait] of [
+      [-150, -80, 350],
+      [-60, -25, 300],
+      [-12, -4, 250],
+      [0, 0, 500]
+    ] as const) {
+      xdo(['mousemove', String(cx + dx), String(cy + dy)]);
+      await new Promise((r) => setTimeout(r, wait));
+    }
+    xdo(['click', '1']);
+  };
+
+  // Solved state shows up as a token in the hidden response input before
+  // the page moves on - a cheap, targeted check we can poll without waiting
+  // for a full page transition. If a click didn't register (the widget
+  // just sits on "Verifying..." with no progress - live-observed via
+  // screenshot: the checkbox hadn't even rendered yet at click time, so the
+  // click lands on nothing), click again - observed the same
+  // click-doesn't-always-land behavior in another Turnstile solver
+  // (byparr's own logs show it clicking twice, ~6s apart, before its
+  // challenge clears - not unique to this widget/site). Bounded to a few
+  // clicks rather than one retry, since how long the widget takes to
+  // render varies with how loaded the machine is.
+  const MAX_CLICKS = 3;
+  const CLICK_INTERVAL_MS = 6000;
+
+  const hasToken = () =>
+    page
+      .evaluate(() => {
+        const input = document.querySelector('input[name="cf-turnstile-response"]') as HTMLInputElement | null;
+        return !!input?.value;
+      })
+      .catch(() => false);
+
+  for (let click = 1; click <= MAX_CLICKS; click++) {
+    await clickCheckbox();
+    if (click === MAX_CLICKS) break;
+    await new Promise((r) => setTimeout(r, CLICK_INTERVAL_MS));
+    if (await hasToken()) break;
+    console.error(`[cf] no progress after click ${click}, retrying (click ${click + 1}/${MAX_CLICKS})...`);
   }
-  xdo(['click', '1']);
+
   return true;
 }
 
@@ -262,12 +320,28 @@ async function launchPersistentContext(): Promise<BrowserContext> {
   // Pin the spoofed OS so it stays consistent with the UA the stored
   // cf_clearance cookie was issued to (see UA_FILE above).
   const os = process.platform === 'linux' ? ('linux' as const) : undefined;
-  // A local const (rather than reading the module-level `let` back) avoids
-  // TypeScript having to assume something else could have reassigned
-  // sharedBrowser across the `await`s below - which can't actually happen
-  // in single-threaded Node, but TS can't know that for a mutable outer-
-  // scope variable.
-  const browser = await Camoufox(os ? { headless, os } : { headless });
+
+  // PAC-based routing (see buildPacDataUri above) instead of Playwright's
+  // own `proxy` launch option - driven through raw Firefox prefs so
+  // per-request routing decisions happen inside the browser itself, not at
+  // the whole-context level Playwright's option is limited to.
+  const pacDataUri = buildPacDataUri();
+  if (pacDataUri) {
+    console.error(`[cf] proxying [${DOMAIN_OVER_PROXY.join(', ')}] via ${PROXY_URL}, direct otherwise.`);
+  }
+  const firefoxPrefs = pacDataUri
+    ? { 'network.proxy.type': 2, 'network.proxy.autoconfig_url': pacDataUri }
+    : undefined;
+
+  // A literal object argument at the call site (rather than a pre-built
+  // `opts` variable) matters here: Camoufox()'s return type is generic on
+  // whether user_data_dir is present, and extracting the parameter type
+  // separately loses that inference, resolving to BrowserContext instead of
+  // Browser. The conditional spreads stay inside this one literal for that
+  // reason - it's still a single object expression at the call site.
+  const browser = os
+    ? await Camoufox({ headless, os, ...(firefoxPrefs ? { firefox_user_prefs: firefoxPrefs } : {}) })
+    : await Camoufox({ headless, ...(firefoxPrefs ? { firefox_user_prefs: firefoxPrefs } : {}) });
   sharedBrowser = browser;
 
   const userAgent = loadUserAgent();
@@ -280,52 +354,15 @@ async function launchPersistentContext(): Promise<BrowserContext> {
   return context;
 }
 
-// Separate browser for providers that must egress through PROXY_URL (see
-// NOTES.md - 1337x bans our IPv4 but not our IPv6, and the Colima VM has no
-// IPv6 of its own). Playwright's Firefox wants the proxy set at launch, so
-// this is a second browser rather than a second context.
-async function getProxyContext(): Promise<BrowserContext | null> {
-  if (proxyContext) return proxyContext;
-  if (!PROXY_URL) return null;
-  if (!proxyContextPromise) {
-    proxyContextPromise = launchProxyContext().catch((err) => {
-      proxyContextPromise = null;
-      throw err;
-    });
-  }
-  return proxyContextPromise;
-}
-
-async function launchProxyContext(): Promise<BrowserContext | null> {
-  // Non-null: only called from getProxyContext(), which already checked
-  // PROXY_URL - narrowing just doesn't carry across the function boundary.
-  const proxyUrl = PROXY_URL!;
-  console.error(`[cf] launching proxied browser via ${proxyUrl}`);
-  const headless = process.platform === 'linux' ? false : true;
-  // A literal object argument at the call site (rather than a pre-built
-  // `opts` variable) matters here: Camoufox()'s return type is generic on
-  // whether user_data_dir is present, and extracting the parameter type
-  // separately loses that inference, resolving to BrowserContext instead of
-  // Browser.
-  const browser = process.platform === 'linux'
-    ? await Camoufox({ headless, proxy: { server: proxyUrl }, os: 'linux' })
-    : await Camoufox({ headless, proxy: { server: proxyUrl } });
-  proxyBrowser = browser;
-  const context = await browser.newContext();
-  proxyContext = context;
-  return context;
-}
-
 // fetchCfProtectedPage()'s options - a standard RequestInit (method/headers/
-// body/etc, same as the global fetch()) plus two extras of our own, so the
+// body/etc, same as the global fetch()) plus one extra of our own, so the
 // function is otherwise a drop-in replacement for fetch() minus getting a
 // live Response back (this always resolves the body text directly instead -
-// see fetchCfProtectedPage's own doc comment for why).
+// see fetchCfProtectedPage's own doc comment for why). No `proxy` field -
+// routing is decided per-hostname by the PAC script (see DOMAIN_OVER_PROXY
+// above), not per-call.
 export interface FetchOptions extends RequestInit {
   timeoutMs?: number;
-  /** Route through PROXY_URL. Pass the provider's id (so PROXY_PROVIDERS can
-   * target it) or `true` for an unnamed request. */
-  proxy?: boolean | string;
 }
 
 // Shared by fetchCfProtectedPage()'s slow path: navigates
@@ -401,23 +438,6 @@ async function navigateAndClear(page: Page, url: string, timeoutMs: number): Pro
   }
 }
 
-// Resolves which context (direct vs proxy) a request should use, and
-// whether that's actually the proxy context (a provider can ask for the
-// proxy and still end up direct, if it isn't allow-listed - see
-// proxyEnabledFor above). Used by getOrCreatePersistentPage() so every
-// fetchCfProtectedPage() call for a given hostname picks its context the
-// same way.
-async function resolveContext(proxy: boolean | string): Promise<{ context: BrowserContext; usingProxy: boolean }> {
-  const wants = typeof proxy === 'string' ? proxy : proxy ? '*' : null;
-  const useProxy = proxyEnabledFor(wants);
-  const context = (useProxy ? await getProxyContext() : null) || (await getPersistentContext());
-  const usingProxy = useProxy && context === proxyContext;
-  if (wants && !usingProxy) {
-    console.error(`[cf] proxy not enabled for '${wants}', using a direct connection.`);
-  }
-  return { context, usingProxy };
-}
-
 // One already-cleared, long-lived page per hostname, reused across many
 // requests instead of opening/closing a fresh page per call - lets
 // listing-page fetches skip full navigation (see fetchCfProtectedPage).
@@ -425,15 +445,24 @@ async function resolveContext(proxy: boolean | string): Promise<{ context: Brows
 // current provider only ever talks to one hostname, so this partitions
 // exactly the same way while removing a redundant parameter every caller
 // would otherwise have to pass and keep in sync with the URLs it fetches.
+//
+// Every hostname shares the same underlying browser/context now - routing
+// through the proxy or not is the PAC script's per-request decision, not a
+// separate context to pick between (see DOMAIN_OVER_PROXY above). usingProxy
+// is still tracked per page, purely so fetchCfProtectedPage knows whether to
+// persist this hostname's cookies (see the note at that call site: a
+// proxy-obtained cf_clearance is bound to the proxy's egress IP, and
+// shouldn't get mixed into the same cookie file a direct-egress domain like
+// ext.to relies on).
 const persistentPages = new Map<string, { page: Page; usingProxy: boolean }>();
 
-async function getOrCreatePersistentPage(hostname: string, proxy: boolean | string): Promise<{ page: Page; usingProxy: boolean }> {
+async function getOrCreatePersistentPage(hostname: string): Promise<{ page: Page; usingProxy: boolean }> {
   const existing = persistentPages.get(hostname);
   if (existing && !existing.page.isClosed()) return existing;
 
-  const { context, usingProxy } = await resolveContext(proxy);
+  const context = await getPersistentContext();
   const page = await context.newPage();
-  const entry = { page, usingProxy };
+  const entry = { page, usingProxy: domainUsesProxy(hostname) };
   persistentPages.set(hostname, entry);
   return entry;
 }
@@ -496,7 +525,7 @@ const pageCache = new TTLCache<string>(PAGE_CACHE_TTL_MS);
 // Concurrent recovery attempts still queue behind serializeNav/serializeSolve,
 // so two requests hitting a stale session at once don't both try to solve it.
 export async function fetchCfProtectedPage(url: string, opts: FetchOptions = {}): Promise<string> {
-  const { timeoutMs = 30000, proxy = false, method = 'GET', headers, body } = opts;
+  const { timeoutMs = 30000, method = 'GET', headers, body } = opts;
   const init: RequestInit = { method, headers, body };
   const isGet = method.toUpperCase() === 'GET';
   const cacheKey = crypto.createHash('sha256').update(`${method}:${url}:${body ?? ''}`).digest('hex');
@@ -504,7 +533,7 @@ export async function fetchCfProtectedPage(url: string, opts: FetchOptions = {})
   const cached = pageCache.get(cacheKey);
   if (cached !== undefined) return cached;
 
-  const { page, usingProxy } = await getOrCreatePersistentPage(new URL(url).hostname, proxy);
+  const { page, usingProxy } = await getOrCreatePersistentPage(new URL(url).hostname);
 
   const fast = await tryFetch(page, url, init);
   if (fast !== null && !isChallenge(fast) && !isBlocked(fast)) {
@@ -533,7 +562,7 @@ export async function fetchCfProtectedPage(url: string, opts: FetchOptions = {})
   // that's unambiguously safe to hand back, whether that's a GET or not.
   const currentUrl = page.url();
   const navigateTarget = isGet ? url : currentUrl && currentUrl !== 'about:blank' ? currentUrl : new URL(url).origin + '/';
-  await serializeNav(usingProxy, () => navigateAndClear(page, navigateTarget, timeoutMs));
+  await serializeNav(() => navigateAndClear(page, navigateTarget, timeoutMs));
   if (!usingProxy) saveCookies(await page.context().cookies());
 
   const retried = await tryFetch(page, url, init);
@@ -546,9 +575,6 @@ export async function fetchCfProtectedPage(url: string, opts: FetchOptions = {})
 
 export async function closeBrowser(): Promise<void> {
   persistentPages.clear();
-  if (proxyBrowser) await proxyBrowser.close().catch(() => {});
-  proxyBrowser = null;
-  proxyContext = null;
   if (sharedBrowser) await sharedBrowser.close();
   sharedBrowser = null;
   sharedContext = null;

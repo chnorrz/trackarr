@@ -1,5 +1,5 @@
 import * as cheerio from 'cheerio';
-import { fetchCfProtectedPage, type FetchOptions } from '../lib/browser.js';
+import { fetchCfProtectedPage } from '../lib/browser.js';
 import { CATEGORIES, matchCategory, type CategoryRule } from '../lib/categories.js';
 import { fetchMergedBrowse, fetchPagedWindow } from '../lib/paging.js';
 import { parseSize } from '../lib/parse.js';
@@ -162,12 +162,6 @@ const CATEGORY_BROWSE: Partial<Record<number, string>> = {
 // supporting real offset/limit depth for this specific case.
 const NO_CAT_BROWSE: number[] = [CATEGORIES.MOVIES, CATEGORIES.TV, CATEGORIES.AUDIO, CATEGORIES.OTHER];
 
-// 1337x has banned our IPv4 address but not our IPv6 one, and the container
-// has no IPv6 of its own - so ask to route through the host proxy (see
-// NOTES.md). Passing the provider id lets PROXY_PROVIDERS target it. Falls
-// back to a direct connection when no proxy is configured.
-const VIA_PROXY: FetchOptions = { proxy: '1337x' };
-
 interface ListingPage {
   items: SearchItem[];
   totalHint?: number;
@@ -246,7 +240,9 @@ function parseListing(html: string, knownCategory?: number): ListingPage {
 }
 
 async function fetchListingPage(url: string, knownCategory?: number): Promise<ListingPage> {
-  const html = await fetchCfProtectedPage(url, VIA_PROXY);
+  // 1337x.to bans our IPv4 but not IPv6 - routing for it is controlled by
+  // DOMAIN_OVER_PROXY (see NOTES.md section 4), not anything passed here.
+  const html = await fetchCfProtectedPage(url);
   return parseListing(html, knownCategory);
 }
 
@@ -297,7 +293,7 @@ async function resolveMagnet({ url }: MagnetRef): Promise<string> {
   // Pure read - the magnet link is right there in the detail page's static
   // HTML, no POST needed - so this doesn't need a live page at all, just
   // the fast-path/caching fetchListingPage's real searches already get.
-  const html = await fetchCfProtectedPage(url, VIA_PROXY);
+  const html = await fetchCfProtectedPage(url);
   const $ = cheerio.load(html);
   const magnet = $('a[href^="magnet:"]').first().attr('href');
   if (!magnet) throw new Error('Could not find a magnet link on the torrent page.');
@@ -307,9 +303,9 @@ async function resolveMagnet({ url }: MagnetRef): Promise<string> {
 export default {
   id: '1337x',
   name: '1337x',
-  // Landing page is enough here - the challenge isn't path-specific, and it's
-  // a cheaper page than a search. Needs the same proxy as everything else.
-  keepAlive: { url: `${BASE}/`, proxy: '1337x' },
+  // Landing page is enough here - the challenge isn't path-specific, and
+  // it's a cheaper page than a search.
+  keepAlive: { url: `${BASE}/` },
   // Every category CATEGORY_BROWSE can route, except BOOKS: that entry is
   // only a browse-routing fallback for an unspecific request, not a real
   // category with its own content (1337x only ever classifies items as the
