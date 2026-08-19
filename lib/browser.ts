@@ -197,6 +197,17 @@ async function autoSolveChallenge(page: Page): Promise<boolean> {
     }
   };
 
+  // xdotool's own arg parser reads a leading "-" as the start of an option
+  // flag, not a negative number - "mousemove -38 100" fails with
+  // "unrecognized option '-38'" instead of moving there, silently doing
+  // nothing (live-observed in the click-approach steps below, whose
+  // offsets can push cx+dx/cy+dy negative when the widget renders near the
+  // screen edge). Clamped to 0 rather than passed through some "--"
+  // end-of-options marker - there's no meaningful off-screen position on
+  // our single-screen Xvfb display anyway, so 0 is both a safe substitute
+  // and never ambiguous with an option flag.
+  const move = (x: number, y: number): boolean => xdo(['mousemove', String(Math.max(0, x)), String(Math.max(0, y))]);
+
   if (!xdo(['getdisplaygeometry'])) {
     console.error('[cf] xdotool unavailable, cannot auto-solve.');
     return false;
@@ -206,11 +217,7 @@ async function autoSolveChallenge(page: Page): Promise<boolean> {
 
   // Movement warm-up: this is what gets the widget past "Verifying...".
   for (let i = 0; i < 30; i++) {
-    xdo([
-      'mousemove',
-      String(300 + Math.round(Math.sin(i / 4) * 250) + i * 8),
-      String(300 + Math.round(Math.cos(i / 5) * 160))
-    ]);
+    move(300 + Math.round(Math.sin(i / 4) * 250) + i * 8, 300 + Math.round(Math.cos(i / 5) * 160));
     await new Promise((r) => setTimeout(r, 100));
   }
 
@@ -259,7 +266,7 @@ async function autoSolveChallenge(page: Page): Promise<boolean> {
       [-12, -4, 250],
       [0, 0, 500]
     ] as const) {
-      xdo(['mousemove', String(cx + dx), String(cy + dy)]);
+      move(cx + dx, cy + dy);
       await new Promise((r) => setTimeout(r, wait));
     }
     xdo(['click', '1']);
@@ -372,8 +379,24 @@ export interface FetchOptions extends RequestInit {
 // us. Doesn't open/close pages or pick a context itself, just the
 // navigate+wait+solve+verify dance, so both callers - one using a fresh
 // page, the other a long-lived persistent one - share identical behavior.
-async function navigateOnce(page: Page, url: string, timeoutMs: number): Promise<string> {
-  await page.goto(url, { waitUntil: 'load', timeout: 60000 });
+//
+// `alreadyConfirmedChallenged`: set when fetchCfProtectedPage's own
+// origin-establishing domcontentloaded navigation (see there) already ran
+// moments ago AND its own same-origin fetch() check already came back
+// challenged - i.e. we already have a fresh, real signal that solving is
+// needed, not a guess. In that case there's no point doing a second fresh
+// page.goto() (we're already on the right page, just extend the wait to
+// 'load' instead of re-navigating) or giving it another 8s passive chance
+// to have self-resolved (empirically, across every case observed so far,
+// it never has once a real challenge is confirmed present - the passive
+// wait only ever helps the "already cleared" case, which the origin-check
+// fetch() would have already caught on its own).
+async function navigateOnce(page: Page, url: string, timeoutMs: number, alreadyConfirmedChallenged = false): Promise<string> {
+  if (alreadyConfirmedChallenged) {
+    await page.waitForLoadState('load', { timeout: 60000 }).catch(() => {});
+  } else {
+    await page.goto(url, { waitUntil: 'load', timeout: 60000 });
+  }
 
   const waitUntilCleared = async (ms: number): Promise<string> => {
     const deadline = Date.now() + ms;
@@ -386,8 +409,9 @@ async function navigateOnce(page: Page, url: string, timeoutMs: number): Promise
   };
 
   // A stored cf_clearance cookie usually means no challenge at all, so give
-  // it a short pass first before spending time on the solve routine.
-  let html = await waitUntilCleared(8000);
+  // it a short pass first before spending time on the solve routine - unless
+  // we already know better (see above).
+  let html = alreadyConfirmedChallenged ? await safeContent(page) : await waitUntilCleared(8000);
 
   if (isChallenge(html) || !html) {
     if (await serializeSolve(() => autoSolveChallenge(page))) {
@@ -424,14 +448,18 @@ async function navigateOnce(page: Page, url: string, timeoutMs: number): Promise
 // request itself, retry the whole navigation once, inline, right here -
 // fresh page.goto, fresh challenge/block check, fresh solve attempt if
 // needed. Only surfaces an error if that retry ALSO fails.
-async function navigateAndClear(page: Page, url: string, timeoutMs: number): Promise<string> {
+async function navigateAndClear(page: Page, url: string, timeoutMs: number, alreadyConfirmedChallenged = false): Promise<string> {
   try {
-    const html = await navigateOnce(page, url, timeoutMs);
+    const html = await navigateOnce(page, url, timeoutMs, alreadyConfirmedChallenged);
     console.error('[cf] cleared.');
     return html;
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
     console.error(`[cf] navigation failed (${message}), retrying once...`);
+    // The retry always does a full fresh navigateOnce (no shortcut) - the
+    // moments-old "already confirmed challenged" signal is stale by now,
+    // and a genuinely fresh page.goto + passive wait is the more robust
+    // fallback once the fast path has already been tried and failed once.
     const html = await navigateOnce(page, url, timeoutMs);
     console.error('[cf] cleared on retry.');
     return html;
@@ -555,6 +583,29 @@ export async function fetchCfProtectedPage(url: string, opts: FetchOptions = {})
 
   const { page, usingProxy } = await getOrCreatePersistentPage(new URL(url).hostname);
 
+  // A brand-new page starts at about:blank, where fetch()'s same-origin
+  // credential/CORS rules mean tryFetch() below is guaranteed to fail no
+  // matter how valid the domain's cookies already are - not a real signal
+  // that a challenge is present, just this check being unable to run yet.
+  // A cheap domcontentloaded navigation (far less work than the full 'load'
+  // the slow path below uses) gets the page onto the real origin first, so
+  // tryFetch has an actual chance to succeed instead of failing
+  // unconditionally on every hostname's first-ever call. On every call
+  // after that first one, the page is already on the right origin from a
+  // prior navigation and this is a no-op.
+  let justNavigated = false;
+  if (page.url() === 'about:blank') {
+    const originTarget = isGet ? url : new URL(url).origin + '/';
+    try {
+      await page.goto(originTarget, { waitUntil: 'domcontentloaded', timeout: 60000 });
+      justNavigated = true;
+    } catch {
+      // Fall through - the slow path below does a full fresh navigation
+      // regardless, so a failed cheap pre-nav just means we skip the
+      // optimization for this call, not that the request fails outright.
+    }
+  }
+
   const fast = await tryFetch(page, url, init);
   if (fast !== null && !isChallenge(fast) && !isBlocked(fast)) {
     pageCache.set(cacheKey, fast);
@@ -571,7 +622,8 @@ export async function fetchCfProtectedPage(url: string, opts: FetchOptions = {})
   // POST endpoint) - reload wherever the page is already sitting instead,
   // falling back to the request's own origin root if it has no real
   // history yet (about:blank - a brand new persistent page whose very
-  // first call happens to be a non-GET).
+  // first call happens to be a non-GET, and the pre-nav above didn't run
+  // or failed).
   //
   // Either way, the navigation's own returned HTML is discarded on
   // purpose and never treated as the answer - only a fresh fetch()
@@ -582,7 +634,7 @@ export async function fetchCfProtectedPage(url: string, opts: FetchOptions = {})
   // that's unambiguously safe to hand back, whether that's a GET or not.
   const currentUrl = page.url();
   const navigateTarget = isGet ? url : currentUrl && currentUrl !== 'about:blank' ? currentUrl : new URL(url).origin + '/';
-  await serializeNav(() => navigateAndClear(page, navigateTarget, timeoutMs));
+  await serializeNav(() => navigateAndClear(page, navigateTarget, timeoutMs, justNavigated));
   if (!usingProxy) saveCookies(await page.context().cookies());
 
   const retried = await tryFetch(page, url, init);
