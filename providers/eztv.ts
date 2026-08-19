@@ -266,7 +266,11 @@ async function resolveMagnet({ url }: MagnetRef): Promise<string> {
 export default {
   id: 'eztv',
   name: 'EZTV',
-  keepAlive: { url: `${BASE}/` },
+  // Must be the search path, not the bare homepage - the challenge lives
+  // there, not on / (confirmed live: curl to / clears with no challenge at
+  // all, curl to /search/ gets a real Turnstile "Just a moment..." page).
+  // Same shape as ext-to.ts's own keepAlive, for the identical reason.
+  keepAlive: { url: `${BASE}/search/?q1=the` },
   // TV-only site, no other content exists to advertise.
   categories: [CATEGORIES.TV],
   search,
