@@ -341,7 +341,7 @@ async function warmProvider(provider: Provider, statusTracker: ProviderStatusTra
   if (!ka) return;
   const started = Date.now();
   try {
-    await fetchCfProtectedPage(ka.url, ka.proxy ? { proxy: ka.proxy } : {});
+    await fetchCfProtectedPage(ka.url);
     statusTracker.recordCheck(provider.id, true);
     console.error(`[keepalive] ${provider.id} ok (${Date.now() - started}ms)`);
   } catch (err) {

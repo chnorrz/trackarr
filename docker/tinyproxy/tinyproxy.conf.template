@@ -1,11 +1,19 @@
 # tinyproxy config for the docker-compose sidecar (see docker-compose.yml).
 #
 # Why this exists: some trackers (1337x) ban an IPv4 address while leaving
-# IPv6 clean. Tunnelling that provider's traffic through here sends it out
-# over the host's IPv6 instead. CONNECT only pipes bytes, so TLS stays
-# end-to-end between the browser and the tracker - the browser's TLS
-# fingerprint is unchanged, only the egress address differs. See
-# NOTES.md section 4 for the full diagnosis and reasoning.
+# IPv6 clean. Tunnelling that domain's traffic through here sends it out
+# over the container's own IPv6 instead. This container only ever sees the
+# domain(s) trackarr's own DOMAIN_OVER_PROXY names - trackarr decides
+# per-request, via a PAC script driving Firefox's own network.proxy.* prefs,
+# which requests actually reach this proxy at all; everything else (e.g. a
+# proxied page's other embedded domains, which can be IPv4-only) is routed
+# direct by trackarr itself before it would ever reach here. See
+# lib/browser.ts's DOMAIN_OVER_PROXY/buildPacDataUri and NOTES.md section 4
+# for the full diagnosis and reasoning behind why that split matters.
+#
+# CONNECT only pipes bytes, so TLS stays end-to-end between the browser and
+# the tracker - the browser's TLS fingerprint is unchanged, only the egress
+# address differs.
 #
 # Unlike tools/tinyproxy.conf (which Allow-lists a whole /12 for a
 # macOS+Colima host setup), this only needs to trust one container on one
