@@ -456,15 +456,35 @@ async function navigateAndClear(page: Page, url: string, timeoutMs: number): Pro
 // ext.to relies on).
 const persistentPages = new Map<string, { page: Page; usingProxy: boolean }>();
 
+// In-flight page-creation promise per hostname, so two concurrent first
+// callers for the same new hostname (e.g. a real request racing the
+// keepalive tick - observed live) await the same newPage() instead of each
+// creating their own tab, with only one ever making it into
+// persistentPages and the other silently leaked (never closed, never
+// referenced again). Mirrors getPersistentContext()'s own
+// persistentContextPromise fix for the same race one level up (browser/
+// context instead of page).
+const persistentPagePromises = new Map<string, Promise<{ page: Page; usingProxy: boolean }>>();
+
 async function getOrCreatePersistentPage(hostname: string): Promise<{ page: Page; usingProxy: boolean }> {
   const existing = persistentPages.get(hostname);
   if (existing && !existing.page.isClosed()) return existing;
 
-  const context = await getPersistentContext();
-  const page = await context.newPage();
-  const entry = { page, usingProxy: domainUsesProxy(hostname) };
-  persistentPages.set(hostname, entry);
-  return entry;
+  let promise = persistentPagePromises.get(hostname);
+  if (!promise) {
+    promise = (async () => {
+      const context = await getPersistentContext();
+      const page = await context.newPage();
+      const entry = { page, usingProxy: domainUsesProxy(hostname) };
+      persistentPages.set(hostname, entry);
+      return entry;
+    })().catch((err) => {
+      persistentPagePromises.delete(hostname);
+      throw err;
+    });
+    persistentPagePromises.set(hostname, promise);
+  }
+  return promise;
 }
 
 // Tries to fetch `url` through an already-cleared persistent page's own
@@ -575,6 +595,7 @@ export async function fetchCfProtectedPage(url: string, opts: FetchOptions = {})
 
 export async function closeBrowser(): Promise<void> {
   persistentPages.clear();
+  persistentPagePromises.clear();
   if (sharedBrowser) await sharedBrowser.close();
   sharedBrowser = null;
   sharedContext = null;
