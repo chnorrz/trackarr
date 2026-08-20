@@ -13,7 +13,7 @@ const ROOT = path.resolve(__dirname, '..', '..');
 process.env.DATA_DIR = await import('node:fs/promises').then((fs) => fs.mkdtemp(path.join(os.tmpdir(), 'trackarr-browser-test-')));
 
 // Fake Playwright Page - only isClosed()/evaluate()/url() are exercised by
-// fetchCfProtectedPage()'s fast path (tryFetch), which is all this test
+// cfFetch()'s fast path (tryFetch), which is all this test
 // needs: a non-challenge response short-circuits before lib/challenge.ts
 // would be reached at all (that module has its own tests in
 // challenge.test.ts). goto() is still called once first (the about:blank
@@ -58,19 +58,19 @@ mock.module('camoufox-js', {
   }
 });
 
-const { fetchCfProtectedPage } = await import(path.join(ROOT, 'dist', 'lib', 'browser.js'));
+const { cfFetch } = await import(path.join(ROOT, 'dist', 'lib', 'browser.js'));
 
-test('concurrent fetchCfProtectedPage calls for the same new hostname only create one page', async () => {
+test('concurrent cfFetch calls for the same new hostname only create one page', async () => {
   newPageCalls = 0;
   newContextCalls = 0;
   camoufoxCalls = 0;
 
-  // Different paths on the same hostname - different fetchCfProtectedPage
+  // Different paths on the same hostname - different cfFetch
   // cache keys, so both calls actually reach getOrCreatePersistentPage()
   // instead of one being served straight from the response cache.
   const [a, b] = await Promise.all([
-    fetchCfProtectedPage('https://race-test.example/one'),
-    fetchCfProtectedPage('https://race-test.example/two')
+    cfFetch('https://race-test.example/one'),
+    cfFetch('https://race-test.example/two')
   ]);
 
   assert.equal(a, '<html><body>cleared, not a challenge</body></html>');

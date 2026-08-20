@@ -18,17 +18,17 @@ const DETAIL_HTML = fs.readFileSync(path.join(ROOT, 'test', 'fixtures', '1337x-d
 // below, not the real one it stands in for.
 //
 // 1337x.ts no longer imports gotoCleared at all - fetchListingPage()
-// (search/browse) and resolveMagnet() both go through fetchCfProtectedPage()
+// (search/browse) and resolveMagnet() both go through cfFetch()
 // now, which returns plain HTML text rather than a live Page (neither needs
 // one - resolveMagnet is a pure read, no POST like ext.to's).
-const fetchCfProtectedPage = mock.fn<(url: string, opts?: FetchOptions) => Promise<string>>(async () => '');
+const cfFetch = mock.fn<(url: string, opts?: FetchOptions) => Promise<string>>(async () => '');
 mock.module(path.join(ROOT, 'dist', 'lib', 'browser.js'), {
-  exports: { fetchCfProtectedPage }
+  exports: { cfFetch }
 });
 const { default: provider } = await import(path.join(ROOT, 'dist', 'providers', '1337x.js'));
 
 test('1337x search() parses real row markup into SearchItem[]', async () => {
-  fetchCfProtectedPage.mock.mockImplementation(async () => SEARCH_HTML);
+  cfFetch.mock.mockImplementation(async () => SEARCH_HTML);
 
   const { items } = await provider.search('anything', { offset: 0, limit: 50 });
 
@@ -49,7 +49,7 @@ test('1337x search() parses real row markup into SearchItem[]', async () => {
 
 test('1337x search() skips rows with no href (malformed row)', async () => {
   const html = '<table class="table-list"><tbody><tr><td class="coll-1 name"><a class="icon"><i class="flaticon-hd"></i></a></td></tr></tbody></table>';
-  fetchCfProtectedPage.mock.mockImplementation(async () => html);
+  cfFetch.mock.mockImplementation(async () => html);
 
   const { items } = await provider.search('anything', { offset: 0, limit: 50 });
   assert.deepEqual(items, []);
@@ -68,7 +68,7 @@ test('1337x search() categorizes an unrecognized sub id as Other, not by icon cl
     <td class="coll-4 size mob-user">1.0 GB<span class="seeds">1</span></td>
     <td class="coll-5 user"><a href="/user/fakeuploader/">fakeuploader</a></td>
   </tr></tbody></table>`;
-  fetchCfProtectedPage.mock.mockImplementation(async () => html);
+  cfFetch.mock.mockImplementation(async () => html);
 
   const { items } = await provider.search('anything', { offset: 0, limit: 50 });
   assert.equal(items.length, 1);
@@ -76,7 +76,7 @@ test('1337x search() categorizes an unrecognized sub id as Other, not by icon cl
 });
 
 test('1337x search() filters real keyword-search results by requested categories', async () => {
-  fetchCfProtectedPage.mock.mockImplementation(async () => SEARCH_HTML);
+  cfFetch.mock.mockImplementation(async () => SEARCH_HTML);
 
   const { items, total } = await provider.search('anything', { categories: [2000], offset: 0, limit: 50 });
   assert.equal(items.length, 2); // fixture has two Movies rows
@@ -85,13 +85,13 @@ test('1337x search() filters real keyword-search results by requested categories
 });
 
 test('1337x blank query with no categories fetches a fixed Movies/TV/Music/Other page-1 snapshot', async () => {
-  fetchCfProtectedPage.mock.mockImplementation(async () => SEARCH_HTML);
-  fetchCfProtectedPage.mock.resetCalls();
+  cfFetch.mock.mockImplementation(async () => SEARCH_HTML);
+  cfFetch.mock.resetCalls();
 
   const { items } = await provider.search('', { offset: 0, limit: 50 });
   assert.equal(items.length, 16); // 4 categories x 4 fixture items each
 
-  const urls = fetchCfProtectedPage.mock.calls.map((c) => c.arguments[0]);
+  const urls = cfFetch.mock.calls.map((c) => c.arguments[0]);
   assert.deepEqual(urls, [
     'https://1337x.to/cat/Movies/1/',
     'https://1337x.to/cat/TV/1/',
@@ -106,14 +106,14 @@ test('1337x blank query with an unsupported/unknown category returns empty', asy
 });
 
 test('1337x blank query with several categories merges their browse listings', async () => {
-  fetchCfProtectedPage.mock.mockImplementation(async () => SEARCH_HTML);
+  cfFetch.mock.mockImplementation(async () => SEARCH_HTML);
 
   const { items } = await provider.search('', { categories: [2000, 5000], offset: 0, limit: 50 });
   assert.equal(items.length, 8); // 2 sources x 4 fixture items each
 });
 
 test('1337x resolveMagnet() extracts the real magnet href from a detail page', async () => {
-  fetchCfProtectedPage.mock.mockImplementation(async () => DETAIL_HTML);
+  cfFetch.mock.mockImplementation(async () => DETAIL_HTML);
 
   const magnet = await provider.resolveMagnet({ id: null, url: 'https://1337x.to/torrent/10000001/whatever/' });
   assert.ok(magnet.startsWith('magnet:?xt=urn:btih:0000000000000000000000000000000000bbb1'));
@@ -124,7 +124,7 @@ test('1337x resolveMagnet() throws without a url', async () => {
 });
 
 test('1337x resolveMagnet() throws when the page has no magnet link', async () => {
-  fetchCfProtectedPage.mock.mockImplementation(async () => '<html><body>no magnet here</body></html>');
+  cfFetch.mock.mockImplementation(async () => '<html><body>no magnet here</body></html>');
 
   await assert.rejects(
     () => provider.resolveMagnet({ id: null, url: 'https://1337x.to/torrent/1/x/' }),

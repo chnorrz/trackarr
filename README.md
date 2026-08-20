@@ -234,7 +234,7 @@ export default {
 ```
 
 Register it in `providers/index.ts`. It gets `/<id>/api` and `/<id>/download`
-automatically. Use `fetchCfProtectedPage(url, opts?)` from `lib/browser.ts`
+automatically. Use `cfFetch(url, opts?)` from `lib/browser.ts`
 to fetch pages - same shape as `fetch()` (`method`/`headers`/`body`) except
 it resolves the body text directly, and it handles Cloudflare, caching and
 proxy routing for you.

@@ -515,7 +515,7 @@ Lives in `lib/challenge.ts` (detection markers + the XTEST solve loop);
 `lib/browser.ts` owns the session and calls into it when a fetch comes back
 challenged.
 
-This is the fragile heart of the project. Three non-obvious requirements,
+This is the fragile heart of the project. Four non-obvious requirements,
 all found empirically:
 
 **1. Input must be injected at the X server level (XTEST / `xdotool`).**
@@ -535,13 +535,33 @@ screenY = window.mozInnerScreenY + rect.y     // typically 57
 
 Getting this wrong clicks ~57px above the checkbox and silently does
 nothing. Coordinates are computed dynamically and vary per launch (observed
-`214,395`, `317,395`, `534,395` — all correct). **Varying coordinates are not
-a bug; do not "fix" this by pinning the viewport.**
+`214,395`, `317,395`, `374,395`, `534,395` — all correct). **Varying
+coordinates are not a bug; do not "fix" this by pinning the viewport.**
+
+`mozInnerScreenX`/`Y` are Firefox-only and absent from `lib.dom.d.ts` (which
+models a Chromium-shaped `Window`), so the `page.evaluate()` callback needs
+a local interface and an `as unknown as` cast to reach them. They are
+genuinely present at runtime - the callback only ever runs inside Firefox.
 
 **3. The display must have a real size.**
 Camoufox's built-in `headless: 'virtual'` uses a **1x1** Xvfb screen —
 nowhere to render or click. Run our own `Xvfb :99 -screen 0 1280x900x24` and
 launch with `headless: false`.
+
+**4. Coordinates handed to `xdotool` must never be negative.**
+`xdotool`'s own argument parser reads a leading `-` as the start of an
+option, not as a negative number: `mousemove -38 100` fails with
+`unrecognized option '-38'` instead of moving anywhere. Because `xdo()`
+swallows failures (see section 14) this is **silent** — the mouse simply
+doesn't move and the click lands wherever it happened to be.
+
+Live-hit via the click-approach offsets, which step in from as far as
+`-150,-80` before landing on the checkbox: any widget rendered near the top
+or left edge pushes `cx+dx`/`cy+dy` below zero. Every `mousemove` therefore
+clamps with `Math.max(0, …)`. Clamping rather than an escaping trick (e.g.
+`--` end-of-options) is deliberate: there is no meaningful off-screen
+position on a single-screen Xvfb display, so 0 is both a safe substitute and
+never ambiguous with a flag.
 
 ### Locating the widget
 
@@ -624,14 +644,14 @@ The fix is to not navigate at all: the poll loop above just keeps checking
 `page.content()` until the challenge markers are gone (with a
 `POLL_INTERVAL_MS`-apart double-check, since a page caught mid-redirect can
 transiently read as cleared), then returns without touching navigation.
-Whatever page Cloudflare's own redirect lands on, `fetchCfProtectedPage`'s
+Whatever page Cloudflare's own redirect lands on, `cfFetch`'s
 own `tryFetch()` picks it up from there - the same fetch that already runs
 after every fast-path failure regardless.
 
 ### Concurrent navigations hang - `page.goto` needs serializing too
 
 Multi-category requests (`fetchMergedBrowse`, 1337x's no-cat 4-category
-snapshot - see section 11) fire several `fetchCfProtectedPage()` calls at
+snapshot - see section 11) fire several `cfFetch()` calls at
 once via `Promise.all`. Live-tested against 1337x through the proxy: a
 single concurrent navigation works fine, 2+ concurrent navigations to the
 same Cloudflare-protected host reliably hang until the 60 s `page.goto`
@@ -653,7 +673,7 @@ Fix: `serializeNav()` - a second promise-chain mutex, mirroring
 `serializeSolve`'s existing pattern. Now that the solve path no longer
 navigates at all (see above), `serializeNav` wraps the one navigation that's
 left - the cheap `about:blank` origin-establishing pre-nav in
-`fetchCfProtectedPage` - while `serializeSolve` wraps the whole
+`cfFetch` - while `serializeSolve` wraps the whole
 `solveChallenge()` poll loop (XTEST input is global to the X display, so two
 solves running at once still fight over the same virtual mouse). Plus:
 `getPersistentContext()` now caches the **in-flight launch promise**, not
@@ -755,8 +775,8 @@ solver regression was localised to our code rather than the environment:
 ```bash
 docker exec -e DISPLAY=:99 ext-dbg node -e "
   (async () => {
-    const { fetchCfProtectedPage, closeBrowser } = await import('/app/lib/browser.js');
-    try { const html = await fetchCfProtectedPage('https://ext.to/browse/?q=yify');
+    const { cfFetch, closeBrowser } = await import('/app/lib/browser.js');
+    try { const html = await cfFetch('https://ext.to/browse/?q=yify');
           console.log('CLEARED', html.length); }
     catch (e) { console.log('FAILED', e.message); }
     await closeBrowser(); process.exit(0);
@@ -826,7 +846,7 @@ A solve costs ~20 s. Landing that inside a Prowlarr search risks the search
 timing out, so a background task periodically visits each provider's
 `keepAlive.url` to keep its clearance warm.
 
-It **checks rather than solves**: calls the same `fetchCfProtectedPage()`
+It **checks rather than solves**: calls the same `cfFetch()`
 a real listing-page fetch would (see section 10 for the full design) -
 solving only happens when actually challenged, so a visit with a valid
 cookie/session is cheap. This doubles as warming the provider's persistent
@@ -851,7 +871,7 @@ request path, lower it.
 
 ---
 
-## 10. Caching: `fetchCfProtectedPage()` instead of a top-level result cache
+## 10. Caching: `cfFetch()` instead of a top-level result cache
 
 `server.ts` used to cache whole `SearchResult`s, keyed on
 `provider:q:sortedCat:offset:limit`. That's gone. Pagination made it a bad
@@ -868,7 +888,7 @@ re-scraped the *entire* site on every single offset call, no reuse at all.
 ### The fix: cache each fetch itself, not the assembled result, via one general function
 
 `gotoCleared()` is **gone entirely** - `lib/browser.ts` now exports a
-single function, `fetchCfProtectedPage(url, opts?)`, that every provider
+single function, `cfFetch(url, opts?)`, that every provider
 uses for everything: listing/search pages, magnet resolution, even POST
 endpoints (ext.to's HMAC magnet lookup, EZTV's wlinks-reveal). `opts`
 extends the standard `RequestInit` (`method`/`headers`/`body`, same shape
@@ -948,13 +968,13 @@ cookies are enough), EZTV's reveal POST apparently needs the page to have
 actually navigated to `/search/` itself first - a referer/session-context
 check, not just a cookie check.
 
-Fixed by restoring an explicit `await fetchCfProtectedPage(searchUrl)` (a
+Fixed by restoring an explicit `await cfFetch(searchUrl)` (a
 plain GET, result discarded - only its side effect of putting the page on
 the right path matters) immediately before the reveal POST. This also
 means the POST's own recovery path (if it ever fires) reloads `searchUrl`
 too, since that's now genuinely where the page was left.
 
-`browseLatest()` still doesn't go through `fetchCfProtectedPage()` at all -
+`browseLatest()` still doesn't go through `cfFetch()` at all -
 EZTV's JSON API isn't Cloudflare-protected to begin with, so a plain
 server-side `fetch()` is fine and cheaper. Both `searchByKeyword()` and
 `browseLatest()` keep their own small local caches on top
@@ -1165,12 +1185,12 @@ on the same `test` job (`needs: test`), so a broken suite can't ship.
 **No browser, no Docker, no network needed to run the suite at all** -
 verified decisively by running `CAMOUFOX_INSTALL_DIR=/tmp/nonexistent npm
 test` and getting all tests passing anyway. The mock boundary is
-`lib/browser.ts`'s `fetchCfProtectedPage()` - provider tests never import
+`lib/browser.ts`'s `cfFetch()` - provider tests never import
 camoufox-js for real.
 
 ### Mock boundary
 
-- **Providers**: mock `fetchCfProtectedPage` (via `node:test`'s
+- **Providers**: mock `cfFetch` (via `node:test`'s
   `mock.module()`), assert against hand-built fixtures in `test/fixtures/`.
 - **`lib/challenge.ts`**: no mocking needed at all - it imports only
   `child_process` and a playwright-core *type*, so `challenge.test.ts`
@@ -1257,7 +1277,7 @@ phantom passing test.
 ### Adding tests for a new provider
 
 1. Build a fixture in `test/fixtures/` with fake content, real selectors.
-2. Mock `fetchCfProtectedPage` once at the top of
+2. Mock `cfFetch` once at the top of
    `test/providers/<id>.test.ts` (copy the pattern from `1337x.test.ts` or
    `ext-to.test.ts`).
 3. Cover at minimum: a successful `search()` parse (title/size/category/etc),
@@ -1284,7 +1304,7 @@ looking wrong.
 
 **EZTV's blank-query browse bypasses the browser entirely.** It calls
 `https://eztvx.to/api/get-torrents` with a plain `fetch()`, not
-`fetchCfProtectedPage()`. If that endpoint ever gets put behind Cloudflare,
+`cfFetch()`. If that endpoint ever gets put behind Cloudflare,
 browsing breaks (keyword search via the scrape flow would be unaffected).
 
 **`xdo()` swallows errors.** Not currently causing problems, but if the

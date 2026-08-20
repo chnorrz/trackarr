@@ -1,5 +1,5 @@
 import * as cheerio from 'cheerio';
-import { fetchCfProtectedPage } from '../lib/browser.js';
+import { cfFetch } from '../lib/browser.js';
 import { CATEGORIES } from '../lib/categories.js';
 import { TTLCache } from '../lib/cache.js';
 import { parseSize } from '../lib/parse.js';
@@ -11,10 +11,10 @@ const BASE = 'https://eztvx.to';
 // Prowlarr's pagination - see server.ts.
 const DEPTH_CAP = 200;
 
-// browseLatest() below still doesn't go through fetchCfProtectedPage() -
+// browseLatest() below still doesn't go through cfFetch() -
 // EZTV's JSON API isn't Cloudflare-protected to begin with (a plain
 // server-side fetch() is fine and cheaper than a browser page), so it gets
-// its own small cache instead, same TTL/env var as fetchCfProtectedPage's
+// its own small cache instead, same TTL/env var as cfFetch's
 // for consistency.
 const CACHE_TTL_MS = Number(process.env.CACHE_TTL_MS) || 5 * 60 * 1000;
 
@@ -112,7 +112,7 @@ async function searchByKeyword(q: string): Promise<SearchItem[]> {
   // The reveal POST (see comment above search()) does return the FULL
   // page with magnet links unlocked, not just a fragment, when the page's
   // session already has real prior context from visiting /search/ itself.
-  // But fetchCfProtectedPage()'s generic recovery path (used whenever the
+  // But cfFetch()'s generic recovery path (used whenever the
   // fast path fails) reloads wherever the page is CURRENTLY sitting, which
   // - without this GET - can be some unrelated page (e.g. keepAlive's
   // homepage visit), and the reveal POST then fails outright even after
@@ -120,9 +120,9 @@ async function searchByKeyword(q: string): Promise<SearchItem[]> {
   // /search/ context before the POST ever runs, whether via this call's
   // own fast path or its own recovery. Result discarded on purpose - only
   // its side effect (a correctly-primed page) matters here.
-  await fetchCfProtectedPage(searchUrl);
+  await cfFetch(searchUrl);
 
-  const html = await fetchCfProtectedPage(searchUrl, {
+  const html = await cfFetch(searchUrl, {
     method: 'POST',
     headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
     body: new URLSearchParams({ layout: 'def_wlinks' }).toString()
@@ -165,7 +165,7 @@ function slugify(title: string): string {
 // EZTV's JSON API (https://eztvx.to/api/get-torrents) supports pagination
 // but no free-text search, so it's only usable for the blank-query "latest"
 // path (see searchByKeyword() above for real queries). Fetched with a plain
-// server-side fetch rather than fetchCfProtectedPage()/the browser - this endpoint
+// server-side fetch rather than cfFetch()/the browser - this endpoint
 // isn't behind the site's Cloudflare challenge (same as the homepage - only
 // /search/ is protected), and a plain fetch is much cheaper than spinning
 // up a browser page for it. If that ever changes and this endpoint gets
@@ -256,7 +256,7 @@ async function resolveMagnet({ url }: MagnetRef): Promise<string> {
 
   // Fallback: magnet is also embedded directly on the episode detail page -
   // no AJAX/HMAC dance, same as 1337x. Pure read, no live page needed.
-  const html = await fetchCfProtectedPage(url);
+  const html = await cfFetch(url);
   const $ = cheerio.load(html);
   const magnet = $('a[href^="magnet:"]').first().attr('href');
   if (!magnet) throw new Error('Could not find a magnet link on the episode page.');

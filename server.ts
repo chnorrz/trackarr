@@ -18,7 +18,7 @@
  */
 
 import express, { type Application, type Request, type Response } from 'express';
-import { closeBrowser, fetchCfProtectedPage } from './lib/browser.js';
+import { closeBrowser, cfFetch } from './lib/browser.js';
 import { categoriesXml } from './lib/categories.js';
 import { TTLCache } from './lib/cache.js';
 import { ProviderStatusTracker, renderStatusPage } from './lib/status.js';
@@ -44,7 +44,7 @@ const KEEPALIVE_INTERVAL_MS = process.env.KEEPALIVE_INTERVAL_MS === undefined
 // good while - avoids hitting the tracker again if Prowlarr re-grabs/retries.
 // (Search results used to have their own cache here too - removed in favor
 // of caching each underlying page fetch itself, right where it happens, in
-// lib/browser.ts's fetchCfProtectedPage(). See NOTES.md.)
+// lib/browser.ts's cfFetch(). See NOTES.md.)
 const MAGNET_CACHE_TTL_MS = Number(process.env.MAGNET_CACHE_TTL_MS) || 60 * 60 * 1000;
 
 // Advertised in caps' <limits> and enforced on every search - Torznab: "the
@@ -138,7 +138,7 @@ export function createApp(providers: Record<string, Provider>, opts: AppOptions 
   //
   // No cache here any more - every search calls provider.search() fresh.
   // That's fine: the expensive part (network/scrape fetches) is cached
-  // right where it happens, in lib/browser.ts's fetchCfProtectedPage(),
+  // right where it happens, in lib/browser.ts's cfFetch(),
   // keyed by the underlying site page's URL rather than by this request's
   // exact q/cat/offset/limit - so a request for a different offset of the
   // same query reuses already-fetched pages instead of missing entirely.
@@ -332,7 +332,7 @@ ${rows}
 }
 
 // Visits a provider's keep-alive URL so its clearance cookie stays fresh.
-// Goes through fetchCfProtectedPage() - same fast-fetch/slow-navigate-
+// Goes through cfFetch() - same fast-fetch/slow-navigate-
 // recover path a real request would use - so this both warms the
 // per-provider persistent page and only pays for a real solve when
 // actually challenged, same as before.
@@ -341,7 +341,7 @@ async function warmProvider(provider: Provider, statusTracker: ProviderStatusTra
   if (!ka) return;
   const started = Date.now();
   try {
-    await fetchCfProtectedPage(ka.url);
+    await cfFetch(ka.url);
     statusTracker.recordCheck(provider.id, true);
     console.error(`[keepalive] ${provider.id} ok (${Date.now() - started}ms)`);
   } catch (err) {
