@@ -14,10 +14,11 @@ process.env.DATA_DIR = await import('node:fs/promises').then((fs) => fs.mkdtemp(
 
 // Fake Playwright Page - only isClosed()/evaluate()/url() are exercised by
 // fetchCfProtectedPage()'s fast path (tryFetch), which is all this test
-// needs: a non-challenge response short-circuits before any real
-// solve machinery would be touched. goto() is still called once first (the
-// about:blank origin-establishing pre-nav) and must exist, even though
-// nothing here asserts on it.
+// needs: a non-challenge response short-circuits before lib/challenge.ts
+// would be reached at all (that module has its own tests in
+// challenge.test.ts). goto() is still called once first (the about:blank
+// origin-establishing pre-nav) and must exist, even though nothing here
+// asserts on it.
 const fakePage = {
   isClosed: () => false,
   evaluate: async () => '<html><body>cleared, not a challenge</body></html>',
