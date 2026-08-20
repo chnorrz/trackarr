@@ -559,6 +559,30 @@ full click cooldown (`CLICK_COOLDOWN_MS`, 4s). Only the overall solve budget
 Turnstile solver's approach (byparr, github.com/ThePhaseless/Byparr) rather
 than a fixed click-count loop.
 
+Every wait inside a solve goes through `wanderFor()`, which keeps the mouse
+moving at 100ms cadence rather than sleeping idle - so movement is
+continuous for the whole solve, not just during the warm-up burst.
+
+**The warm-up looks like dead weight and isn't - measured.** It delays the
+first widget check by ~3s, so dropping it in favour of the loop's own
+movement is an obvious-looking win. Tested properly: 18 runs, 3 per arm per
+provider, arms alternated to control for Cloudflare bot-score drift, one
+fresh container per run (a solved session lasts 15-30 min, so reusing a
+container skips the solve entirely and measures nothing).
+
+| Arm | Median clear | 1-click solves |
+|---|---|---|
+| warm-up (30 moves) | 7.5 s | **7 of 9** |
+| no warm-up | 9.0 s | 2 of 9 |
+
+Zero failures in either arm, so this isn't a reliability argument - it's the
+click count. Without the warm-up the first click usually doesn't take, and
+waiting out a 4s `CLICK_COOLDOWN_MS` for a second one costs more than the 3s
+saved. Per-provider medians split (EZTV was faster without it, ext.to and
+1337x slower), but the click-count inversion held across all three, which is
+the more mechanistic signal. Consistent with the XTEST finding above:
+movement before the click is what makes the click count.
+
 This replaced an earlier design with three separate nested timing loops (a
 fixed warm-up, then a bounded widget-search retry, then a fixed
 `MAX_CLICKS`/`CLICK_INTERVAL_MS` click loop) - collapsing them into one poll

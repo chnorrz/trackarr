@@ -259,13 +259,33 @@ const POLL_INTERVAL_MS = 250;
 const PROBE_INTERVAL_MS = 500;
 const CLICK_COOLDOWN_MS = 4000;
 const SOLVE_BUDGET_MS = 45000;
+const WANDER_INTERVAL_MS = 100;
+// Moves before the first widget check. Measured, don't drop this: an 18-run
+// A/B (3 per arm per provider, alternated) found that removing it inverts
+// the click count - with the warm-up 7 of 9 solves land on the first click,
+// without it 7 of 9 need a second. Saving 3s upfront to then wait out a 4s
+// CLICK_COOLDOWN_MS is a net loss, and the overall median got worse (7.5s ->
+// 9.0s). See NOTES.md section 6.
+const WARMUP_MOVES = 30;
+
+// Keeps the mouse moving for `ms` instead of sleeping idle - every wait
+// inside a solve goes through this, so movement stays continuous at
+// WANDER_INTERVAL_MS cadence for the whole solve rather than only during an
+// upfront warm-up burst.
+async function wanderFor(pointer: Pointer, ms: number): Promise<void> {
+  const end = Date.now() + ms;
+  while (Date.now() < end) {
+    pointer.wander();
+    await new Promise((r) => setTimeout(r, Math.min(WANDER_INTERVAL_MS, end - Date.now())));
+  }
+}
 
 // Confirms the challenge is really gone and not just between navigations -
 // checks twice, POLL_INTERVAL_MS apart, since a page caught mid-redirect
 // can transiently read as cleared.
-async function challengeIsGone(page: Page): Promise<boolean> {
+async function challengeIsGone(page: Page, pointer: Pointer): Promise<boolean> {
   if (isChallenge(await safeContent(page))) return false;
-  await new Promise((r) => setTimeout(r, POLL_INTERVAL_MS));
+  await wanderFor(pointer, POLL_INTERVAL_MS);
   return !isChallenge(await safeContent(page));
 }
 
@@ -298,16 +318,13 @@ async function solveChallenge(page: Page, url: string): Promise<void> {
 
   console.error('[cf] auto-solving challenge (X-level input)...');
   const solveStart = Date.now();
-  for (let i = 0; i < 30; i++) {
-    pointer.wander();
-    await new Promise((r) => setTimeout(r, 100));
-  }
+  await wanderFor(pointer, WARMUP_MOVES * WANDER_INTERVAL_MS);
 
   const deadline = solveStart + SOLVE_BUDGET_MS;
   let nextClickAt = 0;
 
   while (Date.now() < deadline) {
-    if (await challengeIsGone(page)) {
+    if (await challengeIsGone(page, pointer)) {
       console.error(`[cf] challenge cleared after ${Date.now() - solveStart}ms.`);
       return;
     }
@@ -315,10 +332,9 @@ async function solveChallenge(page: Page, url: string): Promise<void> {
     if (Date.now() >= nextClickAt) {
       const clicked = await clickWidgetOnce(page, pointer);
       nextClickAt = Date.now() + (clicked ? CLICK_COOLDOWN_MS : PROBE_INTERVAL_MS);
-      if (!clicked) pointer.wander();
     }
 
-    await new Promise((r) => setTimeout(r, POLL_INTERVAL_MS));
+    await wanderFor(pointer, POLL_INTERVAL_MS);
   }
 
   throw new Error(`Cloudflare challenge did not clear for ${url}.`);
