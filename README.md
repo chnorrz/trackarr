@@ -179,7 +179,7 @@ All via environment variables.
 | `MAGNET_CACHE_TTL_MS` | `3600000` | Magnet cache lifetime (1 h) |
 | `KEEPALIVE_INTERVAL_MS` | `900000` | Background Cloudflare warm-up (15 min). `0` disables |
 | `PROXY_URL` | *(unset)* | Upstream proxy, see below. Unset = direct |
-| `PROXY_PROVIDERS` | *(unset)* | Comma-separated provider ids allowed to use the proxy. **Unset or empty = none** - opt-in, not opt-out |
+| `DOMAIN_OVER_PROXY` | *(unset)* | Comma-separated hostnames routed through the proxy (a listed name also matches its subdomains). **Unset or empty = none** - opt-in, not opt-out |
 
 ### Proxy (optional)
 
@@ -190,17 +190,26 @@ works. A container usually has no IPv6 of its own, so it needs to borrow the hos
 brew install tinyproxy    # or apt install tinyproxy
 tinyproxy -d -c tools/tinyproxy.conf
 
-docker run ... -e PROXY_URL=http://192.168.5.2:8888 -e PROXY_PROVIDERS=1337x ...
+docker run ... -e PROXY_URL=http://192.168.5.2:8888 -e DOMAIN_OVER_PROXY=1337x.to ...
 ```
 
-Both vars are required - `PROXY_URL` alone does nothing, since no provider is
-proxied unless it's explicitly named in `PROXY_PROVIDERS` too. Remove
-`PROXY_PROVIDERS` (or clear it) to disable the proxy for everything without
+Both vars are required - `PROXY_URL` alone does nothing, since no hostname is
+proxied unless it's explicitly named in `DOMAIN_OVER_PROXY` too. Remove
+`DOMAIN_OVER_PROXY` (or clear it) to disable the proxy for everything without
 touching `PROXY_URL`. Full diagnosis steps and the reasoning are in
 `NOTES.md` section 4.
 
-**Don't proxy a provider that already works directly** - the Cloudflare
-clearance cookie is bound to the egress IP.
+Routing is decided **per hostname, per request**, not per provider: the
+browser gets a generated PAC script, so a single page load can send the
+tracker's own requests through the proxy while everything else it embeds
+goes direct. That distinction matters - forcing an entire page through an
+IPv6-only proxy breaks any asset host that happens to be IPv4-only, which is
+exactly what Cloudflare's own challenge assets turned out to be.
+
+**Don't proxy a domain that already works directly** - the Cloudflare
+clearance cookie is bound to the egress IP. For the same reason, cookies are
+only persisted for domains *not* listed in `DOMAIN_OVER_PROXY`, so a
+proxy-obtained cookie can't clobber a direct one.
 
 ---
 
@@ -225,8 +234,10 @@ export default {
 ```
 
 Register it in `providers/index.ts`. It gets `/<id>/api` and `/<id>/download`
-automatically. Use `gotoCleared(url)` from `lib/browser.ts` to fetch pages -
-it handles Cloudflare for you.
+automatically. Use `fetchCfProtectedPage(url, opts?)` from `lib/browser.ts`
+to fetch pages - same shape as `fetch()` (`method`/`headers`/`body`) except
+it resolves the body text directly, and it handles Cloudflare, caching and
+proxy routing for you.
 
 `providers/1337x.ts` is the simpler reference (magnets sit in the HTML);
 `providers/ext-to.ts` shows the signed-API case.
@@ -243,7 +254,7 @@ npm test            # builds, then runs the test suite
 The test suite needs no browser, no Docker, and no network access - provider
 tests run against hand-built fixtures in `test/fixtures/`, and the server is
 tested via dependency injection rather than the real process. See NOTES.md
-section 10 for how the mocking works and how to add tests for a new
+section 13 for how the mocking works and how to add tests for a new
 provider.
 
 ---
