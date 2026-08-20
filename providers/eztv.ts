@@ -16,7 +16,7 @@ const DEPTH_CAP = 200;
 // server-side fetch() is fine and cheaper than a browser page), so it gets
 // its own small cache instead, same TTL/env var as fetchCfProtectedPage's
 // for consistency.
-const CACHE_TTL_MS = Number(process.env.SEARCH_CACHE_TTL_MS) || 5 * 60 * 1000;
+const CACHE_TTL_MS = Number(process.env.CACHE_TTL_MS) || 5 * 60 * 1000;
 
 // EZTV also has an official, unauthenticated JSON API
 // (https://eztvx.to/api/get-torrents) - but it only supports pagination and
