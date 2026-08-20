@@ -163,12 +163,12 @@ async function challengeIsGone(page: Page, pointer: Pointer): Promise<boolean> {
 // Turnstile solver (byparr, github.com/ThePhaseless/Byparr): treat "no
 // widget yet" as "try again shortly", never as terminal failure - only the
 // overall budget running out is failure.
-export async function solveChallenge(page: Page, url: string): Promise<void> {
+export async function solveChallenge(page: Page): Promise<void> {
   const html = await safeContent(page);
 
   if (!isChallenge(html)) {
     throw new Error(
-      `Cloudflare fetch failed for ${url} and the page shows no solvable challenge ` +
+      `Cloudflare fetch failed and the page shows no solvable challenge ` +
         `(htmlLen=${html.length}) - likely a hard block (IP ban/rate limit) or an unrelated failure.`
     );
   }
@@ -201,5 +201,5 @@ export async function solveChallenge(page: Page, url: string): Promise<void> {
     await pointer.wanderFor(POLL_INTERVAL_MS);
   }
 
-  throw new Error(`Cloudflare challenge did not clear for ${url}.`);
+  throw new Error(`Cloudflare challenge did not clear.`);
 }

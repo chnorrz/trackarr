@@ -49,7 +49,7 @@ test('solveChallenge refuses a page that shows no solvable challenge', async () 
   const page = fakePage(async () => '<html><body>a hard block, or just an unrelated failure</body></html>');
 
   await assert.rejects(
-    () => solveChallenge(page, 'https://example.test/search'),
+    () => solveChallenge(page),
     /no solvable challenge/,
     'a page with no Turnstile widget is not something clicking can fix - it must fail loudly rather than sit in the poll loop until the budget runs out'
   );
@@ -63,7 +63,7 @@ test('solveChallenge treats an unreadable page as nothing to solve', async () =>
     throw new Error('Execution context was destroyed');
   });
 
-  await assert.rejects(() => solveChallenge(page, 'https://example.test/search'), /htmlLen=0/);
+  await assert.rejects(() => solveChallenge(page), /htmlLen=0/);
 });
 
 test('an unreadable page whose url() also throws still fails cleanly', async () => {
@@ -80,7 +80,7 @@ test('an unreadable page whose url() also throws still fails cleanly', async () 
     }
   };
 
-  await assert.rejects(() => solveChallenge(page, 'https://example.test/search'), /htmlLen=0/);
+  await assert.rejects(() => solveChallenge(page), /htmlLen=0/);
 });
 
 test('solveChallenge fails clearly when there is no DISPLAY to click on', async () => {
@@ -91,7 +91,7 @@ test('solveChallenge fails clearly when there is no DISPLAY to click on', async 
     const page = fakePage(async () => '<div class="cf-turnstile"></div>');
 
     await assert.rejects(
-      () => solveChallenge(page, 'https://example.test/search'),
+      () => solveChallenge(page),
       /DISPLAY/,
       'without an X display the solver cannot inject input at all, and should say so instead of failing as a generic timeout'
     );

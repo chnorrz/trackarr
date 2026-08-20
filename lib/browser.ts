@@ -236,16 +236,6 @@ async function tryFetch(page: Page, url: string, init: RequestInit): Promise<str
 const CACHE_TTL_MS = Number(process.env.CACHE_TTL_MS) || 5 * 60 * 1000;
 const pageCache = new TTLCache<string>(CACHE_TTL_MS);
 
-// A GET navigates straight to `url`. Anything else (a POST to an AJAX
-// endpoint isn't a page you can navigate to) reuses wherever the page
-// already is, falling back to the origin root if it has no real history yet
-// (about:blank).
-function pickNavigateTarget(url: string, currentUrl: string, isGet: boolean): string {
-  if (isGet) return url;
-  if (currentUrl && currentUrl !== 'about:blank') return currentUrl;
-  return new URL(url).origin + '/';
-}
-
 // General-purpose Cloudflare-aware fetch, cached. Fast path: fetch() through
 // the hostname's already-cleared persistent page - skips a full navigation
 // when the session's still good. Slow path (challenged/blocked/failed):
@@ -264,7 +254,6 @@ export async function cfFetch(url: string, opts: FetchOptions = {}): Promise<str
   if (cached !== undefined) return cached;
 
   const { page, usingProxy } = await getOrCreatePersistentPage(new URL(url).hostname);
-  const navigateTarget = pickNavigateTarget(url, page.url(), isGet);
 
   // A brand-new page starts at about:blank, where fetch()'s same-origin
   // credential/CORS rules mean tryFetch() below is guaranteed to fail no
@@ -274,8 +263,11 @@ export async function cfFetch(url: string, opts: FetchOptions = {}): Promise<str
   // first, so tryFetch has an actual chance to succeed. On every call after
   // that first one, the page is already on the right origin and this is a
   // no-op.
+  let firstNav = false;
+
   if (page.url() === 'about:blank') {
-    await serializeNav(() => page.goto(navigateTarget, { waitUntil: 'domcontentloaded', timeout: 60000 })).catch(() => {});
+    await serializeNav(() => page.goto(url, { waitUntil: 'domcontentloaded', timeout: 15000 })).catch(() => {});
+    firstNav = true;
   }
 
   const fast = await tryFetch(page, url, init);
@@ -289,8 +281,20 @@ export async function cfFetch(url: string, opts: FetchOptions = {}): Promise<str
   // the solve mutex, so we wait on our own time rather than holding the mutex
   // while the page loads. Errors ignored: there may be no navigation in
   // flight at all, which is not a problem.
-  await page.waitForLoadState('load', { timeout: 60000 }).catch(() => {});
-  await serializeSolve(() => solveChallenge(page, navigateTarget));
+  if (!firstNav) {
+    await serializeNav(() => page.goto(url, { waitUntil: 'load', timeout: 60000 })).catch(() => {});
+  } else {
+    await page.waitForLoadState('load', { timeout: 60000 }).catch(() => {});
+  }
+
+  await serializeSolve(async () => { 
+    try {
+      return await solveChallenge(page);
+    } catch (err) {
+      console.error(`[cf] solveChallenge failed for ${url}: ${err}`);
+      throw err;
+    }
+  });
   if (!usingProxy) saveCookies(await page.context().cookies());
 
   const retried = await tryFetch(page, url, init);
