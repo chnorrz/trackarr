@@ -536,56 +536,92 @@ launch with `headless: false`.
 ### Locating the widget
 
 Container ids are randomised per page load (`#mZiFs3` etc.) — never hardcode
-them. Anchor on the stable hidden input and walk up:
+them. Query broadly instead:
 
 ```js
-const input = document.querySelector('input[name="cf-turnstile-response"]');
-let el = input;
-while (el && el.getBoundingClientRect().height < 30) el = el.parentElement;
+document.querySelector('[id^=cf-chl-widget], .cf-turnstile, #mZiFs3')
 // checkbox ≈ left edge + 22px, vertically centred
 ```
 
 The widget is in a **closed shadow DOM**. `document.querySelectorAll('iframe')`
 returns `[]` — you cannot get iframe geometry.
 
-### Ordering
+### Ordering: poll, don't wait-then-navigate
 
-Working sequence: load → short settle → read geometry → mouse warm-up →
-approach → click. The warm-up (~30 moves) is what unsticks "Verifying...".
+Working sequence: load → check for a challenge → mouse warm-up (~30 moves,
+this is what unsticks "Verifying...") → then a tight poll loop, once per
+`POLL_INTERVAL_MS` (250ms): is the challenge already gone? If not, and enough
+time has passed since the last click attempt, look for the widget and click
+it if found. "Widget not found yet" is **not** a failure - it just means
+probe again sooner (`PROBE_INTERVAL_MS`, 500ms) instead of waiting out the
+full click cooldown (`CLICK_COOLDOWN_MS`, 4s). Only the overall solve budget
+(`SOLVE_BUDGET_MS`, 45s) running out is failure. This mirrors another
+Turnstile solver's approach (byparr, github.com/ThePhaseless/Byparr) rather
+than a fixed click-count loop.
 
-### After the solve: wait for the redirect
+This replaced an earlier design with three separate nested timing loops (a
+fixed warm-up, then a bounded widget-search retry, then a fixed
+`MAX_CLICKS`/`CLICK_INTERVAL_MS` click loop) - collapsing them into one poll
+loop fixed a real bug: the old design did its widget lookup exactly once,
+right after the warm-up, and returned failure immediately if the challenge
+happened to clear *passively* during that window (no widget to click,
+because there was no longer a challenge) - live-observed on EZTV, twice.
+Checking "is the challenge gone" first, every iteration, instead of only
+inferring it from a successful click, fixes that: a passive clear during the
+warm-up now resolves instantly rather than reporting a false failure.
 
-Clearing the challenge only means the interstitial is gone. Cloudflare *then*
-client-side redirects to the URL you originally asked for. Returning as soon
-as the challenge markers disappear hands the caller a near-empty page.
+### After the solve: don't navigate, just wait
 
-Symptom: **HTTP 200 with 0 results on the first request after a cold-start
-solve, and correct results on the second.** It looks like a broken parser or
-a stale cache, and it isn't either. `gotoCleared` now waits for
-`networkidle` after a solve and re-reads the content.
+Clearing the challenge only means the interstitial is gone. Cloudflare
+*separately* client-side redirects the current page to the URL originally
+asked for - a real, in-flight navigation that already exists.
+
+An earlier version tried to speed this up by discarding that and issuing its
+own `page.goto(url)` reload immediately after a successful solve, on the
+reasoning that `cf_clearance` is already set by the time the solve completes
+(confirmed true via a live cookie check) so a fresh request should be safe.
+**This was wrong in practice**: that `goto()` can race Cloudflare's own
+already-in-flight redirect and hang for the full 60s `page.goto` timeout -
+the same class of bug documented below for concurrent navigations generally,
+just self-inflicted this time. Live-observed repeatedly on ext.to and 1337x
+as `TimeoutError` right after a successful-looking solve.
+
+The fix is to not navigate at all: the poll loop above just keeps checking
+`page.content()` until the challenge markers are gone (with a
+`POLL_INTERVAL_MS`-apart double-check, since a page caught mid-redirect can
+transiently read as cleared), then returns without touching navigation.
+Whatever page Cloudflare's own redirect lands on, `fetchCfProtectedPage`'s
+own `tryFetch()` picks it up from there - the same fetch that already runs
+after every fast-path failure regardless.
 
 ### Concurrent navigations hang - `page.goto` needs serializing too
 
 Multi-category requests (`fetchMergedBrowse`, 1337x's no-cat 4-category
-snapshot - see section 11) fire several `gotoCleared()` calls at once via
-`Promise.all`. Live-tested against 1337x through the proxy: a single
-concurrent navigation works fine, 2+ concurrent navigations to the same
-Cloudflare-protected host reliably hang until the 60 s `page.goto` timeout -
-reproduced deterministically. Two separate causes, both in `lib/browser.ts`:
+snapshot - see section 11) fire several `fetchCfProtectedPage()` calls at
+once via `Promise.all`. Live-tested against 1337x through the proxy: a
+single concurrent navigation works fine, 2+ concurrent navigations to the
+same Cloudflare-protected host reliably hang until the 60 s `page.goto`
+timeout - reproduced deterministically. Two separate causes, both in
+`lib/browser.ts`:
 
 1. Only the xdotool **solve** step was serialized (the pre-existing
-   `serializeSolve()`/`solveChain` promise-chain mutex). `page.goto()`
-   itself was not - concurrent navigations to the same host raced each
-   other and Cloudflare appears to treat simultaneous connections from one
-   client as suspicious and gets stuck rather than erroring cleanly.
+   `serializeSolve()` promise-chain mutex). `page.goto()` itself was not -
+   concurrent navigations to the same host raced each other and Cloudflare
+   appears to treat simultaneous connections from one client as suspicious
+   and gets stuck rather than erroring cleanly.
 2. `getPersistentContext()` was a lazy singleton with no guard against
    concurrent first calls - each could see the cache as still empty and
    launch its own Camoufox browser instance simultaneously (confirmed via
    logs: multiple `[cf] launching browser` lines for one request), starving
    the shared Xvfb display and causing `NS_ERROR_NET_TIMEOUT`.
 
-Fix: `serializeNav()` - a second promise-chain mutex wrapping the whole
-`gotoCleared` body, mirroring `serializeSolve`'s existing pattern. Plus:
+Fix: `serializeNav()` - a second promise-chain mutex, mirroring
+`serializeSolve`'s existing pattern. Now that the solve path no longer
+navigates at all (see above), `serializeNav` wraps the one navigation that's
+left - the cheap `about:blank` origin-establishing pre-nav in
+`fetchCfProtectedPage` - while `serializeSolve` wraps the whole
+`solveChallenge()` poll loop (XTEST input is global to the X display, so two
+solves running at once still fight over the same virtual mouse). Plus:
 `getPersistentContext()` now caches the **in-flight launch promise**, not
 just the resolved context, so concurrent callers await the same launch
 instead of racing (cache is cleared on launch failure so a later call can
@@ -814,7 +850,7 @@ kept in sync by every caller. Every current provider only ever talks to
 one hostname, so this partitions identically to the old id-keying while
 removing a redundant parameter.
 
-Results are cached (`TTLCache<string>`, same `SEARCH_CACHE_TTL_MS` env
+Results are cached (`TTLCache<string>`, same `CACHE_TTL_MS` env
 var/default as the old result cache, 5 min), keyed by a **hash of
 method+url+body**, not just the URL - a GET is idempotent so the URL alone
 would be a fine key, but a POST's response depends on its body too (ext.to's

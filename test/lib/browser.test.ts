@@ -12,14 +12,17 @@ const ROOT = path.resolve(__dirname, '..', '..');
 // it, but there's no reason to touch real files for a test.
 process.env.DATA_DIR = await import('node:fs/promises').then((fs) => fs.mkdtemp(path.join(os.tmpdir(), 'trackarr-browser-test-')));
 
-// Fake Playwright Page - only isClosed()/evaluate() are exercised by
+// Fake Playwright Page - only isClosed()/evaluate()/url() are exercised by
 // fetchCfProtectedPage()'s fast path (tryFetch), which is all this test
 // needs: a non-challenge response short-circuits before any real
-// navigation/solve machinery would be touched.
+// solve machinery would be touched. goto() is still called once first (the
+// about:blank origin-establishing pre-nav) and must exist, even though
+// nothing here asserts on it.
 const fakePage = {
   isClosed: () => false,
   evaluate: async () => '<html><body>cleared, not a challenge</body></html>',
-  url: () => 'about:blank'
+  url: () => 'about:blank',
+  goto: async () => {}
 };
 
 let newPageCalls = 0;

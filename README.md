@@ -175,7 +175,7 @@ All via environment variables.
 | `API_KEY` | `changeme` | Key Prowlarr must send. **Set this.** |
 | `PORT` | `9117` | HTTP port |
 | `DATA_DIR` | `/data` | Where the Cloudflare cookie is persisted |
-| `SEARCH_CACHE_TTL_MS` | `300000` | Search cache lifetime (5 min) |
+| `CACHE_TTL_MS` | `300000` | Fetch cache lifetime (5 min) |
 | `MAGNET_CACHE_TTL_MS` | `3600000` | Magnet cache lifetime (1 h) |
 | `KEEPALIVE_INTERVAL_MS` | `900000` | Background Cloudflare warm-up (15 min). `0` disables |
 | `PROXY_URL` | *(unset)* | Upstream proxy, see below. Unset = direct |
