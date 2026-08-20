@@ -14,15 +14,15 @@ const MAGNET_JSON = fs.readFileSync(path.join(ROOT, 'test', 'fixtures', 'ext-to-
 // infers the real signature instead of a zero-arg one. ext-to.ts no longer
 // imports gotoCleared at all - both fetchListingPage() (search/browse) and
 // resolveMagnet() (its GET for the token page, and its POST to the magnet
-// endpoint) go through fetchCfProtectedPage() now.
-const fetchCfProtectedPage = mock.fn<(url: string, opts?: FetchOptions) => Promise<string>>(async () => '');
+// endpoint) go through cfFetch() now.
+const cfFetch = mock.fn<(url: string, opts?: FetchOptions) => Promise<string>>(async () => '');
 mock.module(path.join(ROOT, 'dist', 'lib', 'browser.js'), {
-  exports: { fetchCfProtectedPage }
+  exports: { cfFetch }
 });
 const { default: provider } = await import(path.join(ROOT, 'dist', 'providers', 'ext-to.js'));
 
 test('ext.to search() parses real row markup into SearchItem[]', async () => {
-  fetchCfProtectedPage.mock.mockImplementation(async () => SEARCH_HTML);
+  cfFetch.mock.mockImplementation(async () => SEARCH_HTML);
 
   const { items } = await provider.search('anything', { offset: 0, limit: 50 });
 
@@ -49,7 +49,7 @@ test('ext.to search() filters the uploader link out of the category breadcrumb',
   // filter regressed, this would pick up "FakeUploader" as the category text
   // instead of "Movies", which matchCategory would then map to Other (8000)
   // rather than Movies (2000).
-  fetchCfProtectedPage.mock.mockImplementation(async () => SEARCH_HTML);
+  cfFetch.mock.mockImplementation(async () => SEARCH_HTML);
   const { items } = await provider.search('anything', { offset: 0, limit: 50 });
   assert.equal(items[0]?.category, 2000);
 });
@@ -85,7 +85,7 @@ test('ext.to search() classifies audiobooks from the subcategory href, not the l
   // *display text* ("Audio books") doesn't even contain "audiobook" as one
   // word. Matching hrefs (/books/audio-books/), not text, is what makes
   // this resolve correctly.
-  fetchCfProtectedPage.mock.mockImplementation(async () =>
+  cfFetch.mock.mockImplementation(async () =>
     categoryRowHtml(10000005, '/books/', 'Books', '/books/audio-books/', 'Audio books')
   );
   const { items } = await provider.search('anything', { offset: 0, limit: 50 });
@@ -93,7 +93,7 @@ test('ext.to search() classifies audiobooks from the subcategory href, not the l
 });
 
 test('ext.to search() classifies ebooks from the subcategory href, not just top-level "Books"', async () => {
-  fetchCfProtectedPage.mock.mockImplementation(async () =>
+  cfFetch.mock.mockImplementation(async () =>
     categoryRowHtml(10000006, '/books/', 'Books', '/books/ebooks/', 'Ebooks')
   );
   const { items } = await provider.search('anything', { offset: 0, limit: 50 });
@@ -101,13 +101,13 @@ test('ext.to search() classifies ebooks from the subcategory href, not just top-
 });
 
 test('ext.to search() classifies PC games and "other games" from the subcategory href', async () => {
-  fetchCfProtectedPage.mock.mockImplementation(async () =>
+  cfFetch.mock.mockImplementation(async () =>
     categoryRowHtml(10000007, '/games/', 'Games', '/games/pc-games/', 'PC Games')
   );
   const pcGames = await provider.search('anything', { offset: 0, limit: 50 });
   assert.equal(pcGames.items[0]?.category, 4050); // PC/Games
 
-  fetchCfProtectedPage.mock.mockImplementation(async () =>
+  cfFetch.mock.mockImplementation(async () =>
     categoryRowHtml(10000008, '/games/', 'Games', '/games/other-games/', 'Other Games')
   );
   const otherGames = await provider.search('anything', { offset: 0, limit: 50 });
@@ -118,13 +118,13 @@ test('ext.to search() classifies Mac and Android apps from the subcategory href'
   // Real top-level slug is /applications/, not /apps/ - Windows has no
   // dedicated subcategory and falls through to the generic PC (4000) rule,
   // which is covered by the main parse test's "Applications" row.
-  fetchCfProtectedPage.mock.mockImplementation(async () =>
+  cfFetch.mock.mockImplementation(async () =>
     categoryRowHtml(10000009, '/applications/', 'Applications', '/applications/mac/', 'Mac')
   );
   const mac = await provider.search('anything', { offset: 0, limit: 50 });
   assert.equal(mac.items[0]?.category, 4030); // PC/Mac
 
-  fetchCfProtectedPage.mock.mockImplementation(async () =>
+  cfFetch.mock.mockImplementation(async () =>
     categoryRowHtml(10000010, '/applications/', 'Applications', '/applications/android/', 'Android')
   );
   const android = await provider.search('anything', { offset: 0, limit: 50 });
@@ -132,7 +132,7 @@ test('ext.to search() classifies Mac and Android apps from the subcategory href'
 });
 
 test('ext.to search() filters real keyword-search results by requested categories', async () => {
-  fetchCfProtectedPage.mock.mockImplementation(async () => SEARCH_HTML);
+  cfFetch.mock.mockImplementation(async () => SEARCH_HTML);
 
   const { items, total } = await provider.search('anything', { categories: [2000], offset: 0, limit: 50 });
   assert.equal(items.length, 1);
@@ -141,11 +141,11 @@ test('ext.to search() filters real keyword-search results by requested categorie
 });
 
 test('ext.to blank query with no categories uses the general (no cat param) browse listing', async () => {
-  fetchCfProtectedPage.mock.mockImplementation(async () => SEARCH_HTML);
+  cfFetch.mock.mockImplementation(async () => SEARCH_HTML);
 
   const { items } = await provider.search('', { offset: 0, limit: 50 });
   assert.equal(items.length, 4);
-  const url = fetchCfProtectedPage.mock.calls[fetchCfProtectedPage.mock.calls.length - 1]?.arguments[0] as string;
+  const url = cfFetch.mock.calls[cfFetch.mock.calls.length - 1]?.arguments[0] as string;
   assert.doesNotMatch(url, /[?&]cat=/);
   // Without age=4, bare /browse/ renders a category-picker landing page
   // instead of a results table (0 rows, no <table> at all) - confirmed
@@ -160,7 +160,7 @@ test('ext.to blank query with an unsupported category (e.g. XXX) returns empty',
 });
 
 test('ext.to blank query with several categories merges their browse listings', async () => {
-  fetchCfProtectedPage.mock.mockImplementation(async () => SEARCH_HTML);
+  cfFetch.mock.mockImplementation(async () => SEARCH_HTML);
 
   const { items } = await provider.search('', { categories: [2000, 5000], offset: 0, limit: 50 });
   // Both category browses hit the same mocked fixture (4 items each) -
@@ -169,12 +169,12 @@ test('ext.to blank query with several categories merges their browse listings', 
   assert.equal(items.length, 8);
 });
 
-// resolveMagnet() makes two fetchCfProtectedPage() calls now: a GET for the
+// resolveMagnet() makes two cfFetch() calls now: a GET for the
 // token page (carries the fake searchPageToken + csrf-token), then a POST
 // to the magnet endpoint - distinguish them by opts.method, same as the
 // real function does.
 test('ext.to resolveMagnet() computes the HMAC and parses a real magnet response', async () => {
-  fetchCfProtectedPage.mock.mockImplementation(async (_url, opts) =>
+  cfFetch.mock.mockImplementation(async (_url, opts) =>
     opts?.method === 'POST' ? MAGNET_JSON : SEARCH_HTML
   );
 
@@ -187,19 +187,19 @@ test('ext.to resolveMagnet() throws without an id', async () => {
 });
 
 test('ext.to resolveMagnet() throws when the page has no searchPageToken', async () => {
-  fetchCfProtectedPage.mock.mockImplementation(async () => '<html><head></head><body></body></html>');
+  cfFetch.mock.mockImplementation(async () => '<html><head></head><body></body></html>');
   await assert.rejects(() => provider.resolveMagnet({ id: 1, url: null }), /searchPageToken/);
 });
 
 test('ext.to resolveMagnet() throws on a non-JSON response', async () => {
-  fetchCfProtectedPage.mock.mockImplementation(async (_url, opts) =>
+  cfFetch.mock.mockImplementation(async (_url, opts) =>
     opts?.method === 'POST' ? 'not json' : SEARCH_HTML
   );
   await assert.rejects(() => provider.resolveMagnet({ id: 10000001, url: null }), /Non-JSON response/);
 });
 
 test('ext.to resolveMagnet() throws when the API reports failure', async () => {
-  fetchCfProtectedPage.mock.mockImplementation(async (_url, opts) =>
+  cfFetch.mock.mockImplementation(async (_url, opts) =>
     opts?.method === 'POST' ? JSON.stringify({ success: false }) : SEARCH_HTML
   );
   await assert.rejects(() => provider.resolveMagnet({ id: 10000001, url: null }), /No magnet in response/);

@@ -18,7 +18,9 @@ const { isBlocked, isChallenge, solveChallenge } = await import(path.join(ROOT, 
 function fakePage(content: () => Promise<string>) {
   return {
     waitForLoadState: async () => {},
-    content
+    content,
+    // Only read when content() throws, to say which page it was.
+    url: () => 'https://example.test/search'
   };
 }
 
@@ -60,6 +62,23 @@ test('solveChallenge treats an unreadable page as nothing to solve', async () =>
   const page = fakePage(async () => {
     throw new Error('Execution context was destroyed');
   });
+
+  await assert.rejects(() => solveChallenge(page, 'https://example.test/search'), /htmlLen=0/);
+});
+
+test('an unreadable page whose url() also throws still fails cleanly', async () => {
+  // Both calls throw once the page/context is gone. safeContent() reads
+  // page.url() from inside its own catch block, so an unguarded call there
+  // escapes the helper and breaks the poll loop instead of yielding ''.
+  const page = {
+    waitForLoadState: async () => {},
+    content: async () => {
+      throw new Error('Target closed');
+    },
+    url: () => {
+      throw new Error('Target closed');
+    }
+  };
 
   await assert.rejects(() => solveChallenge(page, 'https://example.test/search'), /htmlLen=0/);
 });

@@ -18,6 +18,11 @@ const COOKIE_FILE = path.join(DATA_DIR, '.cf-cookies.json');
 // cookie is rejected. Camoufox otherwise randomises the spoofed OS (and so
 // the UA) on every launch.
 const UA_FILE = path.join(DATA_DIR, '.cf-ua.txt');
+const PROXY_URL = process.env.PROXY_URL || null;
+const DOMAIN_OVER_PROXY = (process.env.DOMAIN_OVER_PROXY || '')
+  .split(',')
+  .map((s) => s.trim())
+  .filter(Boolean);
 
 function loadCookies(): Cookie[] | null {
   try {
@@ -43,7 +48,7 @@ let sharedBrowser: Browser | null = null;
 let sharedContext: BrowserContext | null = null;
 
 // In-flight launch promise, so concurrent first calls (e.g. the 4 parallel
-// fetchCfProtectedPage() calls from a multi-category browse) await the same
+// cfFetch() calls from a multi-category browse) await the same
 // launch instead of each seeing sharedContext still null and racing to start
 // their own browser. That race was observed live: multiple simultaneous
 // "launching browser" attempts, several Camoufox/Firefox instances fighting
@@ -71,23 +76,6 @@ function createSerializer() {
 const serializeSolve = createSerializer();
 const serializeNav = createSerializer();
 
-// Optional upstream proxy for domains unreachable directly. Deliberately
-// opt-in (DOMAIN_OVER_PROXY unset/empty = none) so a new domain never
-// silently starts routing through a proxy an operator hasn't configured
-// for it. See NOTES.md section 4 for the full story.
-//
-//   PROXY_URL         e.g. http://tinyproxy:8888. Unset = disabled entirely.
-//   DOMAIN_OVER_PROXY comma-separated hostnames routed through it (exact
-//                     match or subdomain).
-//
-// Routing is per-request via a PAC script (buildPacDataUri below), not a
-// per-provider flag - a single page load can need both proxied and direct
-// requests at once (see NOTES.md section 4).
-const PROXY_URL = process.env.PROXY_URL || null;
-const DOMAIN_OVER_PROXY = (process.env.DOMAIN_OVER_PROXY || '')
-  .split(',')
-  .map((s) => s.trim())
-  .filter(Boolean);
 
 function domainUsesProxy(hostname: string): boolean {
   if (!PROXY_URL || DOMAIN_OVER_PROXY.length === 0) return false;
@@ -171,11 +159,11 @@ async function launchPersistentContext(): Promise<BrowserContext> {
   return context;
 }
 
-// fetchCfProtectedPage()'s options - a standard RequestInit (method/headers/
+// cfFetch()'s options - a standard RequestInit (method/headers/
 // body/etc, same as the global fetch()) so the function is otherwise a
 // drop-in replacement for fetch() minus getting a live Response back (this
 // always resolves the body text directly instead - see
-// fetchCfProtectedPage's own doc comment for why). No `proxy` field -
+// cfFetch's own doc comment for why). No `proxy` field -
 // routing is decided per-hostname by the PAC script (see DOMAIN_OVER_PROXY
 // above), not per-call.
 export type FetchOptions = RequestInit;
@@ -187,7 +175,7 @@ export type FetchOptions = RequestInit;
 // All hostnames share one browser/context - proxy routing is the PAC
 // script's per-request decision (see DOMAIN_OVER_PROXY above), not a
 // separate context to pick between. usingProxy is tracked per page only so
-// fetchCfProtectedPage knows whether to persist cookies for it: a
+// cfFetch knows whether to persist cookies for it: a
 // proxy-obtained cf_clearance is bound to the proxy's egress IP and
 // shouldn't mix into the same file a direct-egress domain relies on.
 const persistentPages = new Map<string, { page: Page; usingProxy: boolean }>();
@@ -241,7 +229,7 @@ async function tryFetch(page: Page, url: string, init: RequestInit): Promise<str
   }
 }
 
-// Cache for fetchCfProtectedPage()'s results, keyed by a hash of
+// Cache for cfFetch()'s results, keyed by a hash of
 // method+url+body (not just the URL - a POST's response depends on its
 // body too, e.g. ext.to's magnet POST reuses one URL for every torrent).
 // See NOTES.md section 10 for why this replaced a top-level result cache.
@@ -266,7 +254,7 @@ function pickNavigateTarget(url: string, currentUrl: string, isGet: boolean): st
 // something you can navigate to), then retry the fetch. Self-heals inline
 // per-request rather than waiting for the periodic keep-alive tick - see
 // NOTES.md section 10 for the full reasoning and the cache-key subtlety.
-export async function fetchCfProtectedPage(url: string, opts: FetchOptions = {}): Promise<string> {
+export async function cfFetch(url: string, opts: FetchOptions = {}): Promise<string> {
   const { method = 'GET', headers, body } = opts;
   const init: RequestInit = { method, headers, body };
   const isGet = method.toUpperCase() === 'GET';
@@ -296,13 +284,18 @@ export async function fetchCfProtectedPage(url: string, opts: FetchOptions = {})
     return fast;
   }
 
-  console.error(`[cf] fetchCfProtectedPage: fast path unavailable for ${url}, recovering session.`);
+  console.error(`[cf] cfFetch: fast path unavailable for ${url}, recovering session.`);
+  // Let any navigation the failed fetch kicked off settle before queueing for
+  // the solve mutex, so we wait on our own time rather than holding the mutex
+  // while the page loads. Errors ignored: there may be no navigation in
+  // flight at all, which is not a problem.
+  await page.waitForLoadState('load', { timeout: 60000 }).catch(() => {});
   await serializeSolve(() => solveChallenge(page, navigateTarget));
   if (!usingProxy) saveCookies(await page.context().cookies());
 
   const retried = await tryFetch(page, url, init);
   if (retried === null || isChallenge(retried) || isBlocked(retried)) {
-    throw new Error(`fetchCfProtectedPage: fetch failed for ${url} even after session recovery.`);
+    throw new Error(`cfFetch: fetch failed for ${url} even after session recovery.`);
   }
   pageCache.set(cacheKey, retried);
   return retried;

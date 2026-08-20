@@ -1,6 +1,6 @@
 import crypto from 'crypto';
 import * as cheerio from 'cheerio';
-import { fetchCfProtectedPage } from '../lib/browser.js';
+import { cfFetch } from '../lib/browser.js';
 import { CATEGORIES, matchCategory, type CategoryRule } from '../lib/categories.js';
 import { fetchMergedBrowse, fetchPagedWindow } from '../lib/paging.js';
 import { parseSize } from '../lib/parse.js';
@@ -161,7 +161,7 @@ function parseListing(html: string, knownCategory?: number): ListingPage {
 }
 
 async function fetchListingPage(url: string, knownCategory?: number): Promise<ListingPage> {
-  const html = await fetchCfProtectedPage(url);
+  const html = await cfFetch(url);
   return parseListing(html, knownCategory);
 }
 
@@ -239,9 +239,9 @@ async function resolveMagnet({ id }: MagnetRef): Promise<string> {
   // actual results listing. A very short/single-char query seems to trip a
   // stricter WAF rule, so use a realistic-looking query string here. This
   // is the exact same URL keepAlive pings, so the HTML is very often
-  // already warm in fetchCfProtectedPage's own cache - no page interaction
+  // already warm in cfFetch's own cache - no page interaction
   // at all in that case, not even a fast-path fetch.
-  const html = await fetchCfProtectedPage(`${BASE}/browse/?q=yify`);
+  const html = await cfFetch(`${BASE}/browse/?q=yify`);
 
   const pageTokenMatch = html.match(/searchPageToken\s*=\s*['"]([^'"]+)['"]/);
   if (!pageTokenMatch || !pageTokenMatch[1]) throw new Error('Could not find window.searchPageToken on page.');
@@ -255,12 +255,12 @@ async function resolveMagnet({ id }: MagnetRef): Promise<string> {
   const hmac = computeHMAC(id, timestamp, pageToken);
 
   // The actual lookup is a POST, same as the read above just with a verb -
-  // fetchCfProtectedPage runs it through the same persistent page/session,
+  // cfFetch runs it through the same persistent page/session,
   // no separate live-page handling needed. Its own cache is a no-op here
   // in practice (timestamp/hmac make the body unique on every call), which
   // is fine - correctness (never serving one torrent's response for
   // another's request) is what the cache key guards, not a hit rate.
-  const responseText = await fetchCfProtectedPage(MAGNET_ENDPOINT, {
+  const responseText = await cfFetch(MAGNET_ENDPOINT, {
     method: 'POST',
     headers: { 'X-Requested-With': 'XMLHttpRequest', 'Content-Type': 'application/x-www-form-urlencoded' },
     body: new URLSearchParams({

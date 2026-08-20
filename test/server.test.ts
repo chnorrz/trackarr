@@ -212,7 +212,7 @@ test('RSS output includes opensearch:totalResults from the provider', async () =
 test('search results are not cached at the server level - each request calls the provider fresh', async () => {
   // No top-level result cache any more - the expensive part (network/scrape
   // fetches) is cached at the fetch itself instead, in lib/browser.ts's
-  // fetchCfProtectedPage(), keyed by the underlying site page's URL rather
+  // cfFetch(), keyed by the underlying site page's URL rather
   // than the request's exact q/cat/offset/limit. See NOTES.md.
   let calls = 0;
   const provider = fakeProvider({

@@ -1,5 +1,5 @@
 import * as cheerio from 'cheerio';
-import { fetchCfProtectedPage } from '../lib/browser.js';
+import { cfFetch } from '../lib/browser.js';
 import { CATEGORIES, matchCategory, type CategoryRule } from '../lib/categories.js';
 import { fetchMergedBrowse, fetchPagedWindow } from '../lib/paging.js';
 import { parseSize } from '../lib/parse.js';
@@ -242,7 +242,7 @@ function parseListing(html: string, knownCategory?: number): ListingPage {
 async function fetchListingPage(url: string, knownCategory?: number): Promise<ListingPage> {
   // 1337x.to bans our IPv4 but not IPv6 - routing for it is controlled by
   // DOMAIN_OVER_PROXY (see NOTES.md section 4), not anything passed here.
-  const html = await fetchCfProtectedPage(url);
+  const html = await cfFetch(url);
   return parseListing(html, knownCategory);
 }
 
@@ -293,7 +293,7 @@ async function resolveMagnet({ url }: MagnetRef): Promise<string> {
   // Pure read - the magnet link is right there in the detail page's static
   // HTML, no POST needed - so this doesn't need a live page at all, just
   // the fast-path/caching fetchListingPage's real searches already get.
-  const html = await fetchCfProtectedPage(url);
+  const html = await cfFetch(url);
   const $ = cheerio.load(html);
   const magnet = $('a[href^="magnet:"]').first().attr('href');
   if (!magnet) throw new Error('Could not find a magnet link on the torrent page.');
