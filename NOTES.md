@@ -22,7 +22,8 @@ carrying a whole extra toolchain just to interpret TS on every start.
 | File | Role |
 |---|---|
 | `server.ts` | Torznab endpoints: `/:provider/api`, `/:provider/download` |
-| `lib/browser.ts` | Camoufox session, Cloudflare clearing, auto-solve |
+| `lib/browser.ts` | Camoufox session, one persistent page per host, proxy routing, cached fetch |
+| `lib/challenge.ts` | Cloudflare challenge detection and the XTEST auto-solver |
 | `lib/cache.ts` | TTL cache (search 5 min, magnets 1 h) |
 | `lib/categories.ts` | Torznab category ids + `categoriesXml()` (per-provider caps rendering) |
 | `lib/paging.ts` | `fetchPagedWindow()` - offset/limit pagination with a depth cap |
@@ -450,17 +451,22 @@ isBlocked   = html.includes('Access denied') && html.includes('Cloudflare')
 **A Cloudflare failure is often transient** - live-observed a request fail
 with "Blocked by Cloudflare (IP ban/rate limit)" and then succeed on a
 plain retry a few seconds later, with nothing else changed. Looks more
-like short-lived rate-limiting than an actual ban. Surfacing that as a
-client-visible failure means Prowlarr has to notice and retry the whole
-request itself - instead, `navigateAndClear()` in `lib/browser.ts` retries
-the entire navigation once, inline, on any Cloudflare-related failure
-(challenge that didn't clear, or a hard block): fresh `page.goto`, fresh
-challenge/block check, fresh solve attempt if needed. Only surfaces an
-error to the caller if that retry ALSO fails. This covers both
-`gotoCleared()` and `fetchCfProtectedPage()`'s slow path, since both
-funnel through the same function. A genuinely persistent failure still
-surfaces as an error after the one retry - this doesn't paper over that,
-it only absorbs the transient case observed live.
+like short-lived rate-limiting than an actual ban.
+
+There used to be an inline retry for this (`navigateAndClear()` retried the
+whole navigation once on any Cloudflare-related failure). It's gone, along
+with that whole function: a failed solve now surfaces to the caller
+directly. Two reasons. The retry doubled worst-case latency on exactly the
+requests that were already slowest, and the fetch-first design means the
+*next* request self-heals anyway - it tries a cheap same-origin `fetch()`
+through the still-open page first, so a session that recovered in the
+meantime costs nothing to pick back up. Live-confirmed: a failed EZTV
+request followed by an immediate retry served real results in 0.95s with no
+solve at all.
+
+The tradeoff is real and was taken deliberately - a transient failure that
+would previously have been absorbed silently is now one visible error in
+Prowlarr, with recovery on the following request.
 
 ### Ruled out as discriminators (all measured, all negative)
 
@@ -504,6 +510,10 @@ the magnet POST, must run inside the browser page** via
 ---
 
 ## 6. The auto-solver
+
+Lives in `lib/challenge.ts` (detection markers + the XTEST solve loop);
+`lib/browser.ts` owns the session and calls into it when a fetch comes back
+challenged.
 
 This is the fragile heart of the project. Three non-obvious requirements,
 all found empirically:
@@ -745,9 +755,9 @@ solver regression was localised to our code rather than the environment:
 ```bash
 docker exec -e DISPLAY=:99 ext-dbg node -e "
   (async () => {
-    const { gotoCleared, closeBrowser } = await import('/app/lib/browser.js');
-    try { const p = await gotoCleared('https://ext.to/browse/?q=yify');
-          console.log('CLEARED'); await p.close(); }
+    const { fetchCfProtectedPage, closeBrowser } = await import('/app/lib/browser.js');
+    try { const html = await fetchCfProtectedPage('https://ext.to/browse/?q=yify');
+          console.log('CLEARED', html.length); }
     catch (e) { console.log('FAILED', e.message); }
     await closeBrowser(); process.exit(0);
   })();"
@@ -862,7 +872,7 @@ single function, `fetchCfProtectedPage(url, opts?)`, that every provider
 uses for everything: listing/search pages, magnet resolution, even POST
 endpoints (ext.to's HMAC magnet lookup, EZTV's wlinks-reveal). `opts`
 extends the standard `RequestInit` (`method`/`headers`/`body`, same shape
-as the global `fetch()`) plus two extras (`timeoutMs`, `proxy`) - it's a
+as the global `fetch()`) - it's a
 drop-in-ish replacement for `fetch()` that resolves the body text directly
 (never a live `Response`/`Page` - nothing needs one any more, confirmed by
 grepping for `page.evaluate`/`gotoCleared` across every provider: zero
@@ -1039,7 +1049,7 @@ single guard at the top of `search()`: if `categories` is non-empty and
 doesn't include `CATEGORIES.TV`, it returns `{items:[],total:0}` immediately,
 before any network/browser call (blank or keyword path). Otherwise it hits
 `https://eztvx.to/api/get-torrents?limit=N&page=M` directly with a plain
-`fetch()` (not `gotoCleared`/browser - accepted risk if Cloudflare ever
+`fetch()` (not the browser path - accepted risk if Cloudflare ever
 starts protecting that endpoint) and always maps everything to
 `CATEGORIES.TV`.
 
@@ -1155,13 +1165,19 @@ on the same `test` job (`needs: test`), so a broken suite can't ship.
 **No browser, no Docker, no network needed to run the suite at all** -
 verified decisively by running `CAMOUFOX_INSTALL_DIR=/tmp/nonexistent npm
 test` and getting all tests passing anyway. The mock boundary is
-`lib/browser.ts`'s `gotoCleared()` - provider tests never import camoufox-js
-for real.
+`lib/browser.ts`'s `fetchCfProtectedPage()` - provider tests never import
+camoufox-js for real.
 
 ### Mock boundary
 
-- **Providers**: mock `gotoCleared` (via `node:test`'s `mock.module()`),
-  assert against hand-built fixtures in `test/fixtures/`.
+- **Providers**: mock `fetchCfProtectedPage` (via `node:test`'s
+  `mock.module()`), assert against hand-built fixtures in `test/fixtures/`.
+- **`lib/challenge.ts`**: no mocking needed at all - it imports only
+  `child_process` and a playwright-core *type*, so `challenge.test.ts`
+  loads it standalone and covers the marker functions plus the
+  `solveChallenge()` paths that bail before touching a page (nothing to
+  solve, unreadable page, no `DISPLAY`). The click loop itself still needs
+  a real X display and is only exercised live.
 - **Server**: no mocking - `server.ts` exports `createApp(providers, opts?)`,
   a pure factory taking the provider map and cache TTLs as arguments instead
   of reading module-level singletons. Tests call `app.listen(0)` (OS-assigned
@@ -1241,8 +1257,9 @@ phantom passing test.
 ### Adding tests for a new provider
 
 1. Build a fixture in `test/fixtures/` with fake content, real selectors.
-2. Mock `gotoCleared` once at the top of `test/providers/<id>.test.ts`
-   (copy the pattern from `1337x.test.ts` or `ext-to.test.ts`).
+2. Mock `fetchCfProtectedPage` once at the top of
+   `test/providers/<id>.test.ts` (copy the pattern from `1337x.test.ts` or
+   `ext-to.test.ts`).
 3. Cover at minimum: a successful `search()` parse (title/size/category/etc),
    a malformed-row edge case, `resolveMagnet()` success, and its failure
    modes (missing id/url, no magnet found on the page).
@@ -1267,8 +1284,8 @@ looking wrong.
 
 **EZTV's blank-query browse bypasses the browser entirely.** It calls
 `https://eztvx.to/api/get-torrents` with a plain `fetch()`, not
-`gotoCleared()`. If that endpoint ever gets put behind Cloudflare, browsing
-breaks (keyword search via the scrape flow would be unaffected).
+`fetchCfProtectedPage()`. If that endpoint ever gets put behind Cloudflare,
+browsing breaks (keyword search via the scrape flow would be unaffected).
 
 **`xdo()` swallows errors.** Not currently causing problems, but if the
 warm-up movement ever silently no-ops, the widget stays on "Verifying..." and
