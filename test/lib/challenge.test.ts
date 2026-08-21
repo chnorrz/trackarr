@@ -49,7 +49,7 @@ test('solveChallenge refuses a page that shows no solvable challenge', async () 
   const page = fakePage(async () => '<html><body>a hard block, or just an unrelated failure</body></html>');
 
   await assert.rejects(
-    () => solveChallenge(page, 'https://example.test/search'),
+    () => solveChallenge(page),
     /no solvable challenge/,
     'a page with no Turnstile widget is not something clicking can fix - it must fail loudly rather than sit in the poll loop until the budget runs out'
   );
@@ -63,7 +63,7 @@ test('solveChallenge treats an unreadable page as nothing to solve', async () =>
     throw new Error('Execution context was destroyed');
   });
 
-  await assert.rejects(() => solveChallenge(page, 'https://example.test/search'), /htmlLen=0/);
+  await assert.rejects(() => solveChallenge(page), /htmlLen=0/);
 });
 
 test('an unreadable page whose url() also throws still fails cleanly', async () => {
@@ -80,23 +80,10 @@ test('an unreadable page whose url() also throws still fails cleanly', async () 
     }
   };
 
-  await assert.rejects(() => solveChallenge(page, 'https://example.test/search'), /htmlLen=0/);
+  await assert.rejects(() => solveChallenge(page), /htmlLen=0/);
 });
 
-test('solveChallenge fails clearly when there is no DISPLAY to click on', async () => {
-  const saved = process.env.DISPLAY;
-  delete process.env.DISPLAY;
-
-  try {
-    const page = fakePage(async () => '<div class="cf-turnstile"></div>');
-
-    await assert.rejects(
-      () => solveChallenge(page, 'https://example.test/search'),
-      /DISPLAY/,
-      'without an X display the solver cannot inject input at all, and should say so instead of failing as a generic timeout'
-    );
-  } finally {
-    if (saved === undefined) delete process.env.DISPLAY;
-    else process.env.DISPLAY = saved;
-  }
-});
+// The solver used to shell out to xdotool and needed a reachable X display of
+// its own, so there was a test here for failing loudly without one. Clicking
+// now goes through Camoufox's humanized cursor via page.mouse, which needs
+// nothing beyond the page itself, so that failure mode no longer exists.

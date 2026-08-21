@@ -1,30 +1,31 @@
-import { execFileSync } from 'child_process';
+import { execFileSync, spawn, type ChildProcess } from 'child_process';
 import type { Page } from 'playwright-core';
 
-// Solve-loop timing. See NOTES.md section 6 for where these came from -
-// WARMUP_MOVES in particular is measured, not arbitrary.
+// Solve-loop timing. See NOTES.md section 6 for where these came from.
 const POLL_INTERVAL_MS = 250;
 const PROBE_INTERVAL_MS = 500;
 const CLICK_COOLDOWN_MS = 4000;
 const SOLVE_BUDGET_MS = 45000;
-const WANDER_INTERVAL_MS = 100;
-const WARMUP_MOVES = 30;
-const INIT_PAGE_TIMEOUT_MS = 15000;
+const MOVE_SETTLE_MS = 60;
+const CLEAR_SETTLE_MS = 1500;
+const NAV_QUIET_MS = 500;
+const NAV_SETTLE_TIMEOUT_MS = 8000;
+const MIN_WIDGET_HEIGHT = 20;
+const MAX_WIDGET_HEIGHT = 120;
+const MIN_WIDGET_WIDTH = 40;
+const CHECKBOX_INSET = 25;
+const WIDGET_ANCESTOR_DEPTHS = [1, 2, 3, 4];
+const BOX_READ_TIMEOUT_MS = 1000;
+const TURNSTILE_INPUT = 'input[name="cf-turnstile-response"]';
+const CHALLENGE_INDICATORS = `${TURNSTILE_INPUT}, .cf-turnstile, #challenge-form, #challenge-running`;
 
-interface WidgetGeo {
-  offX: number;
-  offY: number;
-  rect: { x: number; y: number; h: number } | null;
-}
-
-interface FirefoxWindow extends Window {
-  mozInnerScreenX: number;
-  mozInnerScreenY: number;
+interface WidgetPos {
+  cx: number;
+  cy: number;
 }
 
 interface Pointer {
-  clickAt: (cx: number, cy: number) => Promise<void>;
-  wanderFor: (ms: number) => Promise<void>;
+  clickAt: (measure: () => Promise<WidgetPos | null>) => Promise<void>;
 }
 
 interface CfWidget {
@@ -58,96 +59,182 @@ async function safeContent(page: Page): Promise<string> {
   }
 }
 
+let xdoProc: ChildProcess | null = null;
+
+function xdoStream(env: NodeJS.ProcessEnv): ((line: string) => void) | null {
+  if (!xdoProc || xdoProc.exitCode !== null || xdoProc.killed || !xdoProc.stdin?.writable) {
+    try {
+      const proc = spawn('xdotool', ['-'], { env, stdio: ['pipe', 'ignore', 'ignore'] });
+      proc.on('error', () => {
+        if (xdoProc === proc) xdoProc = null;
+      });
+      proc.on('exit', () => {
+        if (xdoProc === proc) xdoProc = null;
+      });
+      proc.unref();
+      xdoProc = proc;
+    } catch {
+      return null;
+    }
+  }
+
+  const proc = xdoProc;
+  if (!proc?.stdin?.writable) return null;
+
+  return (line: string): void => {
+    try {
+      proc.stdin?.write(`${line}\n`);
+    } catch {
+      xdoProc = null;
+    }
+  };
+}
+
 function createPointer(): Pointer | null {
   const display = process.env.DISPLAY;
   if (!display) return null;
 
-  const xdo = (args: string[]): boolean => {
-    try {
-      execFileSync('xdotool', args, { env: { ...process.env, DISPLAY: display } });
-      return true;
-    } catch {
-      return false;
-    }
-  };
+  const env = { ...process.env, DISPLAY: display };
 
-  const move = (x: number, y: number): boolean => xdo(['mousemove', String(Math.max(0, x)), String(Math.max(0, y))]);
-
-  if (!xdo(['getdisplaygeometry'])) {
+  try {
+    // we could do this with "coop: false" of camoufox and then page.mouse.click, 
+    // but cloudflare might be able to detect that
+    execFileSync('xdotool', ['getdisplaygeometry'], { env });
+  } catch {
     console.error('[cf] xdotool unavailable, cannot auto-solve.');
     return null;
   }
 
-  let wanderTick = 0;
-  const wander = (): void => {
-    const i = wanderTick++;
-    move(300 + Math.round(Math.sin(i / 4) * 250), 300 + Math.round(Math.cos(i / 5) * 160));
-  };
-
-  const clickAt = async (cx: number, cy: number): Promise<void> => {
-    for (const [dx, dy, wait] of [
-      [-150, -80, 350],
-      [-60, -25, 300],
-      [-12, -4, 250],
-      [0, 0, 500]
-    ] as const) {
-      move(cx + dx, cy + dy);
-      await new Promise((r) => setTimeout(r, wait));
-    }
-    xdo(['click', '1']);
-  };
-
-  const wanderFor = async (ms: number): Promise<void> => {
-    const end = Date.now() + ms;
-    while (Date.now() < end) {
-      wander();
-      await new Promise((r) => setTimeout(r, Math.min(WANDER_INTERVAL_MS, end - Date.now())));
-    }
-  };
-
-  return { wanderFor, clickAt };
-}
-
-// Returns null when the widget isn't in the DOM yet - not an error, it can
-// still be rendering (or the challenge may have cleared on its own), so the
-// caller should probe again shortly rather than treat this as failure.
-async function locateCfWidget(page: Page): Promise<CfWidget | null> {
-  const geo = await page
-    .evaluate<WidgetGeo>(() => {
-      const el = document.querySelector('[id^=cf-chl-widget], .cf-turnstile, #mZiFs3');
-      const r = el ? el.getBoundingClientRect() : null;
-      const win = window as unknown as FirefoxWindow;
-      return {
-        offX: win.mozInnerScreenX,
-        offY: win.mozInnerScreenY,
-        rect: r ? { x: r.x, y: r.y, h: r.height } : null
-      };
-    })
-    .catch(() => null);
-
-  if (!geo || !geo.rect) {
+  const stream = xdoStream(env);
+  if (!stream) {
+    console.error('[cf] xdotool unavailable, cannot auto-solve.');
     return null;
   }
 
-  // Checkbox sits at the left edge of the widget, vertically centred.
-  const cx = Math.round(geo.offX + geo.rect.x + 22);
-  const cy = Math.round(geo.offY + geo.rect.y + geo.rect.h / 2);
+  const clickAt = async (measure: () => Promise<WidgetPos | null>): Promise<void> => {
+    const target = await measure();
+    if (!target) return;
+
+    stream(`mousemove ${Math.max(0, target.cx)} ${Math.max(0, target.cy)}`);
+    await new Promise((r) => setTimeout(r, MOVE_SETTLE_MS));
+    stream('click 1');
+  };
+
+  return { clickAt };
+}
+
+// Measured with locators, not page.evaluate: running a script in the page
+// resets the challenge, so the widget never settles into a clickable state.
+async function measureWidgetPos(page: Page): Promise<WidgetPos | null> {
+  const offset = await screenOffset(page);
+  if (!offset) return null;
+
+  for (const depth of WIDGET_ANCESTOR_DEPTHS) {
+    const widget = page.locator(`${TURNSTILE_INPUT} >> xpath=ancestor::div[${depth}]`);
+    try {
+      if ((await widget.count()) === 0) continue;
+      const box = await widget.first().boundingBox({ timeout: BOX_READ_TIMEOUT_MS });
+      if (!box) continue;
+      if (box.width < MIN_WIDGET_WIDTH) continue;
+      if (box.height < MIN_WIDGET_HEIGHT || box.height > MAX_WIDGET_HEIGHT) continue;
+
+      // Checkbox sits at the left edge of the widget, vertically centred.
+      return {
+        cx: Math.round(offset.x + box.x + CHECKBOX_INSET),
+        cy: Math.round(offset.y + box.y + box.height / 2)
+      };
+    } catch {
+      continue;
+    }
+  }
+  return null;
+}
+
+async function locateCfWidget(page: Page): Promise<CfWidget | null> {
+  const pos = await measureWidgetPos(page);
+
+  if (!pos) return null;
 
   const clickOnce = async (pointer: Pointer): Promise<void> => {
-    console.error(`[cf] clicking checkbox at screen ${cx},${cy}`);
-    await pointer.clickAt(cx, cy);
+    console.error(`[cf] clicking checkbox at screen ${pos.cx},${pos.cy}`);
+    await pointer.clickAt(() => measureWidgetPos(page));
   };
 
   return { clickOnce };
 }
 
+async function challengeVisible(page: Page): Promise<boolean> {
+  return page
+    .locator(CHALLENGE_INDICATORS)
+    .count()
+    .then((n) => n > 0)
+    .catch(() => false);
+}
+
+let cachedOffset: { x: number; y: number } | null = null;
+
+async function screenOffset(page: Page): Promise<{ x: number; y: number } | null> {
+  if (cachedOffset) return cachedOffset;
+  const read = await page
+    .evaluate(() => {
+      const win = window as unknown as { mozInnerScreenX: number; mozInnerScreenY: number };
+      return { x: win.mozInnerScreenX, y: win.mozInnerScreenY };
+    })
+    .catch(() => null);
+  if (read) cachedOffset = read;
+  return read;
+}
+
+// Clearing the interstitial only starts Cloudflare's own client-side redirect
+// back to the requested URL, and that chain can have several hops. Returning
+// mid-chain hands the caller a page that navigates out from under its next
+// fetch ("fetch failed even after session recovery").
+//
+// Both halves are needed. The floor is because quiescence alone cannot tell
+// "the redirect finished" from "the redirect hasn't started yet" - waiting on
+// navigation events alone returned immediately and failed 2 of 3 live. The
+// quiet window is because a fixed wait alone is a guess - 1.5s covered most
+// solves but not all, live-observed failing on 1337x.
+async function waitForRedirectChain(page: Page): Promise<void> {
+  let lastNavAt = 0;
+  const onNavigated = (frame: unknown): void => {
+    if (frame === page.mainFrame()) lastNavAt = Date.now();
+  };
+  page.on('framenavigated', onNavigated);
+
+  try {
+    await new Promise((r) => setTimeout(r, CLEAR_SETTLE_MS));
+
+    const deadline = Date.now() + NAV_SETTLE_TIMEOUT_MS;
+    while (Date.now() < deadline && lastNavAt !== 0 && Date.now() - lastNavAt < NAV_QUIET_MS) {
+      await new Promise((r) => setTimeout(r, 50));
+    }
+  } finally {
+    // The page outlives the solve, so a listener left behind would accumulate
+    // one per challenge for the life of the process.
+    page.off('framenavigated', onNavigated);
+  }
+
+  await page.waitForLoadState('load', { timeout: NAV_SETTLE_TIMEOUT_MS }).catch(() => {});
+}
+
 // Confirms the challenge is really gone and not just between navigations -
 // checks twice, POLL_INTERVAL_MS apart, since a page caught mid-redirect
 // can transiently read as cleared.
-async function challengeIsGone(page: Page, pointer: Pointer): Promise<boolean> {
-  if (isChallenge(await safeContent(page))) return false;
-  await pointer.wanderFor(POLL_INTERVAL_MS);
-  return !isChallenge(await safeContent(page));
+async function challengeIsGone(page: Page): Promise<boolean> {
+  if (await challengeVisible(page)) return false;
+  await new Promise((r) => setTimeout(r, POLL_INTERVAL_MS));
+  return !(await challengeVisible(page));
+}
+
+async function getClearanceCookie(page: Page): Promise<string> {
+  const cookies = await page.context().cookies();
+  const value = cookies.find((c) => c.name === 'cf_clearance')?.value;
+  if (value === undefined) {
+    console.error('[cf] challenge cleared per page content, but no cf_clearance cookie found in the jar.');
+    return '';
+  }
+  return value;
 }
 
 // Waits out the Cloudflare interstitial on `page`, clicking its checkbox
@@ -163,12 +250,12 @@ async function challengeIsGone(page: Page, pointer: Pointer): Promise<boolean> {
 // Turnstile solver (byparr, github.com/ThePhaseless/Byparr): treat "no
 // widget yet" as "try again shortly", never as terminal failure - only the
 // overall budget running out is failure.
-export async function solveChallenge(page: Page, url: string): Promise<void> {
+export async function solveChallenge(page: Page): Promise<string> {
   const html = await safeContent(page);
 
   if (!isChallenge(html)) {
     throw new Error(
-      `Cloudflare fetch failed for ${url} and the page shows no solvable challenge ` +
+      `Cloudflare fetch failed and the page shows no solvable challenge ` +
         `(htmlLen=${html.length}) - likely a hard block (IP ban/rate limit) or an unrelated failure.`
     );
   }
@@ -181,15 +268,15 @@ export async function solveChallenge(page: Page, url: string): Promise<void> {
 
   console.error('[cf] auto-solving challenge (X-level input)...');
   const solveStart = Date.now();
-  await pointer.wanderFor(WARMUP_MOVES * WANDER_INTERVAL_MS);
 
   const deadline = solveStart + SOLVE_BUDGET_MS;
   let nextClickAt = 0;
 
   while (Date.now() < deadline) {
-    if (await challengeIsGone(page, pointer)) {
+    if (await challengeIsGone(page)) {
       console.error(`[cf] challenge cleared after ${Date.now() - solveStart}ms.`);
-      return;
+      await waitForRedirectChain(page);
+      return getClearanceCookie(page);
     }
 
     if (Date.now() >= nextClickAt) {
@@ -198,8 +285,8 @@ export async function solveChallenge(page: Page, url: string): Promise<void> {
       nextClickAt = Date.now() + (widget ? CLICK_COOLDOWN_MS : PROBE_INTERVAL_MS);
     }
 
-    await pointer.wanderFor(POLL_INTERVAL_MS);
+    await new Promise((r) => setTimeout(r, POLL_INTERVAL_MS));
   }
 
-  throw new Error(`Cloudflare challenge did not clear for ${url}.`);
+  throw new Error(`Cloudflare challenge did not clear.`);
 }

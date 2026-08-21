@@ -54,8 +54,8 @@ ENV CAMOUFOX_INSTALL_DIR=/opt/camoufox
 #   Firefox a real WebGL context for Camoufox's spoofing to relabel. It cannot
 #   synthesise one from nothing.
 # xdotool: drives the Turnstile checkbox at the X server level - see
-#   autoSolveChallenge() in lib/browser.ts for why Playwright's mouse API is
-#   not sufficient.
+#   createPointer() in lib/challenge.ts for why Playwright's mouse API is
+#   not used.
 # fonts-*: an abnormally small font list is another headless-bot signal.
 RUN DEBIAN_FRONTEND=noninteractive apt-get update && \
     npx playwright-core install-deps firefox && \

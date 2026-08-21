@@ -515,16 +515,43 @@ Lives in `lib/challenge.ts` (detection markers + the XTEST solve loop);
 `lib/browser.ts` owns the session and calls into it when a fetch comes back
 challenged.
 
-This is the fragile heart of the project. Four non-obvious requirements,
+This is the fragile heart of the project. Five non-obvious requirements,
 all found empirically:
 
-**1. Input must be injected at the X server level (XTEST / `xdotool`).**
-With Playwright's mouse API the widget sits on "Verifying..." forever and
-never offers a checkbox. With XTEST it advances to a real "Verify you are
-human" checkbox. XTEST events are indistinguishable from hardware to
-Firefox. This is the single most important fact in this document.
+**1. Never run page scripts during a solve — `page.evaluate()` resets the
+challenge.** Measure with Playwright *locators* instead: they resolve in an
+isolated world and leave the page's own scripts alone. This is the single
+most important fact in this document.
 
-**2. Coordinates must be translated page → screen.**
+Symptom when violated: the widget never leaves "Verifying...", the Turnstile
+iframe is created and destroyed in a loop, and the solver spends its whole
+budget clicking a spinner. The poll loop asks several times a second, so a
+single `evaluate` in the wrong place is enough to make the challenge
+permanently unsolvable. **`page.content()` counts** — it is `evaluate`
+underneath. Same constraint documented by byparr
+(github.com/ThePhaseless/Byparr, `src/challenge.py`).
+
+Cost of getting this wrong, measured: zero successful solves in ~100
+attempts across ext.to/EZTV/1337x over several hours, on IPv4 and IPv6
+alike, on every Camoufox version tried. After the fix, cold solves land in
+6-12s and 2-3 clicks. It presents exactly like an IP/fingerprint reputation
+problem, which is what cost the time — see section 5 before blaming the site.
+
+Only one `evaluate` remains, for `mozInnerScreenX/Y` (requirement 3), and it
+is read once and cached rather than per measurement.
+
+**2. Input must be injected at the X server level (XTEST / `xdotool`).**
+Turnstile ignores Playwright's `page.mouse` clicks *unless* COOP is disabled
+(`disable_coop: true`), because the checkbox sits in a cross-origin iframe
+that COOP keeps synthetic input out of. XTEST goes through the real input
+stack and needs no such flag — and Camoufox warns that disabling COOP is
+itself WAF-detectable.
+
+Both were measured working once requirement 1 was fixed (`page.mouse` +
+`disable_coop`: 10-12s; xdotool: 6-12s), so this is a choice, not a
+constraint. xdotool is kept because it adds no detectable tell.
+
+**3. Coordinates must be translated page → screen.**
 `getBoundingClientRect()` is page space; `xdotool` is screen space. Firefox's
 chrome offsets the content area:
 
@@ -543,12 +570,12 @@ models a Chromium-shaped `Window`), so the `page.evaluate()` callback needs
 a local interface and an `as unknown as` cast to reach them. They are
 genuinely present at runtime - the callback only ever runs inside Firefox.
 
-**3. The display must have a real size.**
+**4. The display must have a real size.**
 Camoufox's built-in `headless: 'virtual'` uses a **1x1** Xvfb screen —
 nowhere to render or click. Run our own `Xvfb :99 -screen 0 1280x900x24` and
 launch with `headless: false`.
 
-**4. Coordinates handed to `xdotool` must never be negative.**
+**5. Coordinates handed to `xdotool` must never be negative.**
 `xdotool`'s own argument parser reads a leading `-` as the start of an
 option, not as a negative number: `mousemove -38 100` fails with
 `unrecognized option '-38'` instead of moving anywhere. Because `xdo()`
@@ -565,53 +592,74 @@ never ambiguous with a flag.
 
 ### Locating the widget
 
-Container ids are randomised per page load (`#mZiFs3` etc.) — never hardcode
-them. Query broadly instead:
+The widget is in a **closed shadow DOM**. `document.querySelectorAll('iframe')`
+returns `[]` and `element.shadowRoot` is `null` — you cannot reach the
+checkbox or its iframe directly. Container ids are randomised per page load
+(`#mZiFs3` etc.) — never hardcode them.
 
-```js
-document.querySelector('[id^=cf-chl-widget], .cf-turnstile, #mZiFs3')
-// checkbox ≈ left edge + 22px, vertically centred
+The only light-DOM element Cloudflare leaves behind is the hidden response
+input, and **it has no dimensions**. Selecting it and using its rect is the
+trap: `[id^=cf-chl-widget]` matches
+`<input type="hidden" id="cf-chl-widget-XXX_response">` first, giving a
+zero-size rect at the origin. That computes to `offX+22, offY+0` and clicks
+empty page background — the "clicking checkbox at screen 22,57" signature,
+repeated until the budget runs out. It fails silently and looks identical to
+a widget that never rendered.
+
+The shadow *host* does lay out normally, so walk up from the input to the
+nearest ancestor with a widget-shaped box, and click its left edge:
+
+```
+input[name="cf-turnstile-response"] >> xpath=ancestor::div[N]   // N = 1..4
+// accept: width > 40, 20 < height < 120   (a real widget row is ~65-70px tall)
+// checkbox ≈ left edge + 25px, vertically centred
 ```
 
-The widget is in a **closed shadow DOM**. `document.querySelectorAll('iframe')`
-returns `[]` — you cannot get iframe geometry.
+Bounds are load-bearing in both directions. Too small: the zero-height input
+and its equally flat wrappers. Too large: while the widget is still
+rendering every ancestor near the input is zero-height, so an unbounded walk
+runs past them into the page's main content block — live-observed at
+`960x176`, whose left-edge/centre point lands in the middle of the
+interstitial's paragraph text.
+
+Measure via locators, not `evaluate` (requirement 1) — `boundingBox()` gives
+the same rect without touching the page.
+
+**A rendered checkbox and a spinner have the same box.** Height cannot tell
+them apart. If you need to know which is showing, screenshot the clip twice
+~300ms apart and compare the buffers: the spinner animates, the checkbox is
+static. Not needed by the current solver (it just retries on a cooldown), but
+it is the only reliable signal found.
 
 ### Ordering: poll, don't wait-then-navigate
 
-Working sequence: load → check for a challenge → mouse warm-up (~30 moves,
-this is what unsticks "Verifying...") → then a tight poll loop, once per
-`POLL_INTERVAL_MS` (250ms): is the challenge already gone? If not, and enough
-time has passed since the last click attempt, look for the widget and click
-it if found. "Widget not found yet" is **not** a failure - it just means
-probe again sooner (`PROBE_INTERVAL_MS`, 500ms) instead of waiting out the
-full click cooldown (`CLICK_COOLDOWN_MS`, 4s). Only the overall solve budget
-(`SOLVE_BUDGET_MS`, 45s) running out is failure. This mirrors another
+Working sequence: load → check for a challenge → then a tight poll loop,
+once per `POLL_INTERVAL_MS` (250ms): is the challenge already gone? If not,
+and enough time has passed since the last click attempt, look for the widget
+and click it if found. "Widget not found yet" is **not** a failure - it just
+means probe again sooner (`PROBE_INTERVAL_MS`, 500ms) instead of waiting out
+the full click cooldown (`CLICK_COOLDOWN_MS`, 4s). Only the overall solve
+budget (`SOLVE_BUDGET_MS`, 45s) running out is failure. This mirrors another
 Turnstile solver's approach (byparr, github.com/ThePhaseless/Byparr) rather
 than a fixed click-count loop.
 
-Every wait inside a solve goes through `wanderFor()`, which keeps the mouse
-moving at 100ms cadence rather than sleeping idle - so movement is
-continuous for the whole solve, not just during the warm-up burst.
+**Mouse movement beyond the click itself buys nothing — superseded finding.**
+There used to be a `wanderFor()` keeping the cursor moving at 100ms cadence
+for the whole solve, plus a ~30-move warm-up before the first widget check,
+justified by an 18-run A/B that showed the warm-up inverting the click count
+(7 of 9 one-click solves with it, 2 of 9 without). **That measurement is no
+longer valid**: it was taken while the solver was resetting the challenge
+under itself on every poll (requirement 1), so both arms were really
+measuring how long a doomed challenge took to give up. Movement helped
+because it *slowed the poll loop down*.
 
-**The warm-up looks like dead weight and isn't - measured.** It delays the
-first widget check by ~3s, so dropping it in favour of the loop's own
-movement is an obvious-looking win. Tested properly: 18 runs, 3 per arm per
-provider, arms alternated to control for Cloudflare bot-score drift, one
-fresh container per run (a solved session lasts 15-30 min, so reusing a
-container skips the solve entirely and measures nothing).
+With the reset fixed, a plain `mousemove x y` + `click 1` — no warm-up, no
+wander, no easing, no jitter, no press-hold — solves in 6-12s with 2-3
+clicks. Re-adding an interpolated approach and inter-attempt wander made it
+*slower* (~18s) with no better success rate. All of that machinery is gone.
 
-| Arm | Median clear | 1-click solves |
-|---|---|---|
-| warm-up (30 moves) | 7.5 s | **7 of 9** |
-| no warm-up | 9.0 s | 2 of 9 |
-
-Zero failures in either arm, so this isn't a reliability argument - it's the
-click count. Without the warm-up the first click usually doesn't take, and
-waiting out a 4s `CLICK_COOLDOWN_MS` for a second one costs more than the 3s
-saved. Per-provider medians split (EZTV was faster without it, ext.to and
-1337x slower), but the click-count inversion held across all three, which is
-the more mechanistic signal. Consistent with the XTEST finding above:
-movement before the click is what makes the click count.
+If this section ever tempts you to re-add "humanized" movement, re-measure
+first, and check requirement 1 is still holding.
 
 This replaced an earlier design with three separate nested timing loops (a
 fixed warm-up, then a bounded widget-search retry, then a fixed
@@ -641,12 +689,31 @@ just self-inflicted this time. Live-observed repeatedly on ext.to and 1337x
 as `TimeoutError` right after a successful-looking solve.
 
 The fix is to not navigate at all: the poll loop above just keeps checking
-`page.content()` until the challenge markers are gone (with a
-`POLL_INTERVAL_MS`-apart double-check, since a page caught mid-redirect can
-transiently read as cleared), then returns without touching navigation.
-Whatever page Cloudflare's own redirect lands on, `cfFetch`'s
-own `tryFetch()` picks it up from there - the same fetch that already runs
-after every fast-path failure regardless.
+for the challenge markers (with a `POLL_INTERVAL_MS`-apart double-check,
+since a page caught mid-redirect can transiently read as cleared), then
+returns without touching navigation. Whatever page Cloudflare's own redirect
+lands on, `cfFetch`'s own `tryFetch()` picks it up from there - the same
+fetch that already runs after every fast-path failure regardless.
+
+**But it must wait for that redirect to finish before returning** - the chain
+can have several hops, and handing back a mid-chain page kills the caller's
+next fetch ("fetch failed even after session recovery"). Two signals, both
+required, each insufficient alone:
+
+| Approach | Result |
+|---|---|
+| fixed sleep only | 1.5s covers most solves, live-failed on 1337x |
+| navigation quiescence only | returns instantly, failed 2 of 3 live |
+| **floor, then quiescence** | 5 of 5 live |
+
+Quiescence alone cannot distinguish "the redirect finished" from "it hasn't
+started yet", so it needs the floor underneath it; the floor alone is a
+guess, so it needs the quiet window on top. `waitForLoadState('load')` has
+the same hole as quiescence - a hop can complete before the next begins.
+
+This only became visible once detection moved to locators: the old
+`page.content()` double-check was slow enough (~27KB serialised, twice) to
+sleep through the race by accident.
 
 ### Concurrent navigations hang - `page.goto` needs serializing too
 

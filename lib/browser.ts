@@ -5,7 +5,8 @@ import { fileURLToPath } from 'url';
 import { Camoufox } from 'camoufox-js';
 import type { Browser, BrowserContext, Cookie, Page } from 'playwright-core';
 import { TTLCache } from './cache.js';
-import { isBlocked, isChallenge, solveChallenge } from './challenge.js';
+import { isBlocked, solveChallenge } from './challenge.js';
+import { Response as PlaywrightResponse } from 'playwright-core';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 // DATA_DIR is configurable so it can point at a mounted volume in Docker -
@@ -18,6 +19,13 @@ const COOKIE_FILE = path.join(DATA_DIR, '.cf-cookies.json');
 // cookie is rejected. Camoufox otherwise randomises the spoofed OS (and so
 // the UA) on every launch.
 const UA_FILE = path.join(DATA_DIR, '.cf-ua.txt');
+// Camoufox otherwise randomises the window size per launch, which can come out
+// larger than the Xvfb screen - live-observed at 2166x1447 on a 1280x900
+// display, leaving part of the page rendered off-screen (so the solver's
+// clicks land outside it) and reporting a window bigger than its own screen,
+// an impossible geometry Camoufox itself lists as a detectable tell. Keep this
+// within the Xvfb geometry in the Dockerfile's CMD.
+const WINDOW_SIZE: [number, number] = [1280, 800];
 const PROXY_URL = process.env.PROXY_URL || null;
 const DOMAIN_OVER_PROXY = (process.env.DOMAIN_OVER_PROXY || '')
   .split(',')
@@ -144,9 +152,13 @@ async function launchPersistentContext(): Promise<BrowserContext> {
   // separately loses that inference, resolving to BrowserContext instead of
   // Browser. The conditional spreads stay inside this one literal for that
   // reason - it's still a single object expression at the call site.
+  // No `disable_coop` and no `humanize` on purpose: both only matter for
+  // Playwright's mouse API, and the solver injects input at the X server level
+  // instead (see createPointer in lib/challenge.ts). COOP in particular would
+  // be a tell Camoufox itself flags as WAF-detectable.
   const browser = os
-    ? await Camoufox({ headless, os, ...(firefoxPrefs ? { firefox_user_prefs: firefoxPrefs } : {}) })
-    : await Camoufox({ headless, ...(firefoxPrefs ? { firefox_user_prefs: firefoxPrefs } : {}) });
+    ? await Camoufox({ headless, os, window: WINDOW_SIZE, ...(firefoxPrefs ? { firefox_user_prefs: firefoxPrefs } : {}) })
+    : await Camoufox({ headless, window: WINDOW_SIZE, ...(firefoxPrefs ? { firefox_user_prefs: firefoxPrefs } : {}) });
   sharedBrowser = browser;
 
   const userAgent = loadUserAgent();
@@ -211,18 +223,22 @@ async function getOrCreatePersistentPage(hostname: string): Promise<{ page: Page
   return promise;
 }
 
+type TryFetchResponse = { challenged: false, content: string} | { challenged: true } | null;
+
 // Tries to fetch `url` through an already-cleared persistent page's own
 // live session (same-origin fetch() carries its cookies, and runs through
 // the real browser's network stack - same reasoning as the magnet-POST/
 // wlinks-POST flows that already did this). Returns null (never throws) on
 // any failure - the caller falls back to a real navigation instead of
 // treating a fetch error as fatal.
-async function tryFetch(page: Page, url: string, init: RequestInit): Promise<string | null> {
+async function tryFetch(page: Page, url: string, init: RequestInit): Promise<TryFetchResponse> {
   if (page.isClosed()) return null;
   try {
-    return await page.evaluate<string, { url: string; init: RequestInit }>(async ({ url, init }) => {
+    return await page.evaluate<TryFetchResponse, { url: string; init: RequestInit }>(async ({ url, init }) => {
       const res = await fetch(url, init);
-      return await res.text();
+      return res.headers.get('cf-mitigated') === 'challenge'
+        ? { challenged: true }
+        : { challenged: false, content: await res.text() };
     }, { url, init });
   } catch {
     return null;
@@ -236,14 +252,14 @@ async function tryFetch(page: Page, url: string, init: RequestInit): Promise<str
 const CACHE_TTL_MS = Number(process.env.CACHE_TTL_MS) || 5 * 60 * 1000;
 const pageCache = new TTLCache<string>(CACHE_TTL_MS);
 
-// A GET navigates straight to `url`. Anything else (a POST to an AJAX
-// endpoint isn't a page you can navigate to) reuses wherever the page
-// already is, falling back to the origin root if it has no real history yet
-// (about:blank).
-function pickNavigateTarget(url: string, currentUrl: string, isGet: boolean): string {
-  if (isGet) return url;
-  if (currentUrl && currentUrl !== 'about:blank') return currentUrl;
-  return new URL(url).origin + '/';
+// Cloudflare marks a challenged response with `cf-mitigated: challenge`. Read
+// off the header for a navigation response, and off the flag tryFetch already
+// derived from it for a fetch, since the body of a challenged fetch is never
+// carried back.
+export function isChallenge(response: TryFetchResponse | PlaywrightResponse | null): response is { challenged: true } | PlaywrightResponse {
+  if (response === null) return false;
+  if ('challenged' in response) return response.challenged;
+  return response.headers()['cf-mitigated'] === 'challenge';
 }
 
 // General-purpose Cloudflare-aware fetch, cached. Fast path: fetch() through
@@ -264,7 +280,6 @@ export async function cfFetch(url: string, opts: FetchOptions = {}): Promise<str
   if (cached !== undefined) return cached;
 
   const { page, usingProxy } = await getOrCreatePersistentPage(new URL(url).hostname);
-  const navigateTarget = pickNavigateTarget(url, page.url(), isGet);
 
   // A brand-new page starts at about:blank, where fetch()'s same-origin
   // credential/CORS rules mean tryFetch() below is guaranteed to fail no
@@ -274,14 +289,23 @@ export async function cfFetch(url: string, opts: FetchOptions = {}): Promise<str
   // first, so tryFetch has an actual chance to succeed. On every call after
   // that first one, the page is already on the right origin and this is a
   // no-op.
+  let firstNav = false;
+  let response: PlaywrightResponse | null = null;
+
   if (page.url() === 'about:blank') {
-    await serializeNav(() => page.goto(navigateTarget, { waitUntil: 'domcontentloaded', timeout: 60000 })).catch(() => {});
+    response = await serializeNav(() => page.goto(url, { waitUntil: 'commit', timeout: 15000 }));
+    firstNav = true;
   }
 
-  const fast = await tryFetch(page, url, init);
-  if (fast !== null && !isChallenge(fast) && !isBlocked(fast)) {
-    pageCache.set(cacheKey, fast);
-    return fast;
+  if (!isChallenge(response)) {
+    const fast = await tryFetch(page, url, init);
+    if (fast !== null && !isChallenge(fast)) {
+      if (isBlocked(fast.content)) {
+        throw new Error(`cfFetch: fetch failed for ${url} even though the page shows no challenge - probably your IP got blocked.`);
+      }
+      pageCache.set(cacheKey, fast.content);
+      return fast.content;
+    }
   }
 
   console.error(`[cf] cfFetch: fast path unavailable for ${url}, recovering session.`);
@@ -289,16 +313,33 @@ export async function cfFetch(url: string, opts: FetchOptions = {}): Promise<str
   // the solve mutex, so we wait on our own time rather than holding the mutex
   // while the page loads. Errors ignored: there may be no navigation in
   // flight at all, which is not a problem.
-  await page.waitForLoadState('load', { timeout: 60000 }).catch(() => {});
-  await serializeSolve(() => solveChallenge(page, navigateTarget));
+  if (!firstNav) {
+    response = await serializeNav(() => page.goto(url, { waitUntil: 'commit', timeout: 15000 }));
+  }
+
+  if (!isChallenge(response)) {
+    throw new Error(`Cloudflare fetch failed and the page shows no solvable challenge for ${url}`);
+  }
+
+  const clearance = await serializeSolve(async () => {
+    await page.waitForLoadState('load', { timeout: 60000 }).catch(() => {});
+
+    try {
+      return await solveChallenge(page);
+    } catch (err: unknown) {
+      console.error(`[cf] solveChallenge failed for ${url}: ${(err as Error).message}`);
+      throw err;
+    }
+  });
+  console.error(`[cf] cf_clearance obtained (${clearance.slice(0, 8)}...).`);
   if (!usingProxy) saveCookies(await page.context().cookies());
 
   const retried = await tryFetch(page, url, init);
-  if (retried === null || isChallenge(retried) || isBlocked(retried)) {
+  if (retried === null || isChallenge(retried) || isBlocked(retried.content)) {
     throw new Error(`cfFetch: fetch failed for ${url} even after session recovery.`);
   }
-  pageCache.set(cacheKey, retried);
-  return retried;
+  pageCache.set(cacheKey, retried.content);
+  return retried.content;
 }
 
 export async function closeBrowser(): Promise<void> {
