@@ -83,20 +83,7 @@ test('an unreadable page whose url() also throws still fails cleanly', async () 
   await assert.rejects(() => solveChallenge(page), /htmlLen=0/);
 });
 
-test('solveChallenge fails clearly when there is no DISPLAY to click on', async () => {
-  const saved = process.env.DISPLAY;
-  delete process.env.DISPLAY;
-
-  try {
-    const page = fakePage(async () => '<div class="cf-turnstile"></div>');
-
-    await assert.rejects(
-      () => solveChallenge(page),
-      /DISPLAY/,
-      'without an X display the solver cannot inject input at all, and should say so instead of failing as a generic timeout'
-    );
-  } finally {
-    if (saved === undefined) delete process.env.DISPLAY;
-    else process.env.DISPLAY = saved;
-  }
-});
+// The solver used to shell out to xdotool and needed a reachable X display of
+// its own, so there was a test here for failing loudly without one. Clicking
+// now goes through Camoufox's humanized cursor via page.mouse, which needs
+// nothing beyond the page itself, so that failure mode no longer exists.

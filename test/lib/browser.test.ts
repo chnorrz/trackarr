@@ -13,17 +13,20 @@ const ROOT = path.resolve(__dirname, '..', '..');
 process.env.DATA_DIR = await import('node:fs/promises').then((fs) => fs.mkdtemp(path.join(os.tmpdir(), 'trackarr-browser-test-')));
 
 // Fake Playwright Page - only isClosed()/evaluate()/url() are exercised by
-// cfFetch()'s fast path (tryFetch), which is all this test
-// needs: a non-challenge response short-circuits before lib/challenge.ts
-// would be reached at all (that module has its own tests in
-// challenge.test.ts). goto() is still called once first (the about:blank
-// origin-establishing pre-nav) and must exist, even though nothing here
-// asserts on it.
+// cfFetch()'s fast path (tryFetch), which is all this test needs: a
+// non-challenge response short-circuits before lib/challenge.ts would be
+// reached at all (that module has its own tests in challenge.test.ts).
+// evaluate() returns tryFetch()'s {challenged, content} shape, same as a
+// real page.evaluate(fetch(...)) call would. goto() is still called once
+// first (the about:blank origin-establishing pre-nav) and must return
+// something with a headers() method - cfFetch reads the nav response's
+// cf-mitigated header unconditionally, even on this test's happy path
+// where the value itself is never used.
 const fakePage = {
   isClosed: () => false,
-  evaluate: async () => '<html><body>cleared, not a challenge</body></html>',
+  evaluate: async () => ({ challenged: false, content: '<html><body>cleared, not a challenge</body></html>' }),
   url: () => 'about:blank',
-  goto: async () => {}
+  goto: async () => ({ headers: () => ({}), status: () => 200 })
 };
 
 let newPageCalls = 0;
