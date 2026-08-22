@@ -12,11 +12,19 @@ const ROOT = path.resolve(__dirname, '..', '..');
 // solveChallenge() path that bails before it would touch a real page.
 const { isBlocked, isChallenge, solveChallenge } = await import(path.join(ROOT, 'dist', 'lib', 'challenge.js'));
 
-// Minimal stand-in for a Playwright Page - solveChallenge only calls
-// waitForLoadState() and content() before deciding whether there is
-// anything to solve.
+// Minimal stand-in for a Playwright Page. solveChallenge attaches a
+// 'response' listener (watchChallenge, which reads the cf-mitigated header)
+// before it reads content() to decide whether there is anything to solve, so
+// the fake needs on/off/mainFrame too.
+const pageEvents = {
+  on: () => {},
+  off: () => {},
+  mainFrame: () => ({})
+};
+
 function fakePage(content: () => Promise<string>) {
   return {
+    ...pageEvents,
     waitForLoadState: async () => {},
     content,
     // Only read when content() throws, to say which page it was.
@@ -45,25 +53,43 @@ test('isBlocked needs both markers, not either one', () => {
   assert.equal(isBlocked('<p>Powered by Cloudflare</p>'), false);
 });
 
-test('solveChallenge refuses a page that shows no solvable challenge', async () => {
-  const page = fakePage(async () => '<html><body>a hard block, or just an unrelated failure</body></html>');
+test('solveChallenge refuses a hard block - clicking cannot fix an IP ban', async () => {
+  const page = fakePage(async () => '<html><body><h1>Access denied</h1><p>Cloudflare Ray ID</p></body></html>');
 
   await assert.rejects(
     () => solveChallenge(page),
-    /no solvable challenge/,
-    'a page with no Turnstile widget is not something clicking can fix - it must fail loudly rather than sit in the poll loop until the budget runs out'
+    /hard block/,
+    'a ban page has no widget, so it must fail loudly rather than sit in the poll loop until the budget runs out'
   );
 });
 
-test('solveChallenge treats an unreadable page as nothing to solve', async () => {
-  // page.content() throws mid-navigation during Cloudflare's redirect chain;
-  // safeContent() swallows that and yields '', which must not be mistaken
-  // for a challenge.
+test('solveChallenge returns instead of throwing when the page is already clear', async () => {
+  // Real content with no challenge markers means someone else already did the
+  // work - concurrent cfFetch calls for one host share a page, so the second
+  // to reach the solve mutex finds it cleared. Throwing here broke every
+  // multi-category browse; the caller re-validates with its own fetch anyway.
+  const page = {
+    ...pageEvents,
+    waitForLoadState: async () => {},
+    content: async () => '<html><body>real listing, no challenge here</body></html>',
+    url: () => 'https://example.test/browse',
+    context: () => ({ cookies: async () => [{ name: 'cf_clearance', value: 'abc123def456' }] })
+  };
+
+  assert.equal(await solveChallenge(page), 'abc123def456');
+});
+
+test('an unreadable page is not mistaken for a cleared one', async () => {
+  // page.content() throws mid-navigation during Cloudflare's redirect chain and
+  // safeContent() yields ''. That is "unknown", not "clear" - it must fall
+  // through to the poll loop (which keys off the cf-mitigated header and the
+  // URL, neither needing a readable document) rather than return a bogus
+  // success. With no DISPLAY in the test env that surfaces as the xdotool bail.
   const page = fakePage(async () => {
     throw new Error('Execution context was destroyed');
   });
 
-  await assert.rejects(() => solveChallenge(page), /htmlLen=0/);
+  await assert.rejects(() => solveChallenge(page), /DISPLAY\/xdotool/);
 });
 
 test('an unreadable page whose url() also throws still fails cleanly', async () => {
@@ -71,6 +97,7 @@ test('an unreadable page whose url() also throws still fails cleanly', async () 
   // page.url() from inside its own catch block, so an unguarded call there
   // escapes the helper and breaks the poll loop instead of yielding ''.
   const page = {
+    ...pageEvents,
     waitForLoadState: async () => {},
     content: async () => {
       throw new Error('Target closed');
@@ -80,7 +107,7 @@ test('an unreadable page whose url() also throws still fails cleanly', async () 
     }
   };
 
-  await assert.rejects(() => solveChallenge(page), /htmlLen=0/);
+  await assert.rejects(() => solveChallenge(page), /DISPLAY\/xdotool/);
 });
 
 // The solver used to shell out to xdotool and needed a reachable X display of

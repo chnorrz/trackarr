@@ -1,16 +1,10 @@
 import { test, mock } from 'node:test';
 import assert from 'node:assert/strict';
-import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.resolve(__dirname, '..', '..');
-
-// Isolate cookie/UA file reads+writes from the real dev environment - these
-// are guarded by try/catch and safe to point at a directory with nothing in
-// it, but there's no reason to touch real files for a test.
-process.env.DATA_DIR = await import('node:fs/promises').then((fs) => fs.mkdtemp(path.join(os.tmpdir(), 'trackarr-browser-test-')));
 
 // Fake Playwright Page - only isClosed()/evaluate()/url() are exercised by
 // cfFetch()'s fast path (tryFetch), which is all this test needs: a

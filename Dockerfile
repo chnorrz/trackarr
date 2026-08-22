@@ -72,13 +72,16 @@ RUN DEBIAN_FRONTEND=noninteractive apt-get update && \
 
 COPY --from=builder /app/dist ./
 
-ENV DATA_DIR=/data
+
 ENV PORT=9117
 # The browser runs non-headless against this display. It must be a real size:
 # Camoufox's built-in 'virtual' mode uses a 1x1 screen, which leaves nowhere
 # to render or click the Turnstile widget.
 ENV DISPLAY=:99
-VOLUME ["/data"]
 EXPOSE 9117
 
-CMD ["bash", "-c", "Xvfb :99 -screen 0 1280x900x24 -ac +extension GLX & sleep 2 && exec node server.js"]
+# The lock/socket removal is load-bearing on restart: the container filesystem
+# survives `docker restart`, and a leftover /tmp/.X99-lock makes Xvfb refuse to
+# start. Every browser launch then dies with "cannot open display: :99" and
+# every search fails, permanently. Only a full `docker run` recovered it.
+CMD ["bash", "-c", "rm -f /tmp/.X99-lock /tmp/.X11-unix/X99; Xvfb :99 -screen 0 1280x900x24 -ac +extension GLX & sleep 2 && exec node server.js"]

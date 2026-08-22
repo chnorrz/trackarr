@@ -68,8 +68,11 @@ Prowlarr  ──HTTP──>  trackarr  ──> headless Firefox (Camoufox)  ─�
   it's failing - reflects both the background keep-alive and real Prowlarr
   requests, whichever happened more recently. No apikey needed.
 
-`.cf-cookies.json` in the data volume holds the Cloudflare clearance, so
-restarts don't trigger a fresh challenge.
+Cloudflare clearances live in the browser's own cookie jar for the life of the
+process and are **not** written to disk, so a restart solves fresh. That's
+deliberate: a clearance is bound to the exact browser fingerprint and egress IP
+it was issued to, and replaying a stale one is worse than having none. The
+background keep-alive warms every provider at boot, before Prowlarr asks.
 
 ---
 
@@ -78,12 +81,9 @@ restarts don't trigger a fresh challenge.
 Pull the published image:
 
 ```bash
-docker volume create trackarr-data
-
 docker run -d --name trackarr \
   -p 9117:9117 \
   -e API_KEY=pick-something-random \
-  -v trackarr-data:/data \
   ghcr.io/chnorrz/trackarr:latest
 ```
 
@@ -94,7 +94,6 @@ docker build -t trackarr .
 docker run -d --name trackarr \
   -p 9117:9117 \
   -e API_KEY=pick-something-random \
-  -v trackarr-data:/data \
   trackarr
 ```
 
@@ -174,7 +173,6 @@ All via environment variables.
 |---|---|---|
 | `API_KEY` | `changeme` | Key Prowlarr must send. **Set this.** |
 | `PORT` | `9117` | HTTP port |
-| `DATA_DIR` | `/data` | Where the Cloudflare cookie is persisted |
 | `CACHE_TTL_MS` | `300000` | Fetch cache lifetime (5 min) |
 | `MAGNET_CACHE_TTL_MS` | `3600000` | Magnet cache lifetime (1 h) |
 | `KEEPALIVE_INTERVAL_MS` | `900000` | Background Cloudflare warm-up (15 min). `0` disables |
