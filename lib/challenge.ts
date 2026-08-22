@@ -1,5 +1,5 @@
 import { execFileSync, spawn, type ChildProcess } from 'child_process';
-import type { Page } from 'playwright-core';
+import type { Page, Response as PlaywrightResponse } from 'playwright-core';
 
 // Solve-loop timing. See NOTES.md section 6 for where these came from.
 const POLL_INTERVAL_MS = 250;
@@ -7,8 +7,6 @@ const PROBE_INTERVAL_MS = 500;
 const CLICK_COOLDOWN_MS = 4000;
 const SOLVE_BUDGET_MS = 45000;
 const MOVE_SETTLE_MS = 60;
-const CLEAR_SETTLE_MS = 1500;
-const NAV_QUIET_MS = 500;
 const NAV_SETTLE_TIMEOUT_MS = 8000;
 const MIN_WIDGET_HEIGHT = 20;
 const MAX_WIDGET_HEIGHT = 120;
@@ -17,7 +15,11 @@ const CHECKBOX_INSET = 25;
 const WIDGET_ANCESTOR_DEPTHS = [1, 2, 3, 4];
 const BOX_READ_TIMEOUT_MS = 1000;
 const TURNSTILE_INPUT = 'input[name="cf-turnstile-response"]';
-const CHALLENGE_INDICATORS = `${TURNSTILE_INPUT}, .cf-turnstile, #challenge-form, #challenge-running`;
+// Cloudflare tags its own challenge navigations with these. `__cf_chl_rt_tk`
+// fires within ~100ms of the interstitial and means nothing; `__cf_chl_tk` is
+// the hop that actually completes the challenge. Either one means we are
+// mid-chain and definitely not done - see NOTES.md section 6.
+const CHALLENGE_URL_TOKEN = '__cf_chl';
 
 interface WidgetPos {
   cx: number;
@@ -163,12 +165,56 @@ async function locateCfWidget(page: Page): Promise<CfWidget | null> {
   return { clickOnce };
 }
 
-async function challengeVisible(page: Page): Promise<boolean> {
-  return page
-    .locator(CHALLENGE_INDICATORS)
-    .count()
-    .then((n) => n > 0)
-    .catch(() => false);
+interface ChallengeWatch {
+  cleared: () => boolean;
+  dispose: () => void;
+}
+
+// Decides when the challenge is done, from two protocol-level signals only -
+// no DOM inference, no fixed waits. Both are required; see NOTES.md section 6.
+//
+//   1. A main-frame navigation response arrived WITHOUT `cf-mitigated:
+//      challenge`. That is Cloudflare saying it let this navigation through.
+//      Status is deliberately ignored - EZTV clears via a 302, not a 200.
+//   2. The current URL carries no `__cf_chl` token, so we are not mid-chain.
+//
+// Neither alone is enough. The clearing response arrives while the page is
+// still sitting on the `__cf_chl_tk` URL and about to navigate once more, so
+// trusting the header alone hands the caller a page that navigates out from
+// under its next fetch. And the URL goes clean seconds before anything is
+// solved, right after the meaningless `__cf_chl_rt_tk` hop, so trusting the
+// URL alone reports success almost immediately.
+//
+// `page.on('response')` and `page.url()` are not page scripts, so this is
+// safe under requirement 1 (page.evaluate resets the challenge).
+function watchChallenge(page: Page): ChallengeWatch {
+  let sawClearingResponse = false;
+
+  const onResponse = (res: PlaywrightResponse): void => {
+    try {
+      if (res.frame() !== page.mainFrame()) return;
+      if (!res.request().isNavigationRequest()) return;
+      sawClearingResponse = res.headers()['cf-mitigated'] !== 'challenge';
+    } catch {
+      /* response already gone */
+    }
+  };
+
+  page.on('response', onResponse);
+
+  return {
+    cleared: () => {
+      if (!sawClearingResponse) return false;
+      try {
+        return !page.url().includes(CHALLENGE_URL_TOKEN);
+      } catch {
+        return false;
+      }
+    },
+    // The page outlives the solve, so a listener left behind would accumulate
+    // one per challenge for the life of the process.
+    dispose: () => page.off('response', onResponse)
+  };
 }
 
 let cachedOffset: { x: number; y: number } | null = null;
@@ -185,53 +231,19 @@ async function screenOffset(page: Page): Promise<{ x: number; y: number } | null
   return read;
 }
 
-// Clearing the interstitial only starts Cloudflare's own client-side redirect
-// back to the requested URL, and that chain can have several hops. Returning
-// mid-chain hands the caller a page that navigates out from under its next
-// fetch ("fetch failed even after session recovery").
-//
-// Both halves are needed. The floor is because quiescence alone cannot tell
-// "the redirect finished" from "the redirect hasn't started yet" - waiting on
-// navigation events alone returned immediately and failed 2 of 3 live. The
-// quiet window is because a fixed wait alone is a guess - 1.5s covered most
-// solves but not all, live-observed failing on 1337x.
-async function waitForRedirectChain(page: Page): Promise<void> {
-  let lastNavAt = 0;
-  const onNavigated = (frame: unknown): void => {
-    if (frame === page.mainFrame()) lastNavAt = Date.now();
-  };
-  page.on('framenavigated', onNavigated);
-
-  try {
-    await new Promise((r) => setTimeout(r, CLEAR_SETTLE_MS));
-
-    const deadline = Date.now() + NAV_SETTLE_TIMEOUT_MS;
-    while (Date.now() < deadline && lastNavAt !== 0 && Date.now() - lastNavAt < NAV_QUIET_MS) {
-      await new Promise((r) => setTimeout(r, 50));
-    }
-  } finally {
-    // The page outlives the solve, so a listener left behind would accumulate
-    // one per challenge for the life of the process.
-    page.off('framenavigated', onNavigated);
-  }
-
-  await page.waitForLoadState('load', { timeout: NAV_SETTLE_TIMEOUT_MS }).catch(() => {});
-}
-
-// Confirms the challenge is really gone and not just between navigations -
-// checks twice, POLL_INTERVAL_MS apart, since a page caught mid-redirect
-// can transiently read as cleared.
-async function challengeIsGone(page: Page): Promise<boolean> {
-  if (await challengeVisible(page)) return false;
-  await new Promise((r) => setTimeout(r, POLL_INTERVAL_MS));
-  return !(await challengeVisible(page));
-}
-
+// Scoped to this URL's origin. Unscoped, context.cookies() returns every
+// domain's cookies and find() can report another tracker's clearance as this
+// solve's result - live-observed, with one unchanged value logged as
+// "obtained" across several consecutive failed 1337x solves.
 async function getClearanceCookie(page: Page): Promise<string> {
-  const cookies = await page.context().cookies();
+  // Only called once the challenge has cleared, which by definition means
+  // page.url() is a real, settled, token-free URL on the host whose session
+  // we just established.
+  const url = page.url();
+  const cookies = await page.context().cookies(url).catch(() => []);
   const value = cookies.find((c) => c.name === 'cf_clearance')?.value;
   if (value === undefined) {
-    console.error('[cf] challenge cleared per page content, but no cf_clearance cookie found in the jar.');
+    console.error(`[cf] challenge cleared but no cf_clearance cookie found for ${url}.`);
     return '';
   }
   return value;
@@ -251,42 +263,77 @@ async function getClearanceCookie(page: Page): Promise<string> {
 // widget yet" as "try again shortly", never as terminal failure - only the
 // overall budget running out is failure.
 export async function solveChallenge(page: Page): Promise<string> {
-  const html = await safeContent(page);
+  // Attached before anything else so no navigation response is missed.
+  const watch = watchChallenge(page);
 
-  if (!isChallenge(html)) {
-    throw new Error(
-      `Cloudflare fetch failed and the page shows no solvable challenge ` +
-        `(htmlLen=${html.length}) - likely a hard block (IP ban/rate limit) or an unrelated failure.`
-    );
-  }
+  try {
+    const html = await safeContent(page);
 
-  const pointer = createPointer();
-
-  if (!pointer) {
-    throw new Error('Cloudflare challenge present but no DISPLAY/xdotool available to solve it.');
-  }
-
-  console.error('[cf] auto-solving challenge (X-level input)...');
-  const solveStart = Date.now();
-
-  const deadline = solveStart + SOLVE_BUDGET_MS;
-  let nextClickAt = 0;
-
-  while (Date.now() < deadline) {
-    if (await challengeIsGone(page)) {
-      console.error(`[cf] challenge cleared after ${Date.now() - solveStart}ms.`);
-      await waitForRedirectChain(page);
-      return getClearanceCookie(page);
+    // A hard block has no widget, so clicking can never help - fail loudly.
+    if (isBlocked(html)) {
+      throw new Error(
+        `Cloudflare hard block (IP ban/rate limit) - no challenge to solve (htmlLen=${html.length}).`
+      );
     }
 
-    if (Date.now() >= nextClickAt) {
-      const widget = await locateCfWidget(page);
-      if (widget) await widget.clickOnce(pointer);
-      nextClickAt = Date.now() + (widget ? CLICK_COOLDOWN_MS : PROBE_INTERVAL_MS);
+    // Real content and no challenge markers: nothing to do. Usually a
+    // concurrent request for the same host already cleared it while we waited
+    // on the solve mutex - fetchMergedBrowse fires several cfFetch calls that
+    // share one page, so the second one arrives to find the work done.
+    // Live-caught on multi-category browse: htmlLen=622095, a full ext.to
+    // listing, reported as "no solvable challenge". The caller re-validates
+    // with its own fetch immediately after, so returning here is safe.
+    if (html && !isChallenge(html)) {
+      return await getClearanceCookie(page);
     }
 
-    await new Promise((r) => setTimeout(r, POLL_INTERVAL_MS));
-  }
+    // Empty html means page.content() failed, not that there is no challenge.
+    // Fall through: the poll loop keys off the cf-mitigated header and the URL,
+    // neither of which needs a readable document, and the budget bounds it.
 
-  throw new Error(`Cloudflare challenge did not clear.`);
+    const pointer = createPointer();
+
+    if (!pointer) {
+      throw new Error('Cloudflare challenge present but no DISPLAY/xdotool available to solve it.');
+    }
+
+    console.error('[cf] auto-solving challenge (X-level input)...');
+    const solveStart = Date.now();
+
+    const deadline = solveStart + SOLVE_BUDGET_MS;
+    let nextClickAt = 0;
+    let clicks = 0;
+    let widgetSeen = false;
+
+    while (Date.now() < deadline) {
+      if (watch.cleared()) {
+        console.error(`[cf] challenge cleared after ${Date.now() - solveStart}ms (${clicks} clicks).`);
+        // Already on the final, token-free URL by definition of cleared() -
+        // all that's left is letting that document finish loading.
+        await page.waitForLoadState('load', { timeout: NAV_SETTLE_TIMEOUT_MS }).catch(() => {});
+        return await getClearanceCookie(page);
+      }
+
+      if (Date.now() >= nextClickAt) {
+        const widget = await locateCfWidget(page);
+        if (widget) {
+          widgetSeen = true;
+          clicks++;
+          await widget.clickOnce(pointer);
+        }
+        nextClickAt = Date.now() + (widget ? CLICK_COOLDOWN_MS : PROBE_INTERVAL_MS);
+      }
+
+      await new Promise((r) => setTimeout(r, POLL_INTERVAL_MS));
+    }
+
+    // Name the state we got stuck in - a bare "did not clear" cost hours of
+    // unreadable logs.
+    const stuck = widgetSeen
+      ? `widget rendered and was clicked ${clicks}x but Cloudflare never let a navigation through`
+      : 'no widget ever rendered and the challenge never self-cleared';
+    throw new Error(`Cloudflare challenge did not clear after ${SOLVE_BUDGET_MS}ms: ${stuck}.`);
+  } finally {
+    watch.dispose();
+  }
 }

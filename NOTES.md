@@ -219,7 +219,16 @@ exactly correct 20/20/-/20 split across Movies/TV/Music/Other.
 
 1337x has banned our **IPv4** address; our IPv6 is clean. It therefore works
 in a desktop browser but not from the container, and needs the host proxy —
-see [section 4](#4-ipv4-bans-and-the-ipv6-proxy). Unlike other providers,
+see [section 4](#4-ipv4-bans-and-the-ipv6-proxy).
+
+**Re-confirmed since, with a refinement.** IPv4 still returns the ban, but as
+a terse 17-byte `error code: 1006` body that does **not** contain the
+`banned your IP` string section 4's recipe greps for — that check can
+false-negative, so also check the response size. IPv6 is no longer "clean" in
+the sense of sailing through: it now gets a **Cloudflare challenge**. That is
+a much better outcome than a ban, because a challenge is solvable — it
+self-clears in ~7s (see section 6). The proxy is still required and still
+working; traffic demonstrably reaches 1337x through it. Unlike other providers,
 `providers/1337x.ts` requests nothing proxy-related itself - routing is
 decided entirely by `lib/browser.ts`'s `DOMAIN_OVER_PROXY` (unset by
 default), matched against the hostname of whatever URL is being fetched.
@@ -331,13 +340,17 @@ navigation and every embedded sub-resource alike - see the "Gotcha" below
 for why that per-request granularity, rather than a per-provider flag, is
 what actually matters here.
 
-Cookies are only persisted for hostnames not in `DOMAIN_OVER_PROXY`, so a
-proxied domain's `cf_clearance` (bound to the proxy's egress IP) cannot
-clobber a direct domain's like ext.to's.
+Cookies are no longer persisted at all (section 5), so the old rule about
+keeping a proxied domain's `cf_clearance` out of the shared file - and the
+`usingProxy`/`domainUsesProxy` plumbing that enforced it - is gone. Each
+hostname's clearance simply lives in the browser jar for the life of the
+process. Note the claim that used to be here was false in practice anyway:
+`context.cookies()` with no argument returns *every* domain's cookies, so a
+proxied domain's clearance did get written whenever a direct domain saved.
 
 **Do not proxy a domain that works directly.** `cf_clearance` is bound to
 the egress IP (section 5), so routing ext.to through the proxy would
-invalidate its stored cookie.
+invalidate the clearance it already holds for its direct egress.
 
 ### Gotcha: a whole-context proxy strands Cloudflare's own challenge assets
 
@@ -507,6 +520,50 @@ cf_clearance genuinely cannot be replayed there. **All requests, including
 the magnet POST, must run inside the browser page** via
 `page.evaluate(fetch...)`.
 
+### Why cf_clearance is not persisted
+
+Clearances live in the browser's own jar for the life of the process and are
+**never written to disk**. There is no `.cf-cookies.json`, no `.cf-ua.txt`, no
+`DATA_DIR`, and the image declares no volume. This was removed deliberately —
+don't reinstate it without reading this.
+
+The persistence never worked. `UA_FILE` arrived with the VNC solver
+(`3b08b1e`); deleting that flow took the *writer* with it and left
+`loadUserAgent()` reading a file nothing ever created. So every restart
+replayed a stored clearance under a freshly randomised Camoufox fingerprint,
+which is exactly what the list above says Cloudflare rejects.
+
+**And a mismatched clearance is worse than none.** Live-caught: after a
+container restart EZTV failed three times running with `no widget ever
+rendered and the challenge never self-cleared` (full 45s budget each), then
+succeeded immediately once `/data/.cf-cookies.json` was deleted.
+
+Fixing it properly would have meant persisting the **whole fingerprint**, not
+the UA. Camoufox generates a BrowserForge fingerprint where `userAgent` is one
+field of `NavigatorFingerprint`, alongside `userAgentData`, `oscpu`,
+`platform`, the header set, screen metrics, WebGL and fonts — all mutually
+consistent. Overriding just the string via `newContext({ userAgent })`
+desynchronises it from the rest, which is a detectable tell in its own right.
+Camoufox does expose `fingerprint?: Fingerprint` for this, but
+`generateFingerprint` is not in camoufox-js's public exports (only `Camoufox`,
+`NewBrowser`, `launchOptions`, `launchServer`), so it needs a deep import or a
+direct `fingerprint-generator` dependency, plus a version guard so a persisted
+fingerprint doesn't outlive the Firefox build it describes.
+
+Even then it could not be reliable: the clearance is bound to the **IP** too,
+so any egress change silently invalidates it regardless of fingerprint.
+
+Measured expiry, for the record: `cf_clearance` is issued with a **~359 day**
+lifetime on all three trackers, so expiry is never the failure mode — the
+fingerprint and IP bindings are.
+
+Cost of dropping it: one cold solve per provider per restart, which the
+keep-alive already performs at boot before Prowlarr asks (section 9: 19.3s /
+17.3s at boot, sub-second after). That is what was happening in practice
+anyway. It also deleted `usingProxy`/`domainUsesProxy`, which existed solely
+to decide whether a proxied domain's clearance was safe to write to the shared
+file.
+
 ---
 
 ## 6. The auto-solver
@@ -672,6 +729,102 @@ Checking "is the challenge gone" first, every iteration, instead of only
 inferring it from a successful click, fixes that: a passive clear during the
 warm-up now resolves instantly rather than reporting a false failure.
 
+### Knowing when the challenge is actually done
+
+Use Cloudflare's own protocol-level signals. **Two, and both are required:**
+
+1. A main-frame **navigation response without `cf-mitigated: challenge`** -
+   Cloudflare saying it let that navigation through. Status is deliberately
+   ignored: EZTV clears via a **302**, not a 200, and lands on a *different*
+   URL than the one requested (`/search/?q1=the` → `/search/the`).
+2. The current URL carries **no `__cf_chl` token**.
+
+Cloudflare uses two different tokens, and confusing them is a trap:
+
+| Token | When | Meaning |
+|---|---|---|
+| `__cf_chl_rt_tk` | ~100ms in, immediately | nothing - fires before anything is solved |
+| `__cf_chl_tk` | at the end | the hop that actually completes the challenge |
+
+Measured live, all three providers, each showing why one signal alone fails:
+
+| | `__cf_chl_rt_tk` hop | URL clean again | genuinely cleared |
+|---|---|---|---|
+| ext.to | +378ms | **+455ms** | +12653ms |
+| 1337x | +867ms | **+962ms** | +7553ms |
+| EZTV | +307ms | **+368ms** | +8078ms |
+
+So "URL had a token, now it doesn't" reports success in under half a second.
+And the clearing *response* arrives while the page is still sitting on the
+`__cf_chl_tk` URL, about to navigate once more - so trusting the header alone
+hands the caller a page that navigates out from under its next fetch. Require
+both and the verdict lands exactly right: **1337x 7.4s, EZTV 6.3s, ext.to 8.0s**,
+each confirmed by checking the interstitial markup was really gone.
+
+`page.on('response')` and `page.url()` are not page scripts, so this is safe
+under requirement 1.
+
+**This replaced DOM-selector detection, which was silently broken.** The old
+exit check was `input[name="cf-turnstile-response"], .cf-turnstile,
+#challenge-form, #challenge-running` - all Turnstile-specific. But **the
+Turnstile markup is injected ~2s after the interstitial paints** (measured:
+1337x +2.3s, EZTV +2.5s, ext.to +4.5s), so for the first couple of seconds
+every selector returned 0 and the solver declared victory on a challenge that
+had barely started. Entry used text (`isChallenge()`: `'cf-turnstile'` or
+`'Just a moment'`) and matched fine, so the two checks disagreed. Live
+signature: `challenge cleared after 299-342ms` followed by `fetch failed even
+after session recovery`, repeated for 7 hours across every 1337x keep-alive.
+
+It also removed the old fixed-floor-plus-quiescence wait (`CLEAR_SETTLE_MS`,
+`NAV_QUIET_MS`). Those existed to guess when the redirect chain had settled;
+signal 2 answers that exactly, so the guess is gone. All that remains after
+clearing is `waitForLoadState('load')`.
+
+### "No solvable challenge" is usually a race, not a failure
+
+`solveChallenge()` must **not** treat "the page shows no challenge" as an
+error. Concurrent `cfFetch()` calls for one host share a single persistent
+page, and `serializeSolve` lets only one solve at a time - so the second
+caller reaches the mutex *after* the first already cleared the page, reads
+real content, and used to throw `no solvable challenge`.
+
+Live-caught on multi-category browse (`fetchMergedBrowse` fires one fetch per
+category): `htmlLen=622095` - a full 622 KB ext.to listing - reported as if it
+were a hard block. Every blank-query browse failed this way after a restart.
+
+The entry check now distinguishes three cases:
+
+| Page content | Action |
+|---|---|
+| `isBlocked()` | throw - a ban page has no widget, clicking cannot help |
+| real content, no challenge markers | **return the clearance** - someone else already solved it |
+| empty (`page.content()` threw) | fall through to the poll loop - "unknown", not "clear" |
+
+The empty case matters: the loop keys off the `cf-mitigated` header and the
+URL token, neither of which needs a readable document, so an unreadable page
+is still solvable. Returning success there would be a lie; throwing would
+give up on a solvable challenge.
+
+Returning optimistically is safe because `cfFetch()` always re-validates with
+its own `tryFetch()` immediately afterwards and raises `fetch failed even
+after session recovery` if the session really is bad.
+
+### 1337x and EZTV clear passively - don't assume a checkbox
+
+Both currently self-clear with **zero clicks** (1337x ~7.4s, EZTV ~6.3s). A
+Turnstile input does get injected, but is never interacted with and the
+challenge completes anyway. A screenshot at 0.6s shows "Performing security
+verification" with a spinner and no checkbox. The interstitial's `<title>` is
+still `Just a moment...`, which is why `isChallenge()` matches it.
+
+**ext.to genuinely needs the click** - live-confirmed it does not clear on its
+own within 40s, and clears ~8s after clicking. So the click loop stays.
+
+Consequence worth knowing: `createPointer()` returning null (no
+`DISPLAY`/xdotool, e.g. macOS local dev) makes `solveChallenge()` throw
+immediately - even for a challenge that would have cleared on its own had it
+waited. Not a problem in Docker, where DISPLAY always exists.
+
 ### After the solve: don't navigate, just wait
 
 Clearing the challenge only means the interstitial is gone. Cloudflare
@@ -697,23 +850,14 @@ fetch that already runs after every fast-path failure regardless.
 
 **But it must wait for that redirect to finish before returning** - the chain
 can have several hops, and handing back a mid-chain page kills the caller's
-next fetch ("fetch failed even after session recovery"). Two signals, both
-required, each insufficient alone:
+next fetch ("fetch failed even after session recovery").
 
-| Approach | Result |
-|---|---|
-| fixed sleep only | 1.5s covers most solves, live-failed on 1337x |
-| navigation quiescence only | returns instantly, failed 2 of 3 live |
-| **floor, then quiescence** | 5 of 5 live |
-
-Quiescence alone cannot distinguish "the redirect finished" from "it hasn't
-started yet", so it needs the floor underneath it; the floor alone is a
-guess, so it needs the quiet window on top. `waitForLoadState('load')` has
-the same hole as quiescence - a hop can complete before the next begins.
-
-This only became visible once detection moved to locators: the old
-`page.content()` double-check was slow enough (~27KB serialised, twice) to
-sleep through the race by accident.
+This used to be a fixed 1.5s floor plus a navigation-quiescence window, both
+required because each was insufficient alone. **Both are gone**, replaced by
+the `__cf_chl` URL check in "Knowing when the challenge is actually done"
+above, which answers the same question exactly rather than by timing. Kept
+here only because the reasoning explains why a naive `waitForLoadState('load')`
+on its own is not enough: a hop can complete before the next begins.
 
 ### Concurrent navigations hang - `page.goto` needs serializing too
 
@@ -814,6 +958,22 @@ before the routes): `[req] <client ip> "<User-Agent>" <method> <url>`,
 apikey redacted from the URL. Useful for confirming who's actually hitting
 the server (Prowlarr/Sonarr/Radarr all send an identifiable UA) and with
 what params, without needing to reproduce a request by hand.
+
+**Remove old test containers before drawing any conclusion.** The same
+resource-contention trap as below, one level up: several `trackarr` containers
+left running each hold their own Camoufox (~400-800 MB), and Colima's VM
+defaults to under 2 GB. Three at once was enough to OOM-kill the one under
+test. Symptoms look exactly like a code or reputation problem:
+
+- `docker inspect -f '{{.State.OOMKilled}}'` reports `true`
+- `t=caps`, which touches no browser at all, takes **seconds** instead of ~0.1s
+- `page.goto` times out at 15s against a host `curl` fetches in 0.5s
+- solves burn their full budget and report `no widget ever rendered`
+
+Worse if a stale container has `KEEPALIVE_INTERVAL_MS` set low - one was found
+hammering all three trackers every 60s for two hours, wrecking both the local
+VM and the IP's bot score. Check `docker ps` first: `docker stats --no-stream`
+and the `oom` flag distinguish this from a real bug in seconds.
 
 **Never `docker exec node -e "..."` a debug script against the live server
 container.** It's a brand new Node process - it imports `lib/browser.js`

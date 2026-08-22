@@ -1,24 +1,13 @@
 import crypto from 'crypto';
-import fs from 'fs';
-import path from 'path';
-import { fileURLToPath } from 'url';
 import { Camoufox } from 'camoufox-js';
-import type { Browser, BrowserContext, Cookie, Page } from 'playwright-core';
+import type { Browser, BrowserContext, Page } from 'playwright-core';
 import { TTLCache } from './cache.js';
 import { isBlocked, solveChallenge } from './challenge.js';
 import { Response as PlaywrightResponse } from 'playwright-core';
 
-const __dirname = path.dirname(fileURLToPath(import.meta.url));
-// DATA_DIR is configurable so it can point at a mounted volume in Docker -
-// otherwise cookies are lost on every container restart, forcing a cold
-// Cloudflare clearance with no manual-solve fallback available.
-const DATA_DIR = process.env.DATA_DIR || path.join(__dirname, '..');
-const COOKIE_FILE = path.join(DATA_DIR, '.cf-cookies.json');
-// A cf_clearance cookie is bound to the exact User-Agent it was issued to.
-// solve.js records the UA it solved with; we must reuse it verbatim or the
-// cookie is rejected. Camoufox otherwise randomises the spoofed OS (and so
-// the UA) on every launch.
-const UA_FILE = path.join(DATA_DIR, '.cf-ua.txt');
+// Clearances are deliberately NOT persisted across restarts - see NOTES.md
+// section 5, "Why cf_clearance is not persisted".
+//
 // Camoufox otherwise randomises the window size per launch, which can come out
 // larger than the Xvfb screen - live-observed at 2166x1447 on a 1280x900
 // display, leaving part of the page rendered off-screen (so the solver's
@@ -31,26 +20,6 @@ const DOMAIN_OVER_PROXY = (process.env.DOMAIN_OVER_PROXY || '')
   .split(',')
   .map((s) => s.trim())
   .filter(Boolean);
-
-function loadCookies(): Cookie[] | null {
-  try {
-    return JSON.parse(fs.readFileSync(COOKIE_FILE, 'utf8'));
-  } catch {
-    return null;
-  }
-}
-
-function saveCookies(cookies: Cookie[]): void {
-  fs.writeFileSync(COOKIE_FILE, JSON.stringify(cookies, null, 2));
-}
-
-function loadUserAgent(): string | null {
-  try {
-    return fs.readFileSync(UA_FILE, 'utf8').trim() || null;
-  } catch {
-    return null;
-  }
-}
 
 let sharedBrowser: Browser | null = null;
 let sharedContext: BrowserContext | null = null;
@@ -84,11 +53,6 @@ function createSerializer() {
 const serializeSolve = createSerializer();
 const serializeNav = createSerializer();
 
-
-function domainUsesProxy(hostname: string): boolean {
-  if (!PROXY_URL || DOMAIN_OVER_PROXY.length === 0) return false;
-  return DOMAIN_OVER_PROXY.some((d) => hostname === d || hostname.endsWith(`.${d}`));
-}
 
 // Builds a data: URI PAC (Proxy Auto-Config) script routing DOMAIN_OVER_PROXY
 // through PROXY_URL, everything else direct - goes around Playwright's own
@@ -161,13 +125,12 @@ async function launchPersistentContext(): Promise<BrowserContext> {
     : await Camoufox({ headless, window: WINDOW_SIZE, ...(firefoxPrefs ? { firefox_user_prefs: firefoxPrefs } : {}) });
   sharedBrowser = browser;
 
-  const userAgent = loadUserAgent();
-  if (userAgent) console.error(`[cf] using stored User-Agent: ${userAgent}`);
-  const context = await browser.newContext(userAgent ? { userAgent } : {});
+  // No userAgent override and no restored cookies on purpose: Camoufox's
+  // fingerprint is internally consistent, and overriding one field of it (or
+  // replaying a clearance bound to a previous one) is worse than starting
+  // clean. See NOTES.md section 5.
+  const context = await browser.newContext();
   sharedContext = context;
-
-  const cookies = loadCookies();
-  if (cookies) await context.addCookies(cookies).catch(() => {});
   return context;
 }
 
@@ -186,11 +149,8 @@ export type FetchOptions = RequestInit;
 //
 // All hostnames share one browser/context - proxy routing is the PAC
 // script's per-request decision (see DOMAIN_OVER_PROXY above), not a
-// separate context to pick between. usingProxy is tracked per page only so
-// cfFetch knows whether to persist cookies for it: a
-// proxy-obtained cf_clearance is bound to the proxy's egress IP and
-// shouldn't mix into the same file a direct-egress domain relies on.
-const persistentPages = new Map<string, { page: Page; usingProxy: boolean }>();
+// separate context to pick between.
+const persistentPages = new Map<string, Page>();
 
 // In-flight page-creation promise per hostname, so two concurrent first
 // callers for the same new hostname (e.g. a real request racing the
@@ -200,24 +160,40 @@ const persistentPages = new Map<string, { page: Page; usingProxy: boolean }>();
 // referenced again). Mirrors getPersistentContext()'s own
 // persistentContextPromise fix for the same race one level up (browser/
 // context instead of page).
-const persistentPagePromises = new Map<string, Promise<{ page: Page; usingProxy: boolean }>>();
+const persistentPagePromises = new Map<string, Promise<Page>>();
 
-async function getOrCreatePersistentPage(hostname: string): Promise<{ page: Page; usingProxy: boolean }> {
+async function getOrCreatePersistentPage(hostname: string): Promise<Page> {
   const existing = persistentPages.get(hostname);
-  if (existing && !existing.page.isClosed()) return existing;
+  if (existing && !existing.isClosed()) return existing;
+  // Closed page: drop it so a crashed tab can't be handed out again.
+  persistentPages.delete(hostname);
 
   let promise = persistentPagePromises.get(hostname);
   if (!promise) {
     promise = (async () => {
       const context = await getPersistentContext();
       const page = await context.newPage();
-      const entry = { page, usingProxy: domainUsesProxy(hostname) };
-      persistentPages.set(hostname, entry);
-      return entry;
-    })().catch((err) => {
-      persistentPagePromises.delete(hostname);
-      throw err;
-    });
+      persistentPages.set(hostname, page);
+      return page;
+    })()
+      .catch((err) => {
+        // newPage() only fails like this when the context/browser itself is
+        // gone, and a dead context poisons every future call. Drop it so the
+        // next caller relaunches instead of failing forever.
+        sharedContext = null;
+        persistentContextPromise = null;
+        throw err;
+      })
+      // Must clear on success too, not just on error. This map exists only to
+      // dedupe *in-flight* creation; leaving a resolved promise in it meant a
+      // page that later crashed was served from here forever, since the
+      // isClosed() check above skips persistentPages but this cache still
+      // returned the same dead page. Live-caught: 1337x failed every keepalive
+      // tick with "Target page, context or browser has been closed" and never
+      // recovered.
+      .finally(() => {
+        persistentPagePromises.delete(hostname);
+      });
     persistentPagePromises.set(hostname, promise);
   }
   return promise;
@@ -273,13 +249,12 @@ export function isChallenge(response: TryFetchResponse | PlaywrightResponse | nu
 export async function cfFetch(url: string, opts: FetchOptions = {}): Promise<string> {
   const { method = 'GET', headers, body } = opts;
   const init: RequestInit = { method, headers, body };
-  const isGet = method.toUpperCase() === 'GET';
   const cacheKey = crypto.createHash('sha256').update(`${method}:${url}:${body ?? ''}`).digest('hex');
 
   const cached = pageCache.get(cacheKey);
   if (cached !== undefined) return cached;
 
-  const { page, usingProxy } = await getOrCreatePersistentPage(new URL(url).hostname);
+  const page = await getOrCreatePersistentPage(new URL(url).hostname);
 
   // A brand-new page starts at about:blank, where fetch()'s same-origin
   // credential/CORS rules mean tryFetch() below is guaranteed to fail no
@@ -317,22 +292,27 @@ export async function cfFetch(url: string, opts: FetchOptions = {}): Promise<str
     response = await serializeNav(() => page.goto(url, { waitUntil: 'commit', timeout: 15000 }));
   }
 
-  if (!isChallenge(response)) {
-    throw new Error(`Cloudflare fetch failed and the page shows no solvable challenge for ${url}`);
+  // Only solve when the recovery navigation actually came back challenged. A
+  // clean response means the session already recovered - the navigation alone
+  // was enough - so fall through to the retry below instead of erroring on a
+  // page that is now perfectly usable. Live-caught after a container restart:
+  // EZTV's fast path failed on a stale cookie, the recovery navigation
+  // returned a clean 200, and this threw anyway.
+  if (isChallenge(response)) {
+    const clearance = await serializeSolve(async () => {
+      await page.waitForLoadState('load', { timeout: 60000 }).catch(() => {});
+
+      try {
+        return await solveChallenge(page);
+      } catch (err: unknown) {
+        console.error(`[cf] solveChallenge failed for ${url}: ${(err as Error).message}`);
+        throw err;
+      }
+    });
+    // Kept in the browser's own jar for the life of the process; never
+    // written to disk (NOTES.md section 5).
+    if (clearance) console.error(`[cf] cf_clearance obtained (${clearance.slice(0, 8)}...).`);
   }
-
-  const clearance = await serializeSolve(async () => {
-    await page.waitForLoadState('load', { timeout: 60000 }).catch(() => {});
-
-    try {
-      return await solveChallenge(page);
-    } catch (err: unknown) {
-      console.error(`[cf] solveChallenge failed for ${url}: ${(err as Error).message}`);
-      throw err;
-    }
-  });
-  console.error(`[cf] cf_clearance obtained (${clearance.slice(0, 8)}...).`);
-  if (!usingProxy) saveCookies(await page.context().cookies());
 
   const retried = await tryFetch(page, url, init);
   if (retried === null || isChallenge(retried) || isBlocked(retried.content)) {

@@ -32,8 +32,6 @@ services:
       # explicitly named here. Not set by default since needing this at all
       # is specific to your situation (see NOTES.md section 4) - add it
       # yourself, e.g. DOMAIN_OVER_PROXY: "1337x.to"
-    volumes:
-      - trackarr-data:/data
     networks:
       - media_default   # external: Prowlarr's existing network, join it to be reachable by name
       - trackarr-net     # private: only shared with the tinyproxy sidecar
@@ -68,6 +66,3 @@ networks:
       config:
         - subnet: 172.28.99.0/24
         - subnet: fd00:dead:beef:99::/64
-
-volumes:
-  trackarr-data:
