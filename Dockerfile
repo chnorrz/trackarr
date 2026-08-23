@@ -20,6 +20,7 @@ RUN npx camoufox-js fetch
 
 COPY lib ./lib
 COPY providers ./providers
+COPY scripts ./scripts
 COPY server.ts ./
 RUN npm run build
 
