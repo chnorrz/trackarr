@@ -1,13 +1,9 @@
 name: CI
 
-# Runs on every push/PR, unlike docker-publish.yml which only triggers on a
-# release - this is meant to catch regressions immediately, not just at
-# release time. Fast: the test suite mocks gotoCleared (see test/), so it
-# never touches camoufox-js's actual browser (no ~1.3GB binary download,
-# no Docker build needed here at all).
 on:
-  push:
   pull_request:
+  push:
+    branches: [main]
 
 jobs:
   test:
