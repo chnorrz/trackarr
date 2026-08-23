@@ -16,7 +16,6 @@ const DOMAIN_OVER_PROXY = (process.env.DOMAIN_OVER_PROXY || '')
 
 let sharedBrowser: Browser | null = null;
 let sharedContext: BrowserContext | null = null;
-
 let persistentContextPromise: Promise<BrowserContext> | null = null;
 
 // XTEST input is global to the X display, and concurrent navigations to one
@@ -32,9 +31,9 @@ function createSerializer() {
     return run;
   };
 }
+
 const serializeSolve = createSerializer();
 const serializeNav = createSerializer();
-
 
 // Routes only DOMAIN_OVER_PROXY through the proxy: Playwright's own `proxy`
 // option is proxy-by-default plus bypass and cannot express that shape.
