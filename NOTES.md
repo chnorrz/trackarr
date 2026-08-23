@@ -2009,3 +2009,207 @@ under. A definition fetched or filed under the wrong name (a copy/paste
 mistake, or upstream renaming a file without updating its own `id:` field)
 is rejected naming both ids, rather than silently registered under the
 wrong instance.
+
+---
+
+## 19. The Cardigann engine (phase 2b)
+
+`lib/cardigann/{filters,date-format,relative-time,template,select,engine}.ts`.
+Pure functions throughout - **no network I/O anywhere in this layer**. Given
+`(definition, an already-fetched response body, search context)`, `engine.ts`'s
+`runSearch()` returns `CardigannItem[]`. Fetching the response, `requestDelay`,
+cookies, and the definition -> `Provider` adapter are phase 3; nothing here
+is wired into `server.ts` or `providers/index.ts` yet.
+
+Every piece was tested against the wiki's own worked examples
+(wiki.servarr.com/prowlarr/cardigann-yml-definition) wherever one existed -
+the wiki is the closest thing this format has to a spec, and matching its
+literal input/output pairs catches misreadings a self-invented test case
+would not. Two places where the wiki's own example turned out to be
+internally inconsistent (documented rather than silently "fixed" by
+inventing unverified behaviour to match):
+
+- **`dateparse`'s worked example pairs an alpha-month format token (`MMM`)
+  with numeric input (`"09"`)** - can't literally both be true. Tested with
+  the corrected numeric token (`MM`) instead of teaching `MMM` to accept
+  digits, which would be a wrong general rule invented from one broken
+  example.
+- **`validfilename`'s shown output capitalizes a letter
+  (`"aFileNameWithInvalidSymbols"`) that a character-stripped input can't
+  produce** (input's own `"file"` is already lowercase) - no case-transform
+  rule is documented anywhere for this filter. Implemented as pure
+  character-stripping (matching its stated purpose), tested against the
+  literal, case-preserving result.
+
+### Filters (`filters.ts`, `date-format.ts`, `relative-time.ts`)
+
+All 24 of the 25 `FilterBlock` names implemented; `jsonjoinarray` is the one
+skip (needs a JSONPath dependency for one rare `preprocessingfilters` use on
+JSON APIs - see section 17's capability gate). `dateparse`/`timeparse` parse
+.NET custom format tokens (`yyyy`, `MMM`, `HH`, `zzz`, ...) via a
+hand-rolled token-to-regex compiler, longest-token-first so `"yyyy"` isn't
+consumed as four separate `"y"`s. `timeago`/`reltime` parse relative phrases
+(`"2 hours and 1 day"`, `"9hr,12m,39s"`) by summing every `\d+\s*unit`
+match found anywhere in the string - order-independent by construction,
+since every unit pattern is `\b`-bounded on both sides (`"5 months"` can't
+be mistaken for matching the bare-`m` minutes pattern, because `\bm\b`
+requires a non-word character immediately after the `m`, which `"onths"`
+isn't). `fuzzytime` deliberately does **not** implement the wiki's
+documented `"UK"` date-format argument - confirmed Prowlarr's own Cardigann
+engine doesn't implement it either (filter args are ignored there), so
+implementing it here would produce output that diverges from what a real
+Prowlarr-authored definition actually gets when it runs upstream.
+
+All four date-ish filters output `date.toUTCString()` - a valid RFC 2822
+string - deliberately, so it round-trips through plain `new Date(str)` at
+field-extraction time (`engine.ts`'s `parseDateOrNow`) without a second
+custom parser there.
+
+### Template engine (`template.ts`)
+
+A hand-written subset of Go's `text/template`, scoped to exactly what the
+wiki documents: `if/else/end`, `or`/`and` (real Go semantics - they return
+the first/last *value*, not just a boolean, which is why
+`{{ or (.Query.Album) (.Query.Artist) }}` works standalone as a
+substitution, not only inside an `if`), `eq`/`ne` (string equality only),
+`join`, `range` and `range $i, $e := .Var`, plain `{{ .Variable }}`
+substitution, and any filter name callable inline
+(`{{ re_replace .Keywords "x" "y" }}`).
+
+Parenthesized groups are parsed with the *same* top-level rule recursively
+(`parseTokens`) - a `(...)` group is either a bare path/string or a nested
+call, indistinguishably from the top level. That's what makes
+`or (eq .Result.cat "movie") (or (eq .Result.cat "movie_etc") (eq .Result.cat "movie_eng"))`
+- the wiki's own worked nesting example - fall out for free rather than
+needing special-case handling.
+
+Everything in this model is a string; Go template's "empty" truthiness (the
+zero value for the underlying type) collapses to "the string is `''`",
+since every value this engine ever produces is a string.
+
+Compiled template trees are memoized by their raw source string
+(`compileCache`), since the same `text:`/`filters.args` template string gets
+re-rendered once per row and a search can have dozens of rows.
+
+### Selector layer (`select.ts`) - three backends behind one `Row` interface
+
+HTML and XML share one implementation (`DomRow`, cheerio, `xmlMode` the only
+difference) - `:has()`/`:not()`/`:contains()` in `rows.selector` are native
+cheerio (css-select) pseudo-selectors, no extra parsing needed. JSON
+(`JsonRow`) needed a real hand-written mini-language, since Cardigann's JSON
+row selectors aren't plain dot-paths - they support the *same*
+`:has()`/`:not()`/`:contains()` syntax on path segments (the wiki's own
+example: `data:has(attributes.size):has(attributes.name:contains(1080)):not(attributes.fake_att)`,
+and thepiratebay.yml's real, live
+`$:has(username:contains({{ .Config.uploader }}))`). No existing package
+does this; `parseJsonPath`/`navigateJson`/`evalClause` in `select.ts` are a
+small, bounded recursive-descent parser and evaluator for exactly this
+grammar - deliberately not a general JSONPath implementation (no wildcards,
+no slicing, no recursive descent beyond what these two documented shapes
+need). `[N]` numeric indexing is supported only because thepiratebay.yml's
+own `count.selector: $[0].id` needs it.
+
+Two behaviours that differ meaningfully between HTML/XML and JSON, both
+confirmed against real definitions rather than assumed symmetric:
+
+- **`case` blocks work opposite ways.** HTML/XML: each `case` key (other
+  than the `"*"` wildcard) *is itself a CSS selector*, tested against the
+  row; first match in declaration order wins (JS object key order is
+  insertion order for string keys, matching the wiki's "processing ends
+  after the first case selector matches"). JSON: `case` keys are compared
+  by **value equality** against whatever a sibling `selector`/`text` on the
+  *same field* already resolved - thepiratebay.yml's own
+  `downloadvolumefactor: { selector: freeleech, case: {0: 1, 1: 0} }`. Both
+  paths are exercised in `select.test.ts` against exactly these two real
+  shapes.
+- **`remove` is a lasting mutation, not a per-field clone.** The wiki's own
+  advice - "you should put fields using the remove keyword at the end of
+  the list" - only makes sense if removing an element affects every
+  *later* field on that same row too, confirmed by a test that extracts a
+  field with `remove: img`, then checks a later `img` selector on the same
+  row no longer matches.
+- **A leading `".."` on a JSON field selector reaches the *outer* row**,
+  not the (possibly `rows.attribute`-narrowed) item fields are normally
+  extracted from - the wiki's own documented convention for e.g. a nested
+  `torrents` array item reading its parent movie's `year`. This is a
+  Cardigann-specific meaning of a leading `..`, handled once in
+  `JsonRow.resolve()` before the generic path parser ever runs - not a
+  general path feature.
+
+`text:`/`default:` values are template strings and get rendered
+(`engine.ts`); values that came from an actual `selector`/`attribute`/`case`
+match do **not** - they're real scraped content, which could coincidentally
+contain a literal `"{{"` that must never be interpreted as template syntax.
+`select.ts` itself is template-unaware; it always returns raw strings and
+lets `engine.ts` decide which ones need rendering.
+
+### Engine (`engine.ts`)
+
+Field extraction runs in **JS object key declaration order** (`yaml`
+preserves insertion order for string keys, and Cardigann field names are
+never integer-like, so this is reliable) - required for `.Result.*`
+cross-references between fields to work, e.g. yts.yml's `title` field
+building itself from `.Result.year`/`.Result._quality`/`.Result._type`,
+each of which must already be in `ctx.Result` by the time `title` runs.
+Underscore-prefixed "temp" fields (`_quality`, `_type`, ...) need no special
+handling at all - they're extracted into `ctx.Result` exactly like any other
+field and simply never get pulled into the final `CardigannItem`, which
+only reads the small set of well-known output field names.
+
+**Filter *args* can themselves be templates**, not just static strings -
+yts.yml's own `title` field appends
+`".{{ .Result.year }}.{{ .Result._quality }}...`" as an `append` filter's
+arg. Each filter's `args` are rendered through the template engine (with the
+row's current `.Result` context) immediately before the filter runs, for
+every field, every filter, unconditionally - there's no cheap way to tell in
+advance whether a given arg string is "just a literal" or "has a `{{ }}`
+in it", and rendering a plain string through the template engine is a
+no-op, so there is no need to special-case it either.
+
+**Category mapping happens once, after all fields are extracted, and is
+*not* written back into `.Result`.** `resolveCategoryName()` looks up
+`caps.categorymappings` by the row's raw `category` (compared as a string,
+so numeric YAML ids and string selector output line up) or, failing that,
+by `categorydesc` (case-insensitive). A later field referencing
+`.Result.category` sees the tracker's *raw* extracted id/desc, never the
+mapped Torznab name - confirmed by a test, and matches real Cardigann:
+mapping is the consuming application's concern, external to the
+template/filter system entirely. The mapped value here is a **name string**
+("TV/Anime"), not yet a numeric Torznab id - extending
+`lib/categories.ts`'s 24-entry vocabulary to the full 71-value
+`IndexerCategories` set and doing the name -> id conversion is phase 3's
+job, kept out of this layer deliberately.
+
+**`fields.infohash` is not `download.infohash`.** The former is a plain
+string field (like `magnet`/`download`) holding a bare infohash, captured
+as-is; the latter is a *different*, `DownloadBlock`-scoped mechanism with
+its own `hash`/`title` sub-selectors, used only when resolving a download
+link requires fetching the detail page separately - a phase 3 concern
+(`download.before`/`download.infohash`), never read by `engine.ts` at all.
+This was an actual mistake caught before merging - the wiki's own
+`download.infohash` example (an object with `hash`/`title` sub-blocks) was
+initially assumed to be `fields.infohash`'s shape too; the real
+`fields.infohash` usage is a single flat selector.
+
+**Size parsing handles two genuinely different real-world shapes.** HTML
+scraping always has a unit suffix ("1.5 GB" - `lib/parse.ts`-style parsing,
+inlined here to also strip European thousands separators per the wiki's own
+note). JSON APIs commonly report a **bare byte count with no unit at all**
+(milkie.yml's own selector is literally named `size_bytes`) - caught by an
+end-to-end JSON test that would otherwise have silently returned `size: 0`
+for every JSON-backed definition, since the unit-suffix regex simply
+wouldn't match a bare number.
+
+### Verification
+
+240 tests total (86 new this phase: 27 filters, 20 template, 24 select, 15
+engine). The last of the 15 engine tests runs the **real, checked-in**
+`definitions/kickasstorrents-to.yml` through `runSearch()` against synthetic
+HTML built to match that file's own real selectors
+(`table.data > tbody > tr:has(a[href^="magnet:?xt="])`, `a.cellMainLink`,
+`span > strong`, `td.timeago`, positional `td:nth-child(N)`) - this proves
+the *engine* correctly executes a real definition's selector/filter syntax
+end to end. It does **not** prove kickass.torrentbay.st's actual live
+markup matches those selectors - that is phase 4's live test, against real
+captured HTML, the same discipline this project applied to EZTV (section
+16) after getting burned by an unverified selector once already.
