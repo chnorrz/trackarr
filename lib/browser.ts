@@ -44,6 +44,24 @@ function createSerializer() {
 const serializeSolve = createSerializer();
 const serializeNav = createSerializer();
 
+// serializeNav/serializeSolve each only guard one step (one goto, one solve),
+// not the operation as a whole. Two cfFetch() calls for the same hostname
+// otherwise race on the same page - e.g. one is mid-solveChallenge() (only
+// inside serializeSolve) while the other calls page.goto() on that same page
+// (only inside serializeNav), interrupting the solve's own navigation. This
+// wraps a whole recovery attempt per hostname so a second call for a page
+// already in use waits for the first to finish, instead of touching it too.
+const hostSerializers = new Map<string, ReturnType<typeof createSerializer>>();
+
+function serializeHost(hostname: string) {
+  let serialize = hostSerializers.get(hostname);
+  if (!serialize) {
+    serialize = createSerializer();
+    hostSerializers.set(hostname, serialize);
+  }
+  return serialize;
+}
+
 // Routes only DOMAIN_OVER_PROXY through the proxy: Playwright's own `proxy`
 // option is proxy-by-default plus bypass and cannot express that shape.
 function buildPacDataUri(): string | null {
@@ -205,64 +223,69 @@ export async function cfFetch(url: string, opts: FetchOptions = {}): Promise<str
   const cached = pageCache.get(cacheKey);
   if (cached !== undefined) return cached;
 
-  const page = await getOrCreatePersistentPage(new URL(url).hostname);
+  const hostname = new URL(url).hostname;
+  const page = await getOrCreatePersistentPage(hostname);
 
-  try {
-    // A new page sits on about:blank, where fetch()'s same-origin rules make
-    // tryFetch() fail regardless of cookies - not a challenge signal.
-    let firstNav = false;
-    let response: PlaywrightResponse | null = null;
+  // Exclusive per hostname: a second call for the same page must wait for
+  // this one to finish, not interleave its own goto()/solveChallenge() with it.
+  return serializeHost(hostname)(async () => {
+    try {
+      // A new page sits on about:blank, where fetch()'s same-origin rules make
+      // tryFetch() fail regardless of cookies - not a challenge signal.
+      let firstNav = false;
+      let response: PlaywrightResponse | null = null;
 
-    if (page.url() === 'about:blank') {
-      response = await serializeNav(() => page.goto(url, { waitUntil: 'commit', timeout: 15000 }));
-      firstNav = true;
-    }
-
-    if (!isChallenge(response)) {
-      const fast = await tryFetch(page, url, init);
-      if (fast !== null && !isChallenge(fast)) {
-        if (isBlocked(fast.content)) {
-          throw new Error(`cfFetch: fetch failed for ${url} even though the page shows no challenge - probably your IP got blocked.`);
-        }
-        pageCache.set(cacheKey, fast.content);
-        return fast.content;
+      if (page.url() === 'about:blank') {
+        response = await serializeNav(() => page.goto(url, { waitUntil: 'commit', timeout: 15000 }));
+        firstNav = true;
       }
-    }
 
-    console.error(`[cf] cfFetch: fast path unavailable for ${url}, recovering session.`);
-    if (!firstNav) {
-      response = await serializeNav(() => page.goto(url, { waitUntil: 'commit', timeout: 15000 }));
-    }
-
-    if (isChallenge(response)) {
-      const clearance = await serializeSolve(async () => {
-        await page.waitForLoadState('load', { timeout: 60000 }).catch(() => {});
-
-        try {
-          return await solveChallenge(page);
-        } catch (err: unknown) {
-          console.error(`[cf] solveChallenge failed for ${url}: ${(err as Error).message}`);
-          throw err;
+      if (!isChallenge(response)) {
+        const fast = await tryFetch(page, url, init);
+        if (fast !== null && !isChallenge(fast)) {
+          if (isBlocked(fast.content)) {
+            throw new Error(`cfFetch: fetch failed for ${url} even though the page shows no challenge - probably your IP got blocked.`);
+          }
+          pageCache.set(cacheKey, fast.content);
+          return fast.content;
         }
-      });
+      }
 
-      if (clearance) console.error(`[cf] cf_clearance obtained (${clearance.slice(0, 8)}...).`);
+      console.error(`[cf] cfFetch: fast path unavailable for ${url}, recovering session.`);
+      if (!firstNav) {
+        response = await serializeNav(() => page.goto(url, { waitUntil: 'commit', timeout: 15000 }));
+      }
+
+      if (isChallenge(response)) {
+        const clearance = await serializeSolve(async () => {
+          await page.waitForLoadState('load', { timeout: 60000 }).catch(() => {});
+
+          try {
+            return await solveChallenge(page);
+          } catch (err: unknown) {
+            console.error(`[cf] solveChallenge failed for ${url}: ${(err as Error).message}`);
+            throw err;
+          }
+        });
+
+        if (clearance) console.error(`[cf] cf_clearance obtained (${clearance.slice(0, 8)}...).`);
+      }
+
+      const retried = await tryFetch(page, url, init);
+
+      if (retried === null || isChallenge(retried) || isBlocked(retried.content)) {
+        throw new Error(`cfFetch: fetch failed for ${url} even after session recovery.`);
+      }
+
+      pageCache.set(cacheKey, retried.content);
+      return retried.content;
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      console.error(`[cf] recycling page for ${url} after failure: ${message}`);
+      recyclePage(page);
+      throw err;
     }
-
-    const retried = await tryFetch(page, url, init);
-
-    if (retried === null || isChallenge(retried) || isBlocked(retried.content)) {
-      throw new Error(`cfFetch: fetch failed for ${url} even after session recovery.`);
-    }
-
-    pageCache.set(cacheKey, retried.content);
-    return retried.content;
-  } catch (err) {
-    const message = err instanceof Error ? err.message : String(err);
-    console.error(`[cf] recycling page for ${url} after failure: ${message}`);
-    recyclePage(page);
-    throw err;
-  }
+  });
 }
 
 export async function closeBrowser(): Promise<void> {

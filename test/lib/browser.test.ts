@@ -9,11 +9,23 @@ const ROOT = path.resolve(__dirname, '..', '..');
 let gotoFails = false;
 let pageCloses = 0;
 
+// Tracks overlap of evaluate() calls across pages, to prove (or disprove)
+// that two cfFetch() operations for the same hostname never run at once.
+let activeEvaluates = 0;
+let maxActiveEvaluates = 0;
+let evaluateDelayMs = 0;
+
 // A factory, not one shared object: recyclePage() evicts by identity, so a
 // reused object would be found under every hostname at once.
 const createFakePage = () => ({
   isClosed: () => false,
-  evaluate: async () => ({ challenged: false, content: '<html><body>cleared, not a challenge</body></html>' }),
+  evaluate: async () => {
+    activeEvaluates++;
+    maxActiveEvaluates = Math.max(maxActiveEvaluates, activeEvaluates);
+    await new Promise((r) => setTimeout(r, evaluateDelayMs));
+    activeEvaluates--;
+    return { challenged: false, content: '<html><body>cleared, not a challenge</body></html>' };
+  },
   url: () => 'about:blank',
   goto: async () => {
     if (gotoFails) throw new Error('page.goto: Timeout 15000ms exceeded.');
@@ -145,4 +157,32 @@ test('cookies registered for a domain are re-applied after a session is discarde
 
   await cfFetch('https://cookie-test-c.example/three');
   assert.equal(addCookiesCalls.length, 2, 'cookies must be re-applied on the fresh context after the discarded session relaunches');
+});
+
+test('cfFetch calls to the same hostname are serialized, not run concurrently on the shared page', async () => {
+  activeEvaluates = 0;
+  maxActiveEvaluates = 0;
+  evaluateDelayMs = 30;
+
+  await Promise.all([
+    cfFetch('https://serial-test.example/one'),
+    cfFetch('https://serial-test.example/two')
+  ]);
+
+  evaluateDelayMs = 0;
+  assert.equal(maxActiveEvaluates, 1, 'a second call for the same hostname must wait for the first to finish, not touch the page alongside it');
+});
+
+test('cfFetch calls to different hostnames are not serialized against each other', async () => {
+  activeEvaluates = 0;
+  maxActiveEvaluates = 0;
+  evaluateDelayMs = 30;
+
+  await Promise.all([
+    cfFetch('https://serial-test-a.example/one'),
+    cfFetch('https://serial-test-b.example/one')
+  ]);
+
+  evaluateDelayMs = 0;
+  assert.equal(maxActiveEvaluates, 2, 'unrelated hostnames must be able to fetch at the same time, not queue behind one another');
 });
