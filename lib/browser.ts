@@ -134,14 +134,22 @@ async function launchPersistentContext(): Promise<BrowserContext> {
   return context;
 }
 
-// cfFetch()'s options - a standard RequestInit (method/headers/
-// body/etc, same as the global fetch()) so the function is otherwise a
+// cfFetch()'s options - a RequestInit subset, so the function is otherwise a
 // drop-in replacement for fetch() minus getting a live Response back (this
 // always resolves the body text directly instead - see
 // cfFetch's own doc comment for why). No `proxy` field -
 // routing is decided per-hostname by the PAC script (see DOMAIN_OVER_PROXY
 // above), not per-call.
-export type FetchOptions = RequestInit;
+//
+// Deliberately narrower than RequestInit: these values are handed to
+// page.evaluate() (see tryFetch below), which serializes its argument, so only
+// plain JSON-safe fields survive the hop into the page. A stream/Blob/FormData
+// body would arrive as {} in the browser rather than failing loudly.
+export type FetchOptions = {
+  method?: string;
+  headers?: Record<string, string>;
+  body?: string;
+};
 
 // One already-cleared, long-lived page per hostname, reused across many
 // requests instead of opening/closing a fresh page per call - keyed by
@@ -218,10 +226,10 @@ type TryFetchResponse = { challenged: false, content: string} | { challenged: tr
 // wlinks-POST flows that already did this). Returns null (never throws) on
 // any failure - the caller falls back to a real navigation instead of
 // treating a fetch error as fatal.
-async function tryFetch(page: Page, url: string, init: RequestInit): Promise<TryFetchResponse> {
+async function tryFetch(page: Page, url: string, init: FetchOptions): Promise<TryFetchResponse> {
   if (page.isClosed()) return null;
   try {
-    return await page.evaluate<TryFetchResponse, { url: string; init: RequestInit }>(async ({ url, init }) => {
+    return await page.evaluate<TryFetchResponse, { url: string; init: FetchOptions }>(async ({ url, init }) => {
       const res = await fetch(url, init);
       return res.headers.get('cf-mitigated') === 'challenge'
         ? { challenged: true }
@@ -259,7 +267,7 @@ export function isChallenge(response: TryFetchResponse | PlaywrightResponse | nu
 // NOTES.md section 10 for the full reasoning and the cache-key subtlety.
 export async function cfFetch(url: string, opts: FetchOptions = {}): Promise<string> {
   const { method = 'GET', headers, body } = opts;
-  const init: RequestInit = { method, headers, body };
+  const init: FetchOptions = { method, headers, body };
   const cacheKey = crypto.createHash('sha256').update(`${method}:${url}:${body ?? ''}`).digest('hex');
 
   const cached = pageCache.get(cacheKey);
@@ -307,9 +315,7 @@ export async function cfFetch(url: string, opts: FetchOptions = {}): Promise<str
     // Only solve when the recovery navigation actually came back challenged. A
     // clean response means the session already recovered - the navigation alone
     // was enough - so fall through to the retry below instead of erroring on a
-    // page that is now perfectly usable. Live-caught after a container restart:
-    // EZTV's fast path failed on a stale cookie, the recovery navigation
-    // returned a clean 200, and this threw anyway.
+    // page that is now perfectly usable.
     if (isChallenge(response)) {
       const clearance = await serializeSolve(async () => {
         await page.waitForLoadState('load', { timeout: 60000 }).catch(() => {});
@@ -321,15 +327,16 @@ export async function cfFetch(url: string, opts: FetchOptions = {}): Promise<str
           throw err;
         }
       });
-      // Kept in the browser's own jar for the life of the process; never
-      // written to disk (NOTES.md section 5).
+
       if (clearance) console.error(`[cf] cf_clearance obtained (${clearance.slice(0, 8)}...).`);
     }
 
     const retried = await tryFetch(page, url, init);
+
     if (retried === null || isChallenge(retried) || isBlocked(retried.content)) {
       throw new Error(`cfFetch: fetch failed for ${url} even after session recovery.`);
     }
+
     pageCache.set(cacheKey, retried.content);
     return retried.content;
   } catch (err) {
