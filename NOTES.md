@@ -1541,3 +1541,119 @@ the click lands on nothing. Verify the mouse actually moves:
 ```js
 execFileSync('xdotool', ['getmouselocation'], { env: { ...process.env, DISPLAY: ':99' } })
 ```
+
+---
+
+## 15. The wedged page: a browser tab can die without closing
+
+**Symptom.** 1337x failed **55 consecutive keep-alives over 14 hours**, from
+2026-08-22T17:01 onwards, with zero successes. ext.to and EZTV kept working
+the entire time. Two failure modes, arriving in runs of 4-7 rather than
+randomly:
+
+- 34x `page.goto: Timeout 15000ms exceeded` — `waiting until "commit"`
+- 20x `Cloudflare challenge did not clear after 45000ms`, mostly
+  `no widget ever rendered`
+- 1x `page.goto: NS_BINDING_ABORTED`
+
+`isBlocked()` never fired, and not one `cf_clearance obtained` appeared in
+the whole log.
+
+### Theories that were wrong
+
+**"The IPv6 proxy path broke."** The obvious read, given section 4, and
+false. A `curl` through the *same* tinyproxy container, from a throwaway
+container on the same Docker network, reached 1337x in **47ms**:
+
+```bash
+NET=$(docker inspect trackarr -f '{{range $k,$v := .NetworkSettings.Networks}}{{$k}}{{"\n"}}{{end}}' | grep trackarr-net)
+docker run --rm --network "$NET" curlimages/curl:latest \
+  -s -m 25 -x http://tinyproxy:8888 -D - -o /dev/null \
+  -w 'CODE=%{http_code} TIME=%{time_total}\n' https://1337x.to/
+# HTTP/2 403 / cf-mitigated: challenge / CODE=403 TIME=0.047
+```
+
+A `403` with `cf-mitigated: challenge` is the *good* outcome — a solvable
+challenge, not a ban. Egress was a global IPv6 in the expected prefix, so
+`FORCE_IPV6` was working too.
+
+**"Cloudflare withdrew the interactive widget."** Suggested by
+`no widget ever rendered` dominating the later failures. Also false — see
+below, the widget rendered fine on a fresh browser.
+
+**"The launch race is back"** (the one section browser.ts:27-33 documents).
+Ruled out by process inspection: exactly one `camoufox-bin`, not several
+fighting over one Xvfb display.
+
+```bash
+docker exec trackarr sh -c 'ps -eo pid,etime,rss,comm | grep -iE "firefox|camoufox"'
+# 27  18:22:51  889660  camoufox-bin
+```
+
+Note the elapsed time: **18h22m**, matching container uptime exactly, with
+`restarts=0`. The browser launched at boot and was never replaced.
+
+### What it actually was
+
+`docker restart trackarr` fixed it instantly:
+
+```
+[cf] challenge cleared after 6643ms (2 clicks).
+[cf] cf_clearance obtained (4mqznmM1...).
+[keepalive] 1337x ok (14226ms)
+```
+
+Same proxy, same Cloudflare, same click coordinate. The only variable was
+browser age. A tab had stopped navigating **without ever closing**, and
+`getOrCreatePersistentPage()` only recycles on `isClosed()` — so the dead
+tab was handed back to every subsequent caller, forever. Nothing in the
+process could recover it.
+
+`no widget ever rendered` was a *symptom*, not a second cause: a page that
+cannot navigate also cannot load Cloudflare's challenge assets. One root
+cause explained both failure modes.
+
+### The fix
+
+`recyclePage()` in `lib/browser.ts`: any throw out of `cfFetch()` drops the
+page from `persistentPages` and closes it, so the next call builds a clean
+one. Two details are load-bearing:
+
+- **Delete from the map before closing.** `close()` on a wedged page can
+  hang too. Recovery must not wait on it — a leaked tab on an
+  already-failing path is the cheaper trade.
+- **Find the entry by page identity, not by hostname.** By the time a slow
+  failure (a 15s `page.goto` timeout) reaches `recyclePage()`, a sibling
+  call may already have recycled that page and a third call replaced it.
+  Deleting by hostname would evict the healthy replacement and leak it —
+  the same class of tab leak commit 9b3aefe fixed one level up.
+
+No counter and no threshold, deliberately: `cf_clearance` lives on the
+`BrowserContext`, not the page, so a replacement page normally costs one
+navigation and no solve. Recycling on every failure is cheap enough that
+tuning a threshold would be more code than it saves.
+
+### If this recurs
+
+Recycling the page fixes a dead *tab*. It will **not** fix a poisoned
+connection pool, because Firefox pools connections per profile, not per
+tab — a new tab reuses the same sockets. If the logs ever show
+`[cf] recycling page for ...` repeatedly with no recovery, that is the
+signal to escalate to a full browser relaunch. Two things need fixing
+first:
+
+- `closeBrowser()` nulls `sharedBrowser` and `sharedContext` but **not**
+  `persistentContextPromise`, so `getPersistentContext()` would hand out a
+  resolved promise pointing at a dead context. Harmless today (it only runs
+  at shutdown), fatal for a relaunch path.
+- `cachedOffset` in `lib/challenge.ts` survives a relaunch and would be
+  measured against the old window geometry. `WINDOW_SIZE` is pinned, so in
+  practice it would be identical — but it is not guaranteed.
+
+### Diagnostic lesson
+
+"Provider down for hours" looked like a tracker-side or network-side
+problem and was neither. The question that cut through it fastest was
+**"can something *other than the browser* reach the site right now?"** —
+one `curl` through the same proxy, which took 47ms and eliminated half the
+hypothesis space. Ask it first.
