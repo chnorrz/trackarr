@@ -199,6 +199,17 @@ async function getOrCreatePersistentPage(hostname: string): Promise<Page> {
   return promise;
 }
 
+function recyclePage(page: Page): void {
+  for (const [hostname, tracked] of persistentPages) {
+    if (tracked === page) {
+      persistentPages.delete(hostname);
+      break;
+    }
+  }
+
+  void page.close().catch(() => {});
+}
+
 type TryFetchResponse = { challenged: false, content: string} | { challenged: true } | null;
 
 // Tries to fetch `url` through an already-cleared persistent page's own
@@ -256,70 +267,77 @@ export async function cfFetch(url: string, opts: FetchOptions = {}): Promise<str
 
   const page = await getOrCreatePersistentPage(new URL(url).hostname);
 
-  // A brand-new page starts at about:blank, where fetch()'s same-origin
-  // credential/CORS rules mean tryFetch() below is guaranteed to fail no
-  // matter how valid the domain's cookies already are - not a real signal
-  // that a challenge is present, just this check being unable to run yet.
-  // A cheap domcontentloaded navigation gets the page onto the real origin
-  // first, so tryFetch has an actual chance to succeed. On every call after
-  // that first one, the page is already on the right origin and this is a
-  // no-op.
-  let firstNav = false;
-  let response: PlaywrightResponse | null = null;
+  try {
+    // A brand-new page starts at about:blank, where fetch()'s same-origin
+    // credential/CORS rules mean tryFetch() below is guaranteed to fail no
+    // matter how valid the domain's cookies already are - not a real signal
+    // that a challenge is present, just this check being unable to run yet.
+    // A cheap domcontentloaded navigation gets the page onto the real origin
+    // first, so tryFetch has an actual chance to succeed. On every call after
+    // that first one, the page is already on the right origin and this is a
+    // no-op.
+    let firstNav = false;
+    let response: PlaywrightResponse | null = null;
 
-  if (page.url() === 'about:blank') {
-    response = await serializeNav(() => page.goto(url, { waitUntil: 'commit', timeout: 15000 }));
-    firstNav = true;
-  }
-
-  if (!isChallenge(response)) {
-    const fast = await tryFetch(page, url, init);
-    if (fast !== null && !isChallenge(fast)) {
-      if (isBlocked(fast.content)) {
-        throw new Error(`cfFetch: fetch failed for ${url} even though the page shows no challenge - probably your IP got blocked.`);
-      }
-      pageCache.set(cacheKey, fast.content);
-      return fast.content;
+    if (page.url() === 'about:blank') {
+      response = await serializeNav(() => page.goto(url, { waitUntil: 'commit', timeout: 15000 }));
+      firstNav = true;
     }
-  }
 
-  console.error(`[cf] cfFetch: fast path unavailable for ${url}, recovering session.`);
-  // Let any navigation the failed fetch kicked off settle before queueing for
-  // the solve mutex, so we wait on our own time rather than holding the mutex
-  // while the page loads. Errors ignored: there may be no navigation in
-  // flight at all, which is not a problem.
-  if (!firstNav) {
-    response = await serializeNav(() => page.goto(url, { waitUntil: 'commit', timeout: 15000 }));
-  }
-
-  // Only solve when the recovery navigation actually came back challenged. A
-  // clean response means the session already recovered - the navigation alone
-  // was enough - so fall through to the retry below instead of erroring on a
-  // page that is now perfectly usable. Live-caught after a container restart:
-  // EZTV's fast path failed on a stale cookie, the recovery navigation
-  // returned a clean 200, and this threw anyway.
-  if (isChallenge(response)) {
-    const clearance = await serializeSolve(async () => {
-      await page.waitForLoadState('load', { timeout: 60000 }).catch(() => {});
-
-      try {
-        return await solveChallenge(page);
-      } catch (err: unknown) {
-        console.error(`[cf] solveChallenge failed for ${url}: ${(err as Error).message}`);
-        throw err;
+    if (!isChallenge(response)) {
+      const fast = await tryFetch(page, url, init);
+      if (fast !== null && !isChallenge(fast)) {
+        if (isBlocked(fast.content)) {
+          throw new Error(`cfFetch: fetch failed for ${url} even though the page shows no challenge - probably your IP got blocked.`);
+        }
+        pageCache.set(cacheKey, fast.content);
+        return fast.content;
       }
-    });
-    // Kept in the browser's own jar for the life of the process; never
-    // written to disk (NOTES.md section 5).
-    if (clearance) console.error(`[cf] cf_clearance obtained (${clearance.slice(0, 8)}...).`);
-  }
+    }
 
-  const retried = await tryFetch(page, url, init);
-  if (retried === null || isChallenge(retried) || isBlocked(retried.content)) {
-    throw new Error(`cfFetch: fetch failed for ${url} even after session recovery.`);
+    console.error(`[cf] cfFetch: fast path unavailable for ${url}, recovering session.`);
+    // Let any navigation the failed fetch kicked off settle before queueing for
+    // the solve mutex, so we wait on our own time rather than holding the mutex
+    // while the page loads. Errors ignored: there may be no navigation in
+    // flight at all, which is not a problem.
+    if (!firstNav) {
+      response = await serializeNav(() => page.goto(url, { waitUntil: 'commit', timeout: 15000 }));
+    }
+
+    // Only solve when the recovery navigation actually came back challenged. A
+    // clean response means the session already recovered - the navigation alone
+    // was enough - so fall through to the retry below instead of erroring on a
+    // page that is now perfectly usable. Live-caught after a container restart:
+    // EZTV's fast path failed on a stale cookie, the recovery navigation
+    // returned a clean 200, and this threw anyway.
+    if (isChallenge(response)) {
+      const clearance = await serializeSolve(async () => {
+        await page.waitForLoadState('load', { timeout: 60000 }).catch(() => {});
+
+        try {
+          return await solveChallenge(page);
+        } catch (err: unknown) {
+          console.error(`[cf] solveChallenge failed for ${url}: ${(err as Error).message}`);
+          throw err;
+        }
+      });
+      // Kept in the browser's own jar for the life of the process; never
+      // written to disk (NOTES.md section 5).
+      if (clearance) console.error(`[cf] cf_clearance obtained (${clearance.slice(0, 8)}...).`);
+    }
+
+    const retried = await tryFetch(page, url, init);
+    if (retried === null || isChallenge(retried) || isBlocked(retried.content)) {
+      throw new Error(`cfFetch: fetch failed for ${url} even after session recovery.`);
+    }
+    pageCache.set(cacheKey, retried.content);
+    return retried.content;
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    console.error(`[cf] recycling page for ${url} after failure: ${message}`);
+    recyclePage(page);
+    throw err;
   }
-  pageCache.set(cacheKey, retried.content);
-  return retried.content;
 }
 
 export async function closeBrowser(): Promise<void> {
