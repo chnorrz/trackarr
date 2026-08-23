@@ -36,10 +36,6 @@ function fakeProvider(overrides: Record<string, unknown> = {}) {
   };
 }
 
-// Real listening server on an OS-picked ephemeral port (port 0) rather than
-// hitting the Express app in-process - exercises the actual HTTP layer
-// (status codes, headers, real query-string parsing), closer to what
-// Prowlarr actually does.
 async function withServer<T>(
   providers: Record<string, unknown>,
   fn: (baseUrl: string) => Promise<T>,
@@ -67,8 +63,6 @@ test('GET /:provider/api?t=caps needs no apikey and returns caps XML', async () 
 });
 
 test('caps only advertises the categories a provider actually declares', async () => {
-  // Movies (2000) + TV (5000) declared, nothing else - e.g. must not leak
-  // XXX/Books/PC/etc from other providers' schemes.
   await withServer({ fake: fakeProvider({ categories: [2000, 5000] }) }, async (base) => {
     const body = await (await fetch(`${base}/fake/api?t=caps`)).text();
     assert.match(body, /<category id="2000" name="Movies" \/>/);
@@ -103,9 +97,7 @@ test('search returns a Torznab RSS document built from the provider items', asyn
     assert.match(body, /<title>Fake Title<\/title>/);
     assert.match(body, /<torznab:attr name="category" value="2000" \/>/);
     assert.match(body, /<torznab:attr name="seeders" value="5" \/>/);
-    assert.match(body, /<torznab:attr name="peers" value="7" \/>/); // seeds + leechers
-    // download link carries the item's id and the configured apikey (& is
-    // XML-escaped to &amp; in the RSS output, as it must be)
+    assert.match(body, /<torznab:attr name="peers" value="7" \/>/);
     assert.match(body, new RegExp(`/fake/download\\?apikey=${API_KEY}&amp;id=42&amp;url=`));
   });
 });
@@ -116,7 +108,7 @@ test('title/url special characters are XML-escaped in the RSS output', async () 
     const res = await fetch(`${base}/fake/api?t=search&q=x&apikey=${API_KEY}`);
     const body = await res.text();
     assert.match(body, /A &amp; B &lt;C&gt; &quot;D&quot;/);
-    assert.doesNotMatch(body, /<title>A & B/); // raw & would make this invalid XML
+    assert.doesNotMatch(body, /<title>A & B/);
   });
 });
 
@@ -210,10 +202,6 @@ test('RSS output includes opensearch:totalResults from the provider', async () =
 });
 
 test('search results are not cached at the server level - each request calls the provider fresh', async () => {
-  // No top-level result cache any more - the expensive part (network/scrape
-  // fetches) is cached at the fetch itself instead, in lib/browser.ts's
-  // cfFetch(), keyed by the underlying site page's URL rather
-  // than the request's exact q/cat/offset/limit. See NOTES.md.
   let calls = 0;
   const provider = fakeProvider({
     search: async () => {
@@ -312,10 +300,8 @@ test('download errors surface as a torznab <error code="900"> document with the 
   });
 });
 
-// The rendered page's own <style> block contains ".badge-ok"/".badge-error"/
-// ".badge-unknown" as CSS class selectors, so a loose substring match for
-// any of those always "matches" regardless of actual state - assert against
-// the rendered <span> element itself instead.
+// The page's <style> block contains these class names, so a loose substring
+// match always hits - assert against the rendered <span> instead.
 const badgeUnknown = /<span class="badge badge-unknown">UNKNOWN<\/span>/;
 const badgeOk = /<span class="badge badge-ok">OK<\/span>/;
 const badgeError = /<span class="badge badge-error">ERROR<\/span>/;
@@ -362,8 +348,8 @@ test('GET / status reflects the most recent outcome, not the first', async () =>
     }
   });
   await withServer({ fake: provider }, async (base) => {
-    await fetch(`${base}/fake/api?t=search&q=a&apikey=${API_KEY}`); // fails
-    await fetch(`${base}/fake/api?t=search&q=b&apikey=${API_KEY}`); // succeeds (different q, so not cached)
+    await fetch(`${base}/fake/api?t=search&q=a&apikey=${API_KEY}`);
+    await fetch(`${base}/fake/api?t=search&q=b&apikey=${API_KEY}`);
     const body = await (await fetch(`${base}/`)).text();
     assert.match(body, badgeOk);
     assert.doesNotMatch(body, /first attempt failed/);
@@ -381,7 +367,7 @@ test('GET / request stats never show search requests as cached - server.ts has n
   const statusTracker = new ProviderStatusTracker();
   await withServer({ fake: fakeProvider() }, async (base) => {
     await fetch(`${base}/fake/api?t=search&q=same&apikey=${API_KEY}`);
-    await fetch(`${base}/fake/api?t=search&q=same&apikey=${API_KEY}`); // identical, still not "cached" from server.ts's point of view
+    await fetch(`${base}/fake/api?t=search&q=same&apikey=${API_KEY}`);
     const body = await (await fetch(`${base}/`)).text();
     assert.match(body, /2 served/);
     assert.match(body, /2 ok \(0% cached\)/);
@@ -399,8 +385,8 @@ test('GET / request stats count a failed search separately from successes', asyn
     }
   });
   await withServer({ fake: provider }, async (base) => {
-    await fetch(`${base}/fake/api?t=search&q=a&apikey=${API_KEY}`); // fails
-    await fetch(`${base}/fake/api?t=search&q=b&apikey=${API_KEY}`); // succeeds
+    await fetch(`${base}/fake/api?t=search&q=a&apikey=${API_KEY}`);
+    await fetch(`${base}/fake/api?t=search&q=b&apikey=${API_KEY}`);
     const body = await (await fetch(`${base}/`)).text();
     assert.match(body, /2 served/);
     assert.match(body, /1 ok/);
@@ -411,8 +397,8 @@ test('GET / request stats count a failed search separately from successes', asyn
 test('GET / request stats also count download requests, not just search', async () => {
   const statusTracker = new ProviderStatusTracker();
   await withServer({ fake: fakeProvider() }, async (base) => {
-    await fetch(`${base}/fake/download?apikey=${API_KEY}&id=1`, { redirect: 'manual' }); // live
-    await fetch(`${base}/fake/download?apikey=${API_KEY}&id=1`, { redirect: 'manual' }); // cached
+    await fetch(`${base}/fake/download?apikey=${API_KEY}&id=1`, { redirect: 'manual' });
+    await fetch(`${base}/fake/download?apikey=${API_KEY}&id=1`, { redirect: 'manual' });
     const body = await (await fetch(`${base}/`)).text();
     assert.match(body, /2 served/);
     assert.match(body, /2 ok \(50% cached\)/);

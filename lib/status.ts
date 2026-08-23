@@ -2,11 +2,8 @@ import type { Provider } from './types.js';
 
 export type ProviderState = 'ok' | 'error' | 'unknown';
 
-// Cumulative counters, never reset except by a process restart. `cached` is
-// a subset of `successful` (a cache hit is still a successful request), not
-// a separate outcome - so successful - cached is what actually hit the
-// tracker. `total` is `successful + failed`, kept as its own field only for
-// convenience when rendering.
+// `cached` is a subset of `successful`, not a separate outcome, and `total` is
+// `successful + failed` - these are not disjoint slices.
 export interface ProviderStats {
   total: number;
   successful: number;
@@ -24,23 +21,6 @@ export interface ProviderStatus {
 const EMPTY_STATS: ProviderStats = { total: 0, successful: 0, cached: 0, failed: 0 };
 const UNKNOWN: ProviderStatus = { state: 'unknown', lastCheckedAt: null, lastError: null, stats: EMPTY_STATS };
 
-// Tracks each provider's health, updated from two places: the background
-// keep-alive scheduler (server.ts's warmProvider) and real search/download
-// requests (server.ts's createApp). "Last checked/used" is deliberately one
-// merged timestamp rather than two - whichever happened more recently,
-// background check or real Prowlarr request, is what's shown.
-//
-// Request *counts* only come from recordRequest, never recordCheck - a
-// background keep-alive ping isn't a request Prowlarr made, and counting it
-// as one would make the stats reflect KEEPALIVE_INTERVAL_MS as much as
-// actual usage.
-//
-// Not persisted - a restart resets everyone to 'unknown' (and stats to
-// zero) until the next check. That's fine for state (the keep-alive
-// scheduler's boot-time warm-up fires within a few seconds), and stats
-// resetting on restart is expected for a simple in-memory counter like
-// this - it's meant for "is this provider healthy right now", not as a
-// long-term metrics store.
 export class ProviderStatusTracker {
   private readonly statuses = new Map<string, ProviderStatus>();
 
@@ -48,8 +28,6 @@ export class ProviderStatusTracker {
     return this.statuses.get(providerId)?.stats ?? EMPTY_STATS;
   }
 
-  // Background keep-alive check - updates state/last-checked only, doesn't
-  // touch the request counters.
   recordCheck(providerId: string, ok: boolean, error?: string): void {
     this.statuses.set(providerId, {
       state: ok ? 'ok' : 'error',
@@ -59,8 +37,6 @@ export class ProviderStatusTracker {
     });
   }
 
-  // A real search or download request - updates state/last-checked AND
-  // increments the request counters. `cached` only matters when ok is true.
   recordRequest(providerId: string, ok: boolean, opts: { cached?: boolean; error?: string } = {}): void {
     const prev = this.statsFor(providerId);
     const stats: ProviderStats = {
@@ -110,18 +86,12 @@ const STATE_LABEL: Record<ProviderState, string> = { ok: 'OK', error: 'ERROR', u
 
 function formatStats(stats: ProviderStats): string {
   if (stats.total === 0) return 'no requests yet';
-  // % cached is of successful requests, not of total - a cache hit can only
-  // happen on what would otherwise have been a success, so "cached" and
-  // "failed" aren't comparable slices of the same pie.
   const cachedPart = stats.successful > 0
     ? ` (${Math.round((stats.cached / stats.successful) * 100)}% cached)`
     : '';
   return `${stats.total} served \u00b7 ${stats.successful} ok${cachedPart} \u00b7 ${stats.failed} failed`;
 }
 
-// Root-level status dashboard - not behind the apikey (nothing here is
-// torrent data or lets you do anything, same reasoning as ?t=caps needing
-// no key), meant to be pulled up in a browser for an at-a-glance check.
 export function renderStatusPage(providers: Record<string, Provider>, tracker: ProviderStatusTracker): string {
   const rows = Object.values(providers)
     .map((provider) => {

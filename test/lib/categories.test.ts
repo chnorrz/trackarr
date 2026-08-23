@@ -17,8 +17,6 @@ test('matchCategory returns the first matching rule, case-insensitively', () => 
 });
 
 test('matchCategory respects rule order (first match wins)', () => {
-  // Deliberately overlapping: a real-world case from providers/1337x.ts -
-  // "hd" must not shadow "tv" for something like "Show S01E01 [HD]".
   const rules = [
     [['tv'], CATEGORIES.TV],
     [['hd', 'movie'], CATEGORIES.MOVIES]

@@ -1,34 +1,64 @@
-<!-- Hand-built fixture mirroring the markup structure of an EZTV search
-     results page after the layout=def_wlinks reveal POST (see NOTES.md
-     section 2). -->
+<!-- Anonymized, structurally faithful to a real EZTV search results page
+     with the layout=def_wlinks cookie applied (see NOTES.md section 16).
+     Row 1/2: ordinary rows, magnet revealed, real numeric seeds.
+     Row 3: a torrent with no download link at all - even with the cookie
+     set, EZTV omits the whole magnet <td> for these, not just its content.
+     Row 4: magnet present but a non-numeric seeds cell, to exercise the
+     parser's numeric guard. -->
 <html><body>
 <table><tbody>
 
 <tr name="hover" class="forum_header_border">
+  <td width="35" class="forum_thread_post" align="center"><a href="/shows/100001/example-show/" title="Example Show Torrent"><img src="/images/eztv_show_info.png" width="16" height="16" border="0" alt="Info" title="Example Show Torrents"></a></td>
   <td class="forum_thread_post">
-    <a href="/ep/9000001/example-show-s01e01-720p-web-x264-fakegrp/" class="epinfo" title="Example.Show.S01E01.720p.WEB.x264-FAKEGRP (412.60 MB)">Example.Show.S01E01.720...</a>
+    <a href="/ep/9000001/example-show-s01e01-720p-web-x264-fakegrp/?d=" title="Example.Show.S01E01.720p.WEB.x264-FAKEGRP [eztv] (412.60 MB)" alt="Example.Show.S01E01.720p.WEB.x264-FAKEGRP [eztv] (412.60 MB)" class="epinfo">Example.Show.S01E01.720...</a>
   </td>
-  <td class="forum_thread_post"><a class="magnet" href="magnet:?xt=urn:btih:0000000000000000000000000000000000aaa1&amp;dn=Example.Show.S01E01.720p.WEB.x264-FAKEGRP">Magnet</a></td>
-  <td class="forum_thread_post">-</td>
-  <td class="forum_thread_post">-</td>
+  <td align="center" class="forum_thread_post">
+    <a href="magnet:?xt=urn:btih:0000000000000000000000000000000000aaa1&amp;dn=Example.Show.S01E01.720p.WEB.x264-FAKEGRP" class="magnet" title="Example.Show.S01E01.720p.WEB.x264-FAKEGRP Magnet Link" rel="nofollow"></a>
+    <a href="/go.php?t=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" rel="nofollow" class="download_1" title="Example.Show.S01E01.720p.WEB.x264-FAKEGRP Torrent: Download Mirror #1"></a>
+  </td>
+  <td align="center" class="forum_thread_post">412.6 MB</td>
+  <td align="center" class="forum_thread_post">1 mo</td>
+  <td align="center" class="forum_thread_post_end"><font color="green">29</font></td>
 </tr>
 
 <tr name="hover" class="forum_header_border">
+  <td width="35" class="forum_thread_post" align="center"><a href="/shows/100002/another-example-show/" title="Another Example Show Torrent"><img src="/images/eztv_show_info.png" width="16" height="16" border="0" alt="Info" title="Another Example Show Torrents"></a></td>
   <td class="forum_thread_post">
-    <a href="/ep/9000002/example-show-s01e02-720p-web-x264-fakegrp/" class="epinfo" title="Example.Show.S01E02.720p.WEB.x264-FAKEGRP (398.10 MB)">Example.Show.S01E02.720...</a>
+    <a href="/ep/9000002/another-example-show-s02e10-1080p-web-x264-fakegrp/?d=" title="Another.Example.Show.S02E10.1080p.WEB.x264-FAKEGRP [eztv] (1.10 GB)" alt="Another.Example.Show.S02E10.1080p.WEB.x264-FAKEGRP [eztv] (1.10 GB)" class="epinfo">Another.Example.Show.S02...</a>
   </td>
-  <td class="forum_thread_post"><a class="magnet" href="magnet:?xt=urn:btih:0000000000000000000000000000000000aaa2&amp;dn=Example.Show.S01E02.720p.WEB.x264-FAKEGRP">Magnet</a></td>
-  <td class="forum_thread_post">-</td>
-  <td class="forum_thread_post">-</td>
+  <td align="center" class="forum_thread_post">
+    <a href="magnet:?xt=urn:btih:0000000000000000000000000000000000aaa2&amp;dn=Another.Example.Show.S02E10.1080p.WEB.x264-FAKEGRP" class="magnet" title="Another.Example.Show.S02E10.1080p.WEB.x264-FAKEGRP Magnet Link" rel="nofollow"></a>
+    <a href="/go.php?t=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb" rel="nofollow" class="download_1" title="Another.Example.Show.S02E10.1080p.WEB.x264-FAKEGRP Torrent: Download Mirror #1"></a>
+  </td>
+  <td align="center" class="forum_thread_post">1.10 GB</td>
+  <td align="center" class="forum_thread_post">2 mo</td>
+  <td align="center" class="forum_thread_post_end"><font color="green">88</font></td>
 </tr>
 
 <tr name="hover" class="forum_header_border">
+  <td width="35" class="forum_thread_post" align="center"><a href="/shows/100003/no-links-show/" title="No Links Show Torrent"><img src="/images/eztv_show_info.png" width="16" height="16" border="0" alt="Info" title="No Links Show Torrents"></a></td>
   <td class="forum_thread_post">
-    <a href="/ep/9000003/another-example-show-s02e10-1080p-web-x264-fakegrp/" class="epinfo" title="Another.Example.Show.S02E10.1080p.WEB.x264-FAKEGRP (1.10 GB)">Another.Example.Show.S02...</a>
+    <a href="/ep/9000003/no-links-show-s01e01-hdtv-x264-fakegrp/?d=" title="No.Links.Show.S01E01.HDTV.x264-FAKEGRP [eztv] (300.00 MB)" alt="No.Links.Show.S01E01.HDTV.x264-FAKEGRP [eztv] (300.00 MB)" class="epinfo">No.Links.Show.S01...</a>
   </td>
-  <td class="forum_thread_post"><a class="magnet" href="magnet:?xt=urn:btih:0000000000000000000000000000000000aaa3&amp;dn=Another.Example.Show.S02E10.1080p.WEB.x264-FAKEGRP">Magnet</a></td>
-  <td class="forum_thread_post">-</td>
-  <td class="forum_thread_post">-</td>
+
+  <td align="center" class="forum_thread_post">300.0 MB</td>
+  <td align="center" class="forum_thread_post">3 mo</td>
+  <td align="center" class="forum_thread_post_end"><font color="green">0</font></td>
+</tr>
+
+<tr name="hover" class="forum_header_border">
+  <td width="35" class="forum_thread_post" align="center"><a href="/shows/100004/dash-seeds-show/" title="Dash Seeds Show Torrent"><img src="/images/eztv_show_info.png" width="16" height="16" border="0" alt="Info" title="Dash Seeds Show Torrents"></a></td>
+  <td class="forum_thread_post">
+    <a href="/ep/9000004/dash-seeds-show-s01e01-hdtv-x264-fakegrp/?d=" title="Dash.Seeds.Show.S01E01.HDTV.x264-FAKEGRP [eztv] (256.10 MB)" alt="Dash.Seeds.Show.S01E01.HDTV.x264-FAKEGRP [eztv] (256.10 MB)" class="epinfo">Dash.Seeds.Show.S01...</a>
+  </td>
+  <td align="center" class="forum_thread_post">
+    <a href="magnet:?xt=urn:btih:0000000000000000000000000000000000aaa4&amp;dn=Dash.Seeds.Show.S01E01.HDTV.x264-FAKEGRP" class="magnet" title="Dash.Seeds.Show.S01E01.HDTV.x264-FAKEGRP Magnet Link" rel="nofollow"></a>
+    <a href="/go.php?t=dddddddddddddddddddddddddddddddd" rel="nofollow" class="download_1" title="Dash.Seeds.Show.S01E01.HDTV.x264-FAKEGRP Torrent: Download Mirror #1"></a>
+  </td>
+  <td align="center" class="forum_thread_post">256.1 MB</td>
+  <td align="center" class="forum_thread_post">4 mo</td>
+  <td align="center" class="forum_thread_post_end">-</td>
 </tr>
 
 </tbody></table>

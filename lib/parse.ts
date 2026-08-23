@@ -1,10 +1,3 @@
-/**
- * Parses a human-readable size ("1.98 GB") into bytes.
- *
- * Both trackers format sizes the same way - decimals, a space, a binary unit -
- * so this is shared. Returns 0 on anything unparseable; Torznab treats a
- * missing size as unknown rather than erroring out.
- */
 export function parseSize(str: string | undefined | null): number {
   const m = /^([\d.,]+)\s*(B|KB|MB|GB|TB)$/i.exec((str || '').trim());
   if (!m) return 0;

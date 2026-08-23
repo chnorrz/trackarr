@@ -78,7 +78,7 @@ test('recordRequest(true, {cached: true}) counts as both successful and cached',
   const stats = tracker.get('p').stats;
   assert.equal(stats.total, 1);
   assert.equal(stats.successful, 1);
-  assert.equal(stats.cached, 1); // cached is a SUBSET of successful, not a separate bucket
+  assert.equal(stats.cached, 1);
   assert.equal(stats.failed, 0);
 });
 
@@ -99,16 +99,11 @@ test('recordRequest accumulates across many calls, mixing outcomes', () => {
   tracker.recordRequest('p', false, { error: 'x' });
   const stats = tracker.get('p').stats;
   assert.deepEqual(stats, { total: 4, successful: 3, cached: 2, failed: 1 });
-  // last call was a failure, so current state reflects that even though
-  // most historical requests succeeded - state is "right now", stats are
-  // cumulative.
   assert.equal(tracker.get('p').state, 'error');
 });
 
-// The page's own <style> block defines ".badge-ok"/".badge-error"/
-// ".badge-unknown" as CSS class selectors, so a loose substring match for
-// any of those always "matches" regardless of what's actually rendered -
-// assert against the full <span> element instead.
+// The page's <style> block contains these class names, so a loose substring
+// match always hits - assert against the rendered <span> instead.
 const badgeUnknown = /<span class="badge badge-unknown">UNKNOWN<\/span>/;
 const badgeOk = /<span class="badge badge-ok">OK<\/span>/;
 const badgeError = /<span class="badge badge-error">ERROR<\/span>/;
@@ -146,7 +141,7 @@ test('renderStatusPage escapes HTML in provider names and error messages', () =>
 
 test('renderStatusPage shows "no requests yet" when stats are all zero', () => {
   const tracker = new ProviderStatusTracker();
-  tracker.recordCheck('one', true); // a check happened, but never a real request
+  tracker.recordCheck('one', true);
   const providers = { one: fakeProvider('one', 'Provider One') };
   const html = renderStatusPage(providers, tracker);
   assert.match(html, /no requests yet/);
@@ -161,7 +156,6 @@ test('renderStatusPage shows request counts and the cached percentage of success
   tracker.recordRequest('one', false, { error: 'boom' });
   const providers = { one: fakeProvider('one', 'Provider One') };
   const html = renderStatusPage(providers, tracker);
-  // 5 total, 4 successful (3 of which cached = 75%), 1 failed
   assert.match(html, /5 served/);
   assert.match(html, /4 ok \(75% cached\)/);
   assert.match(html, /1 failed/);
@@ -173,6 +167,6 @@ test('renderStatusPage omits the cached percentage when nothing has succeeded ye
   const providers = { one: fakeProvider('one', 'Provider One') };
   const html = renderStatusPage(providers, tracker);
   assert.match(html, /1 served/);
-  assert.match(html, /0 ok \u00b7/); // no "(X% cached)" appended when successful is 0
+  assert.match(html, /0 ok \u00b7/);
   assert.doesNotMatch(html, /cached\)/);
 });

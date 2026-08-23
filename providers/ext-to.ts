@@ -9,54 +9,28 @@ import type { MagnetRef, Provider, SearchItem, SearchOptions, SearchResult } fro
 const BASE = 'https://ext.to';
 const MAGNET_ENDPOINT = `${BASE}/ajax/getSearchMagnet.php`;
 
-// /browse/ page size - used for both keyword search and blank-query
-// "latest" browsing, so fetchPagedWindow's paging math is consistent
-// either way.
 const SITE_PAGE_SIZE = 100;
-// How deep into ext.to's own catalog trackarr will ever page for one query.
-// This, not <opensearch:totalResults> (which Prowlarr never parses - see
-// server.ts), is what actually stops Prowlarr's pagination: once offset
-// reaches this cap search() returns a short/empty page.
 const DEPTH_CAP = 200;
 
 function computeHMAC(torrentId: number, timestamp: number, token: string): string {
   return crypto.createHash('sha256').update(`${torrentId}|${timestamp}|${token}`).digest('hex');
 }
 
-// Matched against the breadcrumb *hrefs* (both levels joined, e.g.
-// "/tv/ /tv/season-packs/"), not the link text - see parseListing. Text is
-// display copy and drifts/varies ("Audio books" vs "audiobook"); the path
-// slug is the same thing the site itself routes on, so it's the more
-// stable signal (same reasoning as 1337x's sub-id table in section 3).
-// Order matters - first match wins, and "audio-book" must stay above the
-// generic "/books/" rule or every audiobook is filed as a plain ebook.
+// Order matters - first match wins, so every subcategory slug must stay
+// above its generic parent (audio-books/ebooks above /books/, etc).
 const CATEGORY_RULES: CategoryRule[] = [
   [['/tv/'], CATEGORIES.TV],
   [['/anime/'], CATEGORIES.TV_ANIME],
-  // Live subcategory slug is /books/audio-books/ - hyphenated, plural.
   [['/books/audio-books/'], CATEGORIES.AUDIOBOOKS],
   [['/music/'], CATEGORIES.AUDIO],
-  // Live subcategories under /games/ - must stay above the generic
-  // /games/ fallback below, same reasoning as audio-book above /books/.
   [['/games/pc-games/'], CATEGORIES.PC_GAMES],
   [['/games/other-games/'], CATEGORIES.CONSOLE_OTHER],
-  // Unrecognized /games/ subcategory (neither of the two above) - closer
-  // to a PC game than anything else on offer, so that's the fallback
-  // rather than generic PC software.
   [['/games/'], CATEGORIES.PC_GAMES],
-  // Real top-level slug is /applications/, not /apps/ - confirmed live.
-  // Mac/Android are their own subcategories; Windows has none (falls
-  // through to the generic /applications/ rule below, which is correct -
-  // Torznab's generic PC id already means Windows software).
   [['/applications/mac/'], CATEGORIES.PC_MAC],
   [['/applications/android/'], CATEGORIES.PC_MOBILE_ANDROID],
   [['/applications/'], CATEGORIES.PC],
-  // Live subcategory slug is /books/ebooks/ - must stay above the generic
-  // /books/ fallback, same reasoning as audio-book/pc-games above.
   [['/books/ebooks/'], CATEGORIES.BOOKS_EBOOK],
   [['/books/'], CATEGORIES.BOOKS],
-  // No XXX rule - ext.to genuinely has no XXX category at all, confirmed
-  // twice (matches CATEGORY_BROWSE's lack of an XXX entry, see below).
   [['/movies/'], CATEGORIES.MOVIES]
 ];
 
@@ -65,18 +39,11 @@ interface BrowseTarget {
   subCat?: number;
 }
 
-// Maps a Torznab category id to ext.to's own /browse/?cat=&sub_cat= params -
-// used only for the blank-query "latest" path (a real keyword search isn't
-// filtered server-side at all, see SearchOptions' doc comment). ext.to has
-// no XXX category whatsoever, so CATEGORIES.XXX has no entry here - a
-// blank query for it returns empty rather than being misrouted to Other.
 const CATEGORY_BROWSE: Partial<Record<number, BrowseTarget>> = {
   [CATEGORIES.MOVIES]: { cat: 1 },
   [CATEGORIES.TV]: { cat: 2 },
   [CATEGORIES.AUDIO]: { cat: 3 },
   [CATEGORIES.PC_GAMES]: { cat: 4, subCat: 31 },
-  // ext.to doesn't split console games by platform - anything that isn't a
-  // PC game lands in its one "Other Games" bucket.
   [CATEGORIES.CONSOLE_OTHER]: { cat: 4, subCat: 32 },
   [CATEGORIES.PC]: { cat: 5 },
   [CATEGORIES.PC_MAC]: { cat: 5, subCat: 22 },
@@ -118,18 +85,8 @@ function parseListing(html: string, knownCategory?: number): ListingPage {
     const parsedDate = ageDate ? new Date(ageDate) : null;
     const pubDate = parsedDate && !isNaN(parsedDate.getTime()) ? parsedDate : new Date();
 
-    // When we already picked this listing's URL by category (blank-query
-    // browse - see browsePage/generalBrowsePage), trust that over the
-    // breadcrumb entirely. .related-posted also contains an uploader link,
-    // and its href shape has changed at least once (used to be
-    // "?source[]=N", now also seen as "/user/<name>/" for verified
-    // uploaders) - either shape can slip past a naive `a[href^="/"]`
-    // filter and get picked up as the "category" instead.
-    //
-    // Match against the breadcrumb links' hrefs (both levels, e.g.
-    // "/tv/ /tv/season-packs/"), NOT the link text - text is display copy
-    // and drifts ("Audio books" vs "audiobook" - real bug, caught live).
-    // The href slug is what the site itself routes on.
+    // .related-posted also holds an uploader link, hence the /user/ exclusion.
+    // Match hrefs, not link text - the display text drifts ("Audio books").
     const categoryHrefs = $tr
       .find('.related-posted a[href^="/"]:not([href^="/user/"])')
       .map((_, a) => $(a).attr('href') || '')
@@ -149,9 +106,6 @@ function parseListing(html: string, knownCategory?: number): ListingPage {
     });
   });
 
-  // ext.to shows a "Showing X - Y from Z" results-count string on the page.
-  // It isn't wrapped in a distinctive element, so match it generically
-  // against the page's text rather than depending on a specific selector.
   const countMatch = $.root()
     .text()
     .match(/[\d,]+\s*-\s*[\d,]+\s*from\s*([\d,]+)/i);
@@ -177,17 +131,9 @@ function browsePage(target: BrowseTarget, categoryId: number, sitePage: number):
   return fetchListingPage(`${BASE}/browse/?${params}`, categoryId);
 }
 
-// Bare /browse/ with no cat/sub_cat param - ext.to's own "all categories,
-// newest first" listing. Only used for a blank query with no cat requested
-// at all (Torznab: absent cat -> return all categories); a specific cat (or
-// several) routes through CATEGORY_BROWSE/fetchMergedBrowse instead. No
-// knownCategory here - the listing genuinely mixes every category, so
-// per-row breadcrumb detection is unavoidable.
 function generalBrowsePage(sitePage: number): Promise<ListingPage> {
-  // Without `age`, bare /browse/ (no q, no cat) renders as a category-picker
-  // landing page instead of a results table - confirmed live (0 rows, no
-  // <table> at all in the response). `age=4` is what a real "sort by age,
-  // no other filter" link on the site itself uses - confirmed live too.
+  // Without `age`, bare /browse/ renders a category-picker landing page
+  // instead of a results table. `age=4` is what the site's own link uses.
   const params = new URLSearchParams({ sort: 'age', order: 'desc', age: '4', page_size: String(SITE_PAGE_SIZE), page: String(sitePage) });
   return fetchListingPage(`${BASE}/browse/?${params}`);
 }
@@ -197,9 +143,6 @@ async function search(q: string, opts: SearchOptions): Promise<SearchResult> {
   const paging = { offset: opts.offset, limit: opts.limit, sitePageSize: SITE_PAGE_SIZE, depthCap: DEPTH_CAP };
 
   if (!trimmed) {
-    // Blank query ("Test" button, and every routine RSS/search sync - see
-    // server.ts): browse the requested category/categories' latest uploads
-    // instead of a keyword search.
     if (!opts.categories || opts.categories.length === 0) {
       return fetchPagedWindow(generalBrowsePage, paging);
     }
@@ -207,7 +150,7 @@ async function search(q: string, opts: SearchOptions): Promise<SearchResult> {
     const targets = opts.categories
       .map((id) => (CATEGORY_BROWSE[id] ? { id, target: CATEGORY_BROWSE[id] as BrowseTarget } : undefined))
       .filter((t): t is { id: number; target: BrowseTarget } => t !== undefined);
-    if (targets.length === 0) return { items: [], total: 0 }; // all requested cats unknown to ext.to (e.g. XXX)
+    if (targets.length === 0) return { items: [], total: 0 };
     if (targets.length === 1) {
       const only = targets[0] as { id: number; target: BrowseTarget };
       return fetchPagedWindow((sitePage) => browsePage(only.target, only.id, sitePage), paging);
@@ -229,18 +172,11 @@ async function search(q: string, opts: SearchOptions): Promise<SearchResult> {
   );
 }
 
-// Resolves a magnet URI for a given torrent id using the search-listing
-// page's magnet flow. `id` is the torrent id from search() - `url` is
-// ignored, ext.to doesn't need the detail page at all.
 async function resolveMagnet({ id }: MagnetRef): Promise<string> {
   if (!id) throw new Error('ext-to: resolveMagnet requires an id.');
 
-  // Bare /browse/ (no query) doesn't render searchPageToken - needs an
-  // actual results listing. A very short/single-char query seems to trip a
-  // stricter WAF rule, so use a realistic-looking query string here. This
-  // is the exact same URL keepAlive pings, so the HTML is very often
-  // already warm in cfFetch's own cache - no page interaction
-  // at all in that case, not even a fast-path fetch.
+  // Needs a real results listing - bare /browse/ renders no searchPageToken,
+  // and a very short query trips a stricter WAF rule.
   const html = await cfFetch(`${BASE}/browse/?q=yify`);
 
   const pageTokenMatch = html.match(/searchPageToken\s*=\s*['"]([^'"]+)['"]/);
@@ -254,12 +190,6 @@ async function resolveMagnet({ id }: MagnetRef): Promise<string> {
   const timestamp = Math.floor(Date.now() / 1000);
   const hmac = computeHMAC(id, timestamp, pageToken);
 
-  // The actual lookup is a POST, same as the read above just with a verb -
-  // cfFetch runs it through the same persistent page/session,
-  // no separate live-page handling needed. Its own cache is a no-op here
-  // in practice (timestamp/hmac make the body unique on every call), which
-  // is fine - correctness (never serving one torrent's response for
-  // another's request) is what the cache key guards, not a hit rate.
   const responseText = await cfFetch(MAGNET_ENDPOINT, {
     method: 'POST',
     headers: { 'X-Requested-With': 'XMLHttpRequest', 'Content-Type': 'application/x-www-form-urlencoded' },
@@ -290,12 +220,7 @@ async function resolveMagnet({ id }: MagnetRef): Promise<string> {
 export default {
   id: 'ext-to',
   name: 'ext.to',
-  // Background warm-up target. Must be a real listing page: bare /browse/
-  // doesn't render searchPageToken, and the challenge lives on the listing
-  // path rather than the homepage.
   keepAlive: { url: `${BASE}/browse/?q=yify` },
-  // No XXX or Mobile-iOS here - ext.to doesn't offer either. The whole
-  // browsable category set is exactly what CATEGORY_BROWSE can route.
   categories: Object.keys(CATEGORY_BROWSE).map(Number),
   search,
   resolveMagnet
