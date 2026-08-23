@@ -30,10 +30,13 @@ carrying a whole extra toolchain just to interpret TS on every start.
 | `lib/parse.ts` | Shared size-string parsing |
 | `lib/types.ts` | `Provider`/`SearchItem`/`MagnetRef` shared interfaces |
 | `providers/*.ts` | Per-tracker, each `export default {...} satisfies Provider` |
+| `lib/cardigann/` | Prowlarr Cardigann YML definition loader/validator - see section 17 |
+| `definitions/*.yml` | Shipped Cardigann definitions (also read from `DEFINITIONS_DIR`) |
 | `tools/tinyproxy.conf` | Proxy config, runs on the **macOS host** (see 1337x) |
 
-Adding a tracker: write `providers/<id>.ts`, register in
-`providers/index.ts`. Nothing else needs touching.
+Adding a hand-written tracker: write `providers/<id>.ts`, register in
+`providers/index.ts`. Adding a Cardigann-defined one: drop a `.yml` file in
+`definitions/` or `DEFINITIONS_DIR` - see section 17.
 
 ---
 
@@ -1751,3 +1754,130 @@ the HTML `home` page instead of an API, so `sort_no=100` (raising the
 keywordless result count to 100) does something for Cardigann that it
 cannot do here — worth knowing if EZTV's blank-query yield is ever
 compared against another Torznab indexer.
+
+---
+
+## 17. Cardigann definitions (`lib/cardigann/`)
+
+Lets a tracker be added by dropping a Prowlarr Cardigann v11 YAML definition
+into `definitions/` (or the `DEFINITIONS_DIR` volume - see the loader) instead
+of hand-writing a `providers/<id>.ts`. Phase 1 only: the loader and the two
+validation gates. The execution engine (phase 2+) doesn't exist yet - nothing
+in this section is wired into `server.ts` or `providers/index.ts`.
+
+### Two gates, not one
+
+Schema-valid does not mean runnable. `lib/cardigann/schema.json` is the
+**vendored, pinned** Prowlarr v11 schema (`additionalProperties: false`,
+draft/2019-09 - needs `ajv/dist/2019`, not Ajv's default draft-07 export).
+It accepts private trackers, login flows, and filters this engine will never
+implement. `lib/cardigann/capability.ts` is the second gate: it walks an
+already-schema-valid definition and names every feature we can't execute.
+
+```
+npm run validate:definitions [dir]   # defaults to ./definitions
+```
+
+### YAML parser choice is load-bearing
+
+`js-yaml`'s default schema resolves ISO-8601-looking scalars to JS `Date`
+objects, which then fails the schema's `type: string` checks. The `yaml`
+package's default (YAML 1.2 core) leaves them as strings - verified directly,
+not assumed (`YAML.parse('a: 2016-07-15')` → `{ a: "2016-07-15" }`, not a
+`Date`).
+
+One real gap `yaml` does *not* paper over: an unquoted `true`/`false` inside
+an `options:`/`case:` map parses as a JS boolean, but the schema requires
+strings there (`options: { hd: true }` needs to mean the string `"true"`).
+This is the same quirk Prowlarr's own Python validator documents and
+auto-corrects (`CONTRIBUTING.md`). `load.ts`'s `normalizeBooleanMaps()`
+mirrors it, scoped to `options`/`case` keys only so genuinely boolean-typed
+schema fields elsewhere (`caps.allowrawsearch`) are left alone. Numeric/
+boolean YAML *keys* (`options: { 1: "x" }`) are a non-issue in JS - unlike
+Python dicts, `Object` keys are always coerced to strings, confirmed
+directly rather than assumed.
+
+`ajv-formats` is required alongside Ajv - without it, `format: "uri"` etc. on
+`links`/`legacylinks` is silently skipped rather than enforced (Prowlarr's
+own documented `ajv-cli` usage pairs the two for the same reason). Its CJS
+export shape resolves to a non-callable type under `moduleResolution:
+NodeNext` despite being callable at runtime (verified against the compiled
+`dist/index.js`) - a known ajv-formats/NodeNext friction point, worked around
+with a documented cast in `load.ts` rather than fighting the resolver.
+
+### What the capability gate actually rejects, and why the list is short
+
+Every rejection reason was checked against the real wiki docs
+(wiki.servarr.com/prowlarr/cardigann-yml-definition) and real upstream
+definitions before being added - guessing what a Cardigann feature does and
+rejecting based on the guess is exactly the mistake the EZTV seeds bug (this
+file, section 16) came from.
+
+- **`type` must be `public`.** No `semi-private`/`private`.
+- **No `login` block.** Five auth methods, session/cookie lifecycle,
+  captchas - a real feature, deliberately out of scope for now.
+- **`search.rows.dateheaders` and `search.rows.after` are unsupported.**
+  Distinct parsing modes (previous-sibling date rows; N-following-rows
+  merged into one before field extraction), not just filters. Rare in
+  practice (3 and 14 hits respectively across the full corpus - see below).
+- **Any filter name outside the 24 implemented ones.** The schema's
+  `FilterBlock`/`RowFilterBlock` `name` enums are closed, finite lists (25
+  field filters + 2 row filters), transcribed from the wiki with exact
+  argument semantics for phase 2. Only `jsonjoinarray` is deliberately
+  unsupported - it needs a JSONPath dependency for one rare use
+  (`preprocessingfilters` on JSON APIs) and nothing in the addressable corpus
+  needs it.
+- **`settings[].type: multi-select`** - broken even in Prowlarr's own engine
+  per the wiki ("Using this type will throw a runtime error").
+
+**Deliberately *not* rejected, after checking real definitions instead of
+assuming:**
+
+- **`settings` in general.** First pass rejected any non-`info_*` setting,
+  which blocked hundreds of definitions purely for having an optional
+  `sort`/`type`-order dropdown with a documented `default` (e.g. `1337x.yml`'s
+  `sort: { type: select, default: time, ... }`, referenced as
+  `.Config.sort` in the search URL template). Second pass allowed settings
+  with a `default`. Checking real usage (`1337x.yml`'s `uploader` filter:
+  `{{ if .Config.uploader }}...{{ else }}{{ end }}`) showed the *standard*
+  Cardigann idiom already guards optional settings this way - so once `type`
+  is `public` and no `login` block exists (nothing else could ever treat a
+  setting as a mandatory credential), settings are never a capability
+  blocker. Unset `.Config.$name` will resolve to `""` in the phase 2 engine,
+  which is exactly what an unguarded reference would evaluate to anyway.
+- **`fields.infohash` / `download.infohash`.** Not a bencode/`.torrent`-file
+  hash computation as first assumed - it's a magnet URI built from a
+  `hash` selector + a `title` selector, explicitly documented as
+  Public/Semi-Private-only (private trackers need a tracker-exclusive magnet
+  with DHT off, which this can't produce). Simple, will be implemented.
+- **`download.before`.** A documented, bounded multi-step fetch (either a
+  templated `path`+`inputs` request, or a `pathselector` extracted from the
+  current page) before resolving the actual download link - structurally the
+  same shape as EZTV's old priming-GET (section 16), just declared instead of
+  hand-written. Will be implemented.
+
+### Coverage against the full upstream corpus (547 v11 definitions, one snapshot)
+
+```
+git clone --depth 1 --filter=blob:none --sparse https://github.com/Prowlarr/Indexers.git <dir>
+cd <dir> && git sparse-checkout set definitions/v11
+node dist/lib/cardigann/cli.js <dir>/definitions/v11
+```
+
+| | Count |
+|---|---|
+| Schema-invalid | 0 |
+| Schema-valid | 547 |
+| Blocked by `type: private`/`semi-private` + `login` | 468 (excluded by design) |
+| Blocked by `rows.after` / `rows.dateheaders` | 14 / 3 (deferred, rare) |
+| **Runnable end to end** | **76** |
+
+76 includes real, well-known public trackers: `1337x.yml` (Cardigann's own -
+distinct from our hand-written `providers/1337x.ts`), `thepiratebay.yml`,
+`yts.yml`, `nyaasi.yml`, `eztv.yml` (distinct from `providers/eztv.ts`),
+`limetorrents.yml`, `rutor.yml`, `showrss.yml`, `internetarchive.yml`.
+
+This number is upstream-dependent and will drift; re-run the two commands
+above (with a fresh clone) to get a current figure, and re-check `VERSIONS`
+(`MIN=MAX=CURRENT=11` at time of writing, `v12` in development) before
+assuming the vendored `schema.json` is still current.
