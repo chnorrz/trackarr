@@ -1881,3 +1881,131 @@ This number is upstream-dependent and will drift; re-run the two commands
 above (with a fresh clone) to get a current figure, and re-check `VERSIONS`
 (`MIN=MAX=CURRENT=11` at time of writing, `v12` in development) before
 assuming the vendored `schema.json` is still current.
+
+---
+
+## 18. Cardigann indexer config (`config/trackarr.yml`, phase 2a)
+
+No config UI, so a tracker is enabled by naming a Cardigann definition in a
+YAML file instead. Still no execution engine (phase 2b) - this phase is
+config loading, definition resolution, and both refuse-to-boot gates.
+`CONFIG_FILE` (default `config/trackarr.yml`) is read by
+`lib/cardigann/config-cli.ts` (`npm run validate:config`) today; wiring it
+into `server.ts`'s actual boot sequence is phase 3, alongside the provider
+adapter - a config file that validates cleanly currently does nothing
+observable yet, deliberately, rather than half-wiring boot behaviour ahead
+of the thing that would consume it.
+
+### Keyed by instance name, not a list
+
+```yaml
+indexers:
+  kickass:
+    definition: kickasstorrents-to
+  tpb-audio:                    # second instance, same definition
+    definition: thepiratebay
+    source: prowlarr:v11
+    config:
+      top100: "100"
+```
+
+The map key is both the instance name and the Torznab route
+(`/kickass/api`). `definition:` is always required, even when it would equal
+the key - explicit over implicit, since a dozen instances should each be
+individually greppable for which definition backs them. Two entries can name
+the same `definition` (confirmed: `yaml`'s parser itself throws `Map keys
+must be unique` on a literal duplicate *key*, which is a different thing
+from two different keys pointing at one definition - that's allowed and is
+the whole point of `tpb-audio` existing).
+
+**Per-instance state must stay per-instance**, not module-scope - phase 3's
+adapter must build a fresh cache (search results, magnets) per
+`createCardigannProvider()` call, the same mistake class our own
+`providers/eztv.ts` avoids by construction (its caches are already
+module-level singletons, but there's only ever one EZTV instance). Two
+`thepiratebay` instances sharing one cache would silently return one
+instance's results under the other's config. `cfFetch`'s own `pageCache`
+stays global and correctly so - it's keyed on method+URL+body, and two
+instances hitting the identical URL *should* share that fetch.
+
+**Not deduped: keep-alive.** Two instances of one definition (or a Cardigann
+definition and a hand-written provider for the same site) will each run
+their own keep-alive against the same host - doubled Cloudflare traffic for
+that host. Deliberately deferred; revisit if it becomes a real problem
+rather than a theoretical one.
+
+### Two schemas doing different jobs
+
+`lib/cardigann/schema.json` (vendored, section 17) validates a *definition*.
+`lib/cardigann/config-schema.json` (hand-written here) validates *our own*
+config file - a different document with a different, much smaller shape.
+Both compiled through the same `lib/cardigann/ajv.ts` helper (factored out
+of `load.ts` once a second schema needed the identical Ajv2019 +
+ajv-formats + NodeNext-cast setup - see section 17 for why the cast exists).
+
+### Four checks neither schema can express alone
+
+Because they depend on *both* documents at once - the config file and the
+definition it names - these live in `lib/cardigann/validate-config.ts`, not
+either JSON Schema, and are checked after a definition has already resolved:
+
+1. **Instance key collides with a built-in provider id** (`ext-to`, `1337x`,
+   `eztv`).
+2. **`link:` isn't in the definition's own `links[]`.** Deliberately
+   restrictive, not "any URL, warn if unlisted" - a typo here should fail
+   loudly rather than silently try to solve a challenge against a host that
+   was never meant to be reached. `DEFINITIONS_DIR` remains the intended
+   escape hatch for a mirror that died faster than upstream updated it: edit
+   a local copy's `links[]` to add it, rather than bypassing the check.
+3. **`config.<key>` isn't one of the definition's `settings[].name`s.**
+4. **A `select`-typed setting's config value isn't one of its declared
+   `options` keys** - checked by key, since that's what the wiki's own
+   example (`options: { 0_0: "All categories", 1_0: Movies }`) uses as the
+   machine value; the object's *values* are just display labels, never
+   compared against.
+
+All four are fatal - refuse to boot, matching the config file's own schema
+failures (section header). A stray character in `config/trackarr.yml`
+should be seen immediately, not silently ignored the way one bad definition
+in `definitions/` is (section 17's "skip it, log loudly" policy) - a config
+file is something an operator just edited, a definition is third-party data
+that arrives on its own schedule.
+
+### Resolution order, and why it's this order
+
+Per instance: **`DEFINITIONS_DIR` (volume) → `source:` (fetch+cache) →
+bundled repo `definitions/`.** `lib/cardigann/resolve.ts`.
+
+`DEFINITIONS_DIR` wins even over an *explicit* `source:` - confirmed by a
+dedicated test (`resolve.test.ts`: fetch throws if called, proving the
+volume copy short-circuits before it). This is deliberate: it's the same
+override escape hatch as `link:` above, and it needs to win unconditionally
+or "drop an edited copy in the volume" wouldn't actually override anything
+for an instance that also declares a `source:`.
+
+`source:` accepts either a raw URL, or a pin shorthand
+(`lib/cardigann/pins.json`) naming a **commit SHA**, not a branch - `prowlarr:v11`
+resolves to `raw.githubusercontent.com/Prowlarr/Indexers/<pinned-sha>/definitions/v11/<id>.yml`.
+Pinning to a SHA rather than `master` is what makes two runs of the same
+config deterministic; a definition drives real requests through the browser
+session and proxy, so "what ran yesterday" silently becoming "what runs
+today" because upstream pushed a change is the same class of problem
+non-reproducible builds are. Bumping the pin is a deliberate, visible,
+one-line diff, not something that happens by itself.
+
+**Fetched definitions are cached to disk** (`CARDIGANN_CACHE_DIR`, default
+`.cardigann-cache/`) as `<id>.yml` plus a `<id>.meta.json` sidecar recording
+the source URL and fetch time. A failed fetch falls back to the cache if one
+exists (`docker restart` with no network still boots) and only throws if
+there's truly nothing to fall back to - confirmed with an injected
+`fetchImpl` that always throws, both with and without a pre-seeded cache
+file. The cache never auto-expires; only a successful re-fetch (or bumping
+the pin) refreshes it.
+
+Every resolved definition - local, cached, or freshly fetched - is
+validated exactly once, through the same `validateDefinitionYaml()` from
+section 17, and its parsed `id` is checked against the id it was requested
+under. A definition fetched or filed under the wrong name (a copy/paste
+mistake, or upstream renaming a file without updating its own `id:` field)
+is rejected naming both ids, rather than silently registered under the
+wrong instance.

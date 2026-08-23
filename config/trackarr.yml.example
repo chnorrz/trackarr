@@ -1,0 +1,16 @@
+indexers:
+  kickass:
+    definition: kickasstorrents-to
+
+  thepiratebay:
+    definition: thepiratebay
+    source: prowlarr:v11
+    config:
+      apiurl: apibay.org
+      top100: recent
+
+  tpb-audio:
+    definition: thepiratebay
+    source: prowlarr:v11
+    config:
+      top100: "100"

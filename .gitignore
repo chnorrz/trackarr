@@ -3,3 +3,5 @@ dist
 .cf-cookies.json
 .cf-ua.txt
 *.log
+.cardigann-cache/
+config/trackarr.yml

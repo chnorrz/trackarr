@@ -1,0 +1,7 @@
+{
+  "prowlarr:v11": {
+    "repo": "Prowlarr/Indexers",
+    "ref": "dca9847c4b136d02e07c2a492615687f0eacc7d8",
+    "path": "definitions/v11"
+  }
+}

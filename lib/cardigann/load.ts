@@ -2,30 +2,13 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import YAML from 'yaml';
-// Ajv's default export only understands draft-07; the vendored Prowlarr
-// schema declares draft/2019-09, so this build is required.
-import { Ajv2019 } from 'ajv/dist/2019.js';
-import type { ErrorObject, ValidateFunction } from 'ajv';
-// Without this, format: "uri" etc. on schema.json's fields (links,
-// legacylinks, ...) is silently skipped rather than enforced - Prowlarr's
-// own documented ajv-cli usage pairs the two for the same reason.
-//
-// ajv-formats' CJS output is `module.exports = formatsPlugin` with `.default`
-// re-pointed at itself for interop; under NodeNext this resolves at the type
-// level to a non-callable namespace, though the runtime value (verified via
-// the compiled dist/index.js) really is the callable function. Cast rather
-// than fight the resolver - a known friction point for this package, not a
-// bug in our code.
-import ajvFormatsImport from 'ajv-formats';
-const addFormats = ajvFormatsImport as unknown as (ajv: Ajv2019) => void;
+import type { ErrorObject } from 'ajv';
+import { compileSchema } from './ajv.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
 const schema = JSON.parse(fs.readFileSync(path.join(__dirname, 'schema.json'), 'utf8')) as object;
-
-const ajv = new Ajv2019({ allErrors: true, strict: false });
-addFormats(ajv);
-const validateSchema: ValidateFunction = ajv.compile(schema);
+const validateSchema = compileSchema(schema);
 
 // Mirrors a quirk documented in Prowlarr's own Python validator
 // (CONTRIBUTING.md): the schema requires string values inside `options` and
@@ -62,6 +45,40 @@ export interface LoadResult {
   invalid: RejectedDefinition[];
 }
 
+export type ValidatedYaml =
+  | { ok: true; id: string; definition: Record<string, unknown> }
+  | { ok: false; errors: string[] };
+
+// The one place both the directory scanner below and lib/cardigann/resolve.ts
+// (single definition, by id, from a local dir or a fetched URL) run schema
+// validation - kept as a single Ajv instance/compiled validator rather than
+// two, so both paths reject exactly the same things the same way.
+export function validateDefinitionYaml(raw: string): ValidatedYaml {
+  let parsed: unknown;
+
+  try {
+    parsed = YAML.parse(raw);
+  } catch (err) {
+    return { ok: false, errors: [`YAML parse error: ${err instanceof Error ? err.message : String(err)}`] };
+  }
+
+  normalizeBooleanMaps(parsed);
+
+  if (!validateSchema(parsed)) {
+    const errors = (validateSchema.errors || []).map((e: ErrorObject) => `${e.instancePath || '/'} ${e.message}`);
+    return { ok: false, errors };
+  }
+
+  const definition = parsed as Record<string, unknown>;
+  const id = definition.id;
+
+  if (typeof id !== 'string') {
+    return { ok: false, errors: ['missing or non-string id after schema validation (unexpected)'] };
+  }
+
+  return { ok: true, id, definition };
+}
+
 export function loadDefinitions(dir: string): LoadResult {
   const valid: LoadedDefinition[] = [];
   const invalid: RejectedDefinition[] = [];
@@ -72,32 +89,22 @@ export function loadDefinitions(dir: string): LoadResult {
 
   for (const file of files) {
     const full = path.join(dir, file);
-    let parsed: unknown;
+    let raw: string;
 
     try {
-      parsed = YAML.parse(fs.readFileSync(full, 'utf8'));
+      raw = fs.readFileSync(full, 'utf8');
     } catch (err) {
-      invalid.push({ file, errors: [`YAML parse error: ${err instanceof Error ? err.message : String(err)}`] });
+      invalid.push({ file, errors: [`read error: ${err instanceof Error ? err.message : String(err)}`] });
       continue;
     }
 
-    normalizeBooleanMaps(parsed);
-
-    if (!validateSchema(parsed)) {
-      const errors = (validateSchema.errors || []).map((e: ErrorObject) => `${e.instancePath || '/'} ${e.message}`);
-      invalid.push({ file, errors });
+    const result = validateDefinitionYaml(raw);
+    if (!result.ok) {
+      invalid.push({ file, errors: result.errors });
       continue;
     }
 
-    const definition = parsed as Record<string, unknown>;
-    const id = definition.id;
-
-    if (typeof id !== 'string') {
-      invalid.push({ file, errors: ['missing or non-string id after schema validation (unexpected)'] });
-      continue;
-    }
-
-    valid.push({ file, id, definition });
+    valid.push({ file, id: result.id, definition: result.definition });
   }
 
   return { valid, invalid };

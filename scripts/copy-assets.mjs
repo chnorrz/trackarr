@@ -11,7 +11,9 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const root = path.resolve(__dirname, '..');
 
 const assets = [
-  ['lib/cardigann/schema.json', 'dist/lib/cardigann/schema.json']
+  ['lib/cardigann/schema.json', 'dist/lib/cardigann/schema.json'],
+  ['lib/cardigann/config-schema.json', 'dist/lib/cardigann/config-schema.json'],
+  ['lib/cardigann/pins.json', 'dist/lib/cardigann/pins.json']
 ];
 
 for (const [src, dest] of assets) {

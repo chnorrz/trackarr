@@ -10,7 +10,8 @@
     "lint": "eslint .",
     "test": "npm run build && node --experimental-test-module-mocks --test \"test/**/*.test.ts\"",
     "typecheck": "tsc --noEmit -p tsconfig.test.json",
-    "validate:definitions": "npm run build && node dist/lib/cardigann/cli.js"
+    "validate:definitions": "npm run build && node dist/lib/cardigann/cli.js",
+    "validate:config": "npm run build && node dist/lib/cardigann/config-cli.js"
   },
   "dependencies": {
     "ajv": "^8.20.0",

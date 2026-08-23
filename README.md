@@ -178,6 +178,33 @@ All via environment variables.
 | `KEEPALIVE_INTERVAL_MS` | `900000` | Background Cloudflare warm-up (15 min). `0` disables |
 | `PROXY_URL` | *(unset)* | Upstream proxy, see below. Unset = direct |
 | `DOMAIN_OVER_PROXY` | *(unset)* | Comma-separated hostnames routed through the proxy (a listed name also matches its subdomains). **Unset or empty = none** - opt-in, not opt-out |
+| `CONFIG_FILE` | `config/trackarr.yml` | Cardigann indexer config - see below. Missing file = no Cardigann indexers, no effect on `ext-to`/`1337x`/`eztv` |
+| `DEFINITIONS_DIR` | *(unset)* | Volume of Cardigann `.yml` definitions, checked before the repo's bundled `definitions/` and before any `source:` fetch - drop an edited copy here to override one |
+| `CARDIGANN_CACHE_DIR` | `.cardigann-cache` | Disk cache for `source:`-fetched definitions, so a restart works offline |
+
+### Cardigann indexer config (optional)
+
+Adds a tracker from a [Prowlarr Cardigann](https://wiki.servarr.com/prowlarr/cardigann-yml-definition)
+YAML definition instead of a hand-written provider. See `config/trackarr.yml.example`
+and `NOTES.md` section 17/18 for the full design (two validation gates, definition
+resolution order, why settings without a default are still safe to use).
+
+```yaml
+# config/trackarr.yml
+indexers:
+  kickass:
+    definition: kickasstorrents-to
+
+  tpb-audio:                        # a second instance of the same definition
+    definition: thepiratebay
+    source: prowlarr:v11
+    config:
+      top100: "100"
+```
+
+A config file present but failing validation refuses to boot (typos should
+be seen immediately, not silently ignored); no config file at all just means
+no Cardigann indexers.
 
 ### Proxy (optional)
 
