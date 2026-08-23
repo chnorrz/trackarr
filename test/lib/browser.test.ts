@@ -28,11 +28,15 @@ let newPageCalls = 0;
 let newContextCalls = 0;
 let camoufoxCalls = 0;
 
+let newPageFails = false;
+let browserCloses = 0;
+
 const fakeContext = {
   newPage: async () => {
     newPageCalls++;
     // Widens the race window so both callers are genuinely in-flight at once.
     await new Promise((r) => setTimeout(r, 20));
+    if (newPageFails) throw new Error('newPage: Target closed');
     return createFakePage();
   },
   cookies: async () => []
@@ -42,6 +46,9 @@ const fakeBrowser = {
   newContext: async () => {
     newContextCalls++;
     return fakeContext;
+  },
+  close: async () => {
+    browserCloses++;
   }
 };
 
@@ -93,4 +100,22 @@ test('a page that failed is thrown away instead of being handed to the next call
 
   assert.equal(recovered, '<html><body>cleared, not a challenge</body></html>');
   assert.equal(newPageCalls, 2, 'the next call must build a fresh page, not reuse the failed one');
+});
+
+test('a session that cannot open a page is torn down, not leaked', async () => {
+  camoufoxCalls = 0;
+  browserCloses = 0;
+
+  newPageFails = true;
+  await assert.rejects(
+    cfFetch('https://leak-test.example/one'),
+    /Target closed/
+  );
+  assert.equal(browserCloses, 1, 'the unusable browser must be closed, not orphaned');
+
+  newPageFails = false;
+  const recovered = await cfFetch('https://leak-test.example/two');
+
+  assert.equal(recovered, '<html><body>cleared, not a challenge</body></html>');
+  assert.equal(camoufoxCalls, 1, 'the next call must launch a fresh browser');
 });

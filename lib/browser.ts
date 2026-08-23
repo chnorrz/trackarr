@@ -14,9 +14,9 @@ const DOMAIN_OVER_PROXY = (process.env.DOMAIN_OVER_PROXY || '')
   .map((s) => s.trim())
   .filter(Boolean);
 
-let sharedBrowser: Browser | null = null;
-let sharedContext: BrowserContext | null = null;
-let persistentContextPromise: Promise<BrowserContext> | null = null;
+type BrowserSession = { browser: Browser; context: BrowserContext };
+
+let session: Promise<BrowserSession> | null = null;
 
 // XTEST input is global to the X display, and concurrent navigations to one
 // Cloudflare-protected host hang until the page.goto timeout.
@@ -53,18 +53,32 @@ function buildPacDataUri(): string | null {
   return `data:application/x-ns-proxy-autoconfig;base64,${Buffer.from(pac).toString('base64')}`;
 }
 
-async function getPersistentContext(): Promise<BrowserContext> {
-  if (sharedContext) return sharedContext;
-  if (!persistentContextPromise) {
-    persistentContextPromise = launchPersistentContext().catch((err) => {
-      persistentContextPromise = null;
+function getSession(): Promise<BrowserSession> {
+  if (!session) {
+    session = launchSession().catch((err) => {
+      session = null;
       throw err;
     });
   }
-  return persistentContextPromise;
+
+  return session;
 }
 
-async function launchPersistentContext(): Promise<BrowserContext> {
+// Closing the browser is best-effort: it may already be gone, which is the
+// usual reason we are discarding the session in the first place.
+async function discardSession(): Promise<void> {
+  const current = session;
+  session = null;
+  persistentPages.clear();
+  persistentPagePromises.clear();
+
+  const live = await current?.catch(() => null);
+  try {
+    await live?.browser.close();
+  } catch { /* already gone */ }
+}
+
+async function launchSession(): Promise<BrowserSession> {
   // Camoufox's own 'virtual' mode also uses Xvfb but at 1x1, leaving no room to
   // render or click the Turnstile widget, so on Linux run against DISPLAY.
   const headless = process.platform === 'linux' ? false : true;
@@ -83,11 +97,8 @@ async function launchPersistentContext(): Promise<BrowserContext> {
   const browser = os
     ? await Camoufox({ headless, os, window: WINDOW_SIZE, ...(firefoxPrefs ? { firefox_user_prefs: firefoxPrefs } : {}) })
     : await Camoufox({ headless, window: WINDOW_SIZE, ...(firefoxPrefs ? { firefox_user_prefs: firefoxPrefs } : {}) });
-  sharedBrowser = browser;
 
-  const context = await browser.newContext();
-  sharedContext = context;
-  return context;
+  return { browser, context: await browser.newContext() };
 }
 
 // Narrower than RequestInit on purpose: these values are serialized into
@@ -99,33 +110,41 @@ export type FetchOptions = {
 };
 
 const persistentPages = new Map<string, Page>();
-
 const persistentPagePromises = new Map<string, Promise<Page>>();
 
 async function getOrCreatePersistentPage(hostname: string): Promise<Page> {
   const existing = persistentPages.get(hostname);
-  if (existing && !existing.isClosed()) return existing;
+
+  if (existing && !existing.isClosed()) {
+    return existing;
+  }
+
   persistentPages.delete(hostname);
 
-  let promise = persistentPagePromises.get(hostname);
-  if (!promise) {
-    promise = (async () => {
-      const context = await getPersistentContext();
-      const page = await context.newPage();
-      persistentPages.set(hostname, page);
-      return page;
-    })()
-      .catch((err) => {
-        sharedContext = null;
-        persistentContextPromise = null;
-        throw err;
-      })
-      .finally(() => {
-        persistentPagePromises.delete(hostname);
-      });
-    persistentPagePromises.set(hostname, promise);
+  // Nothing may await between this lookup and the set below, or two
+  // concurrent callers would each open a page for one hostname.
+  let pending = persistentPagePromises.get(hostname);
+
+  if (!pending) {
+    pending = openPersistentPage(hostname);
+    persistentPagePromises.set(hostname, pending);
   }
-  return promise;
+
+  return pending;
+}
+
+async function openPersistentPage(hostname: string): Promise<Page> {
+  try {
+    const { context } = await getSession();
+    const page = await context.newPage();
+    persistentPages.set(hostname, page);
+    return page;
+  } catch (err) {
+    await discardSession();
+    throw err;
+  } finally {
+    persistentPagePromises.delete(hostname);
+  }
 }
 
 function recyclePage(page: Page): void {
@@ -233,9 +252,5 @@ export async function cfFetch(url: string, opts: FetchOptions = {}): Promise<str
 }
 
 export async function closeBrowser(): Promise<void> {
-  persistentPages.clear();
-  persistentPagePromises.clear();
-  if (sharedBrowser) await sharedBrowser.close();
-  sharedBrowser = null;
-  sharedContext = null;
+  await discardSession();
 }
