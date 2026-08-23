@@ -9,9 +9,6 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.resolve(__dirname, '..', '..');
 const SEARCH_HTML = fs.readFileSync(path.join(ROOT, 'test', 'fixtures', 'eztv-search.html'), 'utf8');
 
-// eztv.ts no longer imports gotoCleared at all - searchByKeyword()'s
-// wlinks-reveal flow (a priming GET, then a POST) and resolveMagnet()'s
-// detail-page fallback (a plain GET) all go through cfFetch().
 const cfFetch = mock.fn<(url: string, opts?: FetchOptions) => Promise<string>>(async () => '');
 mock.module(path.join(ROOT, 'dist', 'lib', 'browser.js'), {
   exports: { cfFetch }
@@ -26,12 +23,10 @@ test('eztv search() parses the wlinks-revealed markup, including inline magnets'
   assert.equal(items.length, 3);
 
   const [first] = items;
-  // Title is derived from the title attr with the trailing "(size)" suffix
-  // stripped off - NOT the truncated "..." visible anchor text.
   assert.equal(first.title, 'Example.Show.S01E01.720p.WEB.x264-FAKEGRP');
   assert.equal(first.size, Math.round(412.6 * 1024 ** 2));
-  assert.equal(first.category, 5000); // EZTV is TV-only, always CATEGORIES.TV
-  assert.equal(first.seeds, 0); // search rows never show seed/leech counts
+  assert.equal(first.category, 5000);
+  assert.equal(first.seeds, 0);
 });
 
 test('eztv resolveMagnet() serves from magnetCache after a prior search(), no second fetch', async () => {
@@ -44,7 +39,6 @@ test('eztv resolveMagnet() serves from magnetCache after a prior search(), no se
   const magnet = await provider.resolveMagnet({ id: null, url: detailUrl });
 
   assert.ok(magnet.startsWith('magnet:?xt=urn:btih:0000000000000000000000000000000000aaa1'));
-  // Cache hit - resolveMagnet must not have called cfFetch again.
   assert.equal(cfFetch.mock.callCount(), callsBeforeResolve);
 });
 
@@ -63,13 +57,13 @@ test('eztv resolveMagnet() throws without a url', async () => {
 test('eztv search() returns empty for a category that excludes TV, without hitting the network', async () => {
   const callsBefore = cfFetch.mock.callCount();
 
-  const blank = await provider.search('', { categories: [2000], offset: 0, limit: 50 }); // Movies only
+  const blank = await provider.search('', { categories: [2000], offset: 0, limit: 50 });
   assert.deepEqual(blank, { items: [], total: 0 });
 
   const keyword = await provider.search('anything', { categories: [2000], offset: 0, limit: 50 });
   assert.deepEqual(keyword, { items: [], total: 0 });
 
-  assert.equal(cfFetch.mock.callCount(), callsBefore); // short-circuited before any fetch
+  assert.equal(cfFetch.mock.callCount(), callsBefore);
 });
 
 test('eztv search() still returns results when TV is among several requested categories', async () => {
@@ -81,9 +75,8 @@ test('eztv search() still returns results when TV is among several requested cat
 
 test('eztv search() passes the wlinks-reveal POST body/headers through to cfFetch', async () => {
   cfFetch.mock.mockImplementation(async () => SEARCH_HTML);
-  // Distinct query - 'anything' is already cached by earlier tests in this
-  // file (keywordSearchCache is a module-level singleton keyed only by q),
-  // which would make this a cache hit that never calls cfFetch.
+  // Distinct query: keywordSearchCache is a module-level singleton keyed only
+  // by q, so reusing 'anything' here would be a cache hit that skips cfFetch.
   await provider.search('a-query-not-used-elsewhere-in-this-file', { offset: 0, limit: 50 });
 
   const lastCall = cfFetch.mock.calls[cfFetch.mock.calls.length - 1];

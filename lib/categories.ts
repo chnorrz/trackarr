@@ -1,12 +1,5 @@
-// Shared Torznab category ids. Providers map their own site-specific
-// category schemes onto these. Ids beyond the original flat set match the
-// real Newznab/Torznab standard (confirmed against Prowlarr's own
-// NewznabStandardCategory.cs) rather than being invented - added because a
-// real downstream consumer needs the distinction: Bindery (ebook/audiobook
-// managers) requires 7020/3030 specifically, bare 7000/3000 aren't enough
-// (see NOTES.md). 4050 and the 1000-series console ids were added for the
-// same reason, once ext.to/1337x's own category schemes turned out to
-// support that granularity.
+// Subcat ids follow the real Newznab/Torznab standard because downstream
+// consumers need them: Bindery requires 7020/3030, bare 7000/3000 won't do.
 export const CATEGORIES = {
   MOVIES: 2000,
   TV: 5000,
@@ -22,10 +15,6 @@ export const CATEGORIES = {
   BOOKS: 7000,
   BOOKS_EBOOK: 7020,
   OTHER: 8000,
-  // Console (1000-series) is its own parent tree, separate from PC/4000 -
-  // only the ids actually reachable via ext.to's/1337x's own category
-  // schemes are listed; anything else (older/newer consoles the standard
-  // doesn't have a dedicated id for) falls back to CONSOLE_OTHER.
   CONSOLE_NDS: 1010,
   CONSOLE_PSP: 1020,
   CONSOLE_WII: 1030,
@@ -40,8 +29,6 @@ export const CATEGORIES = {
 interface CategoryDef {
   id: number;
   name: string;
-  /** Set for every subcat - the Newznab/Torznab standard convention nests an
-   * Xnnn id under its X000 parent (e.g. 5070 TV/Anime under 5000 TV). */
   parent?: number;
 }
 
@@ -72,15 +59,6 @@ const CATEGORY_DEFS: CategoryDef[] = [
   { id: 1180, name: 'Console/PS4', parent: 1000 }
 ];
 
-/**
- * Renders a <categories> block containing only the ids a given provider
- * actually offers - e.g. EZTV is TV-only, so it should never advertise
- * Movies/Books/XXX/etc just because trackarr-wide CATEGORIES has them.
- * A subcat pulls its parent in automatically (Torznab caps nest subcats
- * under a parent category element) even if the provider only listed the
- * subcat id; a lone id with no parent/children renders as a self-closing
- * <category />.
- */
 export function categoriesXml(ids: number[]): string {
   const idSet = new Set(ids);
   const parentIds = new Set(CATEGORY_DEFS.filter((d) => d.parent && idSet.has(d.id)).map((d) => d.parent as number));
@@ -95,20 +73,10 @@ export function categoriesXml(ids: number[]): string {
     .join('\n');
 }
 
-/** An ordered [keywords, category] rule for matchCategory - first match wins. */
 export type CategoryRule = [string[], number];
 
-/**
- * Maps a provider-specific string to a Torznab category id.
- *
- * `rules` is an ordered list of [keywords, category] - the first rule with a
- * matching substring wins, so put the more specific ones first (e.g. "tv"
- * before "movie", or a title like "TV Movies" lands in the wrong bucket).
- *
- * The keyword tables stay in the providers because the input differs per
- * site: ext.to matches breadcrumb text, 1337x matches a CSS icon class. Only
- * the matching mechanism is shared.
- */
+/** Rules are ordered and the first substring match wins, so more specific
+ * keywords must come first ("tv" before "movie", or "TV Movies" mis-buckets). */
 export function matchCategory(text: string | undefined | null, rules: CategoryRule[]): number {
   const haystack = (text || '').toLowerCase();
   for (const [keywords, category] of rules) {

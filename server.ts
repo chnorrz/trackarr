@@ -1,22 +1,5 @@
 #!/usr/bin/env node
 
-/**
- * Torznab-compatible server for scraper-unfriendly torrent trackers, for
- * use as "Torznab (Custom)" indexers in Prowlarr. One indexer per tracker,
- * all served from this one process (shared browser session pool + cache).
- *
- * Add a tracker: create providers/<id>.ts exporting
- * { id, name, search(q), resolveMagnet({ id, url }) } (see providers/ for
- * examples), then register it in providers/index.ts.
- *
- * Each provider gets its own Torznab endpoint at /<provider-id>/api, e.g.:
- *   http://localhost:9117/ext-to/api
- *   http://localhost:9117/1337x/api
- *
- * Usage:
- *   API_KEY=yoursecret PORT=9117 node server.js
- */
-
 import express, { type Application, type Request, type Response } from 'express';
 import { closeBrowser, cfFetch } from './lib/browser.js';
 import { categoriesXml } from './lib/categories.js';
@@ -28,34 +11,17 @@ import type { MagnetRef, Provider, SearchItem } from './lib/types.js';
 const PORT = process.env.PORT || 9117;
 const API_KEY = process.env.API_KEY || 'changeme';
 
-// Solving a challenge takes ~20-30s. Landing that inside a Prowlarr search
-// risks the search timing out, so a background task periodically visits each
-// provider to keep its Cloudflare clearance warm and move that cost off the
-// request path. It only *solves* when actually challenged - with a valid
-// cookie the visit is cheap.
-//
-// The interval is a guess: the real clearance lifetime was never measured,
-// only estimated at roughly 15-30 min. Tune with the env var, 0 disables.
+// Real Cloudflare clearance lifetime was never measured, only estimated at
+// ~15-30 min, so this interval is a guess. 0 disables.
 const KEEPALIVE_INTERVAL_MS = process.env.KEEPALIVE_INTERVAL_MS === undefined
   ? 15 * 60 * 1000
   : Number(process.env.KEEPALIVE_INTERVAL_MS);
 
-// Magnet info hashes never change for a given torrent, so cache those for a
-// good while - avoids hitting the tracker again if Prowlarr re-grabs/retries.
-// (Search results used to have their own cache here too - removed in favor
-// of caching each underlying page fetch itself, right where it happens, in
-// lib/browser.ts's cfFetch(). See NOTES.md.)
 const MAGNET_CACHE_TTL_MS = Number(process.env.MAGNET_CACHE_TTL_MS) || 60 * 60 * 1000;
 
-// Advertised in caps' <limits> and enforced on every search - Torznab: "the
-// service should automatically limit the value to the maximum".
 const DEFAULT_LIMIT = 50;
 const MAX_LIMIT = 100;
 
-// Express 5's req.query values are `string | string[] | ParsedQs | ParsedQs[]
-// | undefined` (from the `qs` package) - our params are always plain single
-// strings, so this narrows that down in one place rather than at every call
-// site.
 function queryString(v: unknown): string | undefined {
   return typeof v === 'string' ? v : undefined;
 }
@@ -71,12 +37,8 @@ function xmlEscape(str: unknown): string {
   return String(str).replace(/[&<>"']/g, (c) => entities[c] as string);
 }
 
-// Newznab/Torznab error convention: a well-formed <error> document, not a
-// raw HTTP status. HTTP stays 200 - the error is communicated entirely via
-// the code/description attributes, which is what real newznab/torznab
-// clients (and Prowlarr) parse. Codes follow the standard newznab table:
-// 100 auth, 200 missing parameter, 201 incorrect parameter, 203 no such
-// function, 900 unknown/internal error.
+// Newznab/Torznab convention: errors are an <error> document sent with HTTP
+// 200, not an HTTP error status - that is what Prowlarr parses.
 function sendError(res: Response, code: number, description: string): void {
   res.type('application/xml').send(`<?xml version="1.0" encoding="UTF-8"?>
 <error code="${code}" description="${xmlEscape(description)}" />`);
@@ -101,18 +63,9 @@ ${categoriesXml(provider.categories)}
 export interface AppOptions {
   apiKey?: string;
   magnetCacheTtlMs?: number;
-  // Shared with the keep-alive scheduler in production (see the isMain
-  // block at the bottom) so a provider's status reflects both background
-  // checks and real requests. Tests can inject their own to assert on it
-  // directly; otherwise each app gets its own, independent instance.
   statusTracker?: ProviderStatusTracker;
 }
 
-// Factory rather than a module-level app: lets tests inject a fake
-// providerMap and a fresh pair of caches per test instead of sharing the
-// real, module-level providers/caches (and, as a side effect, avoids
-// app.listen()/process signal handlers running just by importing this file
-// - see the entrypoint guard at the bottom).
 export function createApp(providers: Record<string, Provider>, opts: AppOptions = {}): Application {
   const apiKey = opts.apiKey ?? API_KEY;
   const magnetCache = new TTLCache<string>(opts.magnetCacheTtlMs ?? MAGNET_CACHE_TTL_MS);
@@ -125,27 +78,6 @@ export function createApp(providers: Record<string, Provider>, opts: AppOptions 
     }
     return true;
   }
-
-  // A blank q (Prowlarr's Test button, and every routine RSS/search sync -
-  // both look identical at the HTTP level, there's no reliable way to tell
-  // them apart) used to get a canned keyword substituted in. That meant
-  // Sonarr/Radarr's routine automatic discovery never saw real, fresh
-  // content - only whatever that fixed keyword happened to match, forever.
-  // Blank q now passes straight through unchanged; each provider decides
-  // what it means (return latest uploads) instead of server.ts injecting a
-  // keyword. See NOTES.md for the full history of why this existed and why
-  // it was removed.
-  //
-  // No cache here any more - every search calls provider.search() fresh.
-  // That's fine: the expensive part (network/scrape fetches) is cached
-  // right where it happens, in lib/browser.ts's cfFetch(),
-  // keyed by the underlying site page's URL rather than by this request's
-  // exact q/cat/offset/limit - so a request for a different offset of the
-  // same query reuses already-fetched pages instead of missing entirely.
-  // Rebuilding the RSS response itself (merge/sort/slice/XML) is cheap.
-  // See NOTES.md for the full reasoning and the tradeoff this gives up
-  // (server.ts can no longer report per-request cache-hit stats - see the
-  // status page's "cached" counter, now magnet-download-only).
 
   async function resolveMagnet(provider: Provider, ref: MagnetRef): Promise<{ magnet: string; cached: boolean }> {
     const cacheKey = `${provider.id}:${ref.id ?? ref.url}`;
@@ -186,10 +118,6 @@ export function createApp(providers: Record<string, Provider>, opts: AppOptions 
       })
       .join('\n');
 
-    // total is spec-compliance polish, not load-bearing: Prowlarr itself
-    // never parses opensearch:totalResults (confirmed from its source).
-    // What actually stops its pagination is items.length coming back
-    // shorter than the requested limit - see lib/paging.ts.
     return `<?xml version="1.0" encoding="UTF-8"?>
 <rss version="2.0" xmlns:atom="http://www.w3.org/2005/Atom" xmlns:torznab="http://torznab.com/schemas/2015/feed" xmlns:opensearch="http://a9.com/-/spec/opensearch/1.1/">
 <channel>
@@ -204,11 +132,6 @@ ${rows}
 
   const app = express();
 
-  // Logs every incoming request, including who made it - the client IP
-  // (which container/host) and User-Agent (which app - Prowlarr/Sonarr/
-  // Radarr identify themselves there). apikey is redacted from the URL -
-  // it's a query param, and logging it raw would land the real key in
-  // stdout/stderr and whatever log aggregator ends up storing it.
   app.use((req: Request, _res: Response, next) => {
     const url = req.originalUrl.replace(/([?&]apikey=)[^&]*/, '$1***');
     const ua = req.get('user-agent') || 'unknown';
@@ -216,9 +139,6 @@ ${rows}
     next();
   });
 
-  // No apikey needed - same reasoning as ?t=caps: this exposes no torrent
-  // data and lets you do nothing, it's just a health dashboard meant to be
-  // pulled up directly in a browser.
   app.get('/', (_req: Request, res: Response) => {
     res.type('html').send(renderStatusPage(providers, statusTracker));
   });
@@ -245,25 +165,14 @@ ${rows}
 
     if (!checkKey(req, res)) return;
 
-    // Torznab function names are unhyphenated (t=search/tvsearch/movie) -
-    // the hyphenated forms are only the caps <tv-search>/<movie-search>
-    // *element* names, a different thing.
     if (t === 'search' || t === 'tvsearch' || t === 'movie') {
       const q = queryString(req.query.q) || '';
       const catParam = queryString(req.query.cat);
-      // Spec: cat must be verified as a comma-separated list of integers
-      // (^\d+(,\d+)*$), error 201 if it isn't - a *syntax* check, distinct
-      // from semantically-unknown category ids, which must be silently
-      // ignored instead (handled below by fetchPagedWindow/providers
-      // returning empty results for a category they don't recognize).
       if (catParam && !/^\d+(,\d+)*$/.test(catParam)) {
         sendError(res, 201, 'Incorrect parameter: cat must be a comma-separated list of non-negative integers');
         return;
       }
-      // Comma-separated, OR'd (cat=2000,5000 -> either).
       const categories = catParam ? catParam.split(',').map((c) => parseInt(c, 10)) : undefined;
-      // Spec: both must be integers >= 0, otherwise error 201 - not a
-      // silent fallback. Empty/absent is fine and defaults normally.
       const offsetParam = queryString(req.query.offset);
       let offset = 0;
       if (offsetParam) {
@@ -331,11 +240,6 @@ ${rows}
   return app;
 }
 
-// Visits a provider's keep-alive URL so its clearance cookie stays fresh.
-// Goes through cfFetch() - same fast-fetch/slow-navigate-
-// recover path a real request would use - so this both warms the
-// per-provider persistent page and only pays for a real solve when
-// actually challenged, same as before.
 async function warmProvider(provider: Provider, statusTracker: ProviderStatusTracker): Promise<void> {
   const ka = provider.keepAlive;
   if (!ka) return;
@@ -345,7 +249,6 @@ async function warmProvider(provider: Provider, statusTracker: ProviderStatusTra
     statusTracker.recordCheck(provider.id, true);
     console.error(`[keepalive] ${provider.id} ok (${Date.now() - started}ms)`);
   } catch (err) {
-    // Never throw: a tracker being unreachable must not kill the scheduler.
     const message = err instanceof Error ? err.message : String(err);
     statusTracker.recordCheck(provider.id, false, message);
     console.error(`[keepalive] ${provider.id} failed: ${message}`);
@@ -367,12 +270,10 @@ function scheduleKeepAlive(statusTracker: ProviderStatusTracker): void {
     for (const provider of Object.values(providerMap)) {
       await warmProvider(provider, statusTracker);
     }
-    // +/-20% jitter, so we're not hitting the trackers on an exact schedule.
     const next = KEEPALIVE_INTERVAL_MS * (0.8 + Math.random() * 0.4);
     keepAliveTimer = setTimeout(tick, next);
   };
 
-  // Warm shortly after boot so the first real search doesn't pay for a solve.
   keepAliveTimer = setTimeout(tick, 5000);
 }
 
@@ -383,14 +284,8 @@ async function shutdown(): Promise<void> {
   process.exit(0);
 }
 
-// Only actually start listening (and register process-level signal handlers)
-// when this file is run directly - e.g. `node dist/server.js`, which is what
-// the Dockerfile's CMD does. Importing createApp() from a test must not have
-// these side effects.
 const isMain = import.meta.url === `file://${process.argv[1]}`;
 if (isMain) {
-  // Shared between the app's routes and the keep-alive scheduler, so the
-  // status page reflects both real requests and background checks.
   const statusTracker = new ProviderStatusTracker();
   const app = createApp(providerMap, { statusTracker });
   app.listen(PORT, () => {

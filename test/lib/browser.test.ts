@@ -6,24 +6,11 @@ import { fileURLToPath } from 'node:url';
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.resolve(__dirname, '..', '..');
 
-// Fake Playwright Page - only isClosed()/evaluate()/url() are exercised by
-// cfFetch()'s fast path (tryFetch), which is all this test needs: a
-// non-challenge response short-circuits before lib/challenge.ts would be
-// reached at all (that module has its own tests in challenge.test.ts).
-// evaluate() returns tryFetch()'s {challenged, content} shape, same as a
-// real page.evaluate(fetch(...)) call would. goto() is still called once
-// first (the about:blank origin-establishing pre-nav) and must return
-// something with a headers() method - cfFetch reads the nav response's
-// cf-mitigated header unconditionally, even on this test's happy path
-// where the value itself is never used.
-// Flipped by the recycling test to make the page fail the way a wedged one
-// does in production - see that test for why goto() is the failure point.
 let gotoFails = false;
 let pageCloses = 0;
 
-// A factory rather than one shared object, because recyclePage() finds the
-// page to evict by identity - a single object reused for every hostname
-// would be found under all of them at once and hide that.
+// A factory, not one shared object: recyclePage() evicts by identity, so a
+// reused object would be found under every hostname at once.
 const createFakePage = () => ({
   isClosed: () => false,
   evaluate: async () => ({ challenged: false, content: '<html><body>cleared, not a challenge</body></html>' }),
@@ -44,9 +31,7 @@ let camoufoxCalls = 0;
 const fakeContext = {
   newPage: async () => {
     newPageCalls++;
-    // Widen the race window so two concurrent callers are actually
-    // in-flight at the same time, instead of one finishing before the
-    // other even starts.
+    // Widens the race window so both callers are genuinely in-flight at once.
     await new Promise((r) => setTimeout(r, 20));
     return createFakePage();
   },
@@ -76,9 +61,8 @@ test('concurrent cfFetch calls for the same new hostname only create one page', 
   newContextCalls = 0;
   camoufoxCalls = 0;
 
-  // Different paths on the same hostname - different cfFetch
-  // cache keys, so both calls actually reach getOrCreatePersistentPage()
-  // instead of one being served straight from the response cache.
+  // Different paths = different cfFetch cache keys, so both calls reach
+  // getOrCreatePersistentPage() instead of one hitting the response cache.
   const [a, b] = await Promise.all([
     cfFetch('https://race-test.example/one'),
     cfFetch('https://race-test.example/two')
@@ -91,18 +75,10 @@ test('concurrent cfFetch calls for the same new hostname only create one page', 
   assert.equal(camoufoxCalls, 1);
 });
 
-// The bug this guards against: getOrCreatePersistentPage() only recycles a
-// page when isClosed() is true, so a page that stopped navigating without
-// ever closing was handed back to every later caller. Live-observed as 55
-// consecutive 1337x failures over 14 hours against a host that was reachable
-// in 47ms the whole time - see NOTES.md section 15.
 test('a page that failed is thrown away instead of being handed to the next caller', async () => {
   newPageCalls = 0;
   pageCloses = 0;
 
-  // goto() is the failure point because a fresh page starts at about:blank,
-  // so cfFetch's origin-establishing navigation runs first - the same call
-  // that timed out in production.
   gotoFails = true;
   await assert.rejects(
     cfFetch('https://wedge-test.example/one'),

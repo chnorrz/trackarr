@@ -10,17 +10,8 @@ const ROOT = path.resolve(__dirname, '..', '..');
 const SEARCH_HTML = fs.readFileSync(path.join(ROOT, 'test', 'fixtures', '1337x-search.html'), 'utf8');
 const DETAIL_HTML = fs.readFileSync(path.join(ROOT, 'test', 'fixtures', '1337x-detail.html'), 'utf8');
 
-// mock.module() can only be registered once per specifier per test file, so
-// this registers a mutable mock up front - individual tests reconfigure its
-// behaviour via mockImplementation() rather than re-registering the module
-// mock. Typed explicitly against the real signature - without this,
-// mock.calls[].arguments infers from the initial zero-arg implementation
-// below, not the real one it stands in for.
-//
-// 1337x.ts no longer imports gotoCleared at all - fetchListingPage()
-// (search/browse) and resolveMagnet() both go through cfFetch()
-// now, which returns plain HTML text rather than a live Page (neither needs
-// one - resolveMagnet is a pure read, no POST like ext.to's).
+// mock.module() registers once per specifier per file, so tests reconfigure
+// this mock via mockImplementation(); the explicit type keeps mock.calls typed.
 const cfFetch = mock.fn<(url: string, opts?: FetchOptions) => Promise<string>>(async () => '');
 mock.module(path.join(ROOT, 'dist', 'lib', 'browser.js'), {
   exports: { cfFetch }
@@ -37,14 +28,14 @@ test('1337x search() parses real row markup into SearchItem[]', async () => {
   const [movie, , tv, music] = items;
   assert.equal(movie.title, 'Example Movie One (2024) [BluRay] [1080p] [FAKEGRP]');
   assert.equal(movie.detailUrl, 'https://1337x.to/torrent/10000001/Example-Movie-One-2024-BluRay-1080p-FAKEGRP/');
-  assert.equal(movie.id, null); // 1337x has no per-row id, only the detail URL
+  assert.equal(movie.id, null);
   assert.equal(movie.size, 1.5 * 1024 ** 3);
   assert.equal(movie.seeds, 1200);
   assert.equal(movie.leechers, 340);
-  assert.equal(movie.category, 2000); // flaticon-hd -> Movies
+  assert.equal(movie.category, 2000);
 
-  assert.equal(tv.category, 5000); // flaticon-tv -> TV, must win over "hd"/"movie" substrings
-  assert.equal(music.category, 3000); // flaticon-music -> Audio
+  assert.equal(tv.category, 5000);
+  assert.equal(music.category, 3000);
 });
 
 test('1337x search() skips rows with no href (malformed row)', async () => {
@@ -56,10 +47,6 @@ test('1337x search() skips rows with no href (malformed row)', async () => {
 });
 
 test('1337x search() categorizes an unrecognized sub id as Other, not by icon class', async () => {
-  // /sub/99999/ isn't in SUB_ID_CATEGORY - the icon class here (flaticon-hd,
-  // normally Movies) must NOT be used as a fallback any more (it drifted
-  // live once already - see NOTES.md section 3's "Category drift"), so an
-  // unrecognized sub id lands in Other (8000) instead of a guessed category.
   const html = `<table class="table-list"><tbody><tr>
     <td class="coll-1 name"><a href="/sub/99999/0/" class="icon"><i class="flaticon-hd"></i></a><a href="/torrent/1/whatever/">Unrecognized sub id</a></td>
     <td class="coll-2 seeds">1</td>
@@ -79,7 +66,7 @@ test('1337x search() filters real keyword-search results by requested categories
   cfFetch.mock.mockImplementation(async () => SEARCH_HTML);
 
   const { items, total } = await provider.search('anything', { categories: [2000], offset: 0, limit: 50 });
-  assert.equal(items.length, 2); // fixture has two Movies rows
+  assert.equal(items.length, 2);
   assert.ok(items.every((it: { category: number }) => it.category === 2000));
   assert.equal(total, 2);
 });
@@ -89,7 +76,7 @@ test('1337x blank query with no categories fetches a fixed Movies/TV/Music/Other
   cfFetch.mock.resetCalls();
 
   const { items } = await provider.search('', { offset: 0, limit: 50 });
-  assert.equal(items.length, 16); // 4 categories x 4 fixture items each
+  assert.equal(items.length, 16);
 
   const urls = cfFetch.mock.calls.map((c) => c.arguments[0]);
   assert.deepEqual(urls, [
@@ -109,7 +96,7 @@ test('1337x blank query with several categories merges their browse listings', a
   cfFetch.mock.mockImplementation(async () => SEARCH_HTML);
 
   const { items } = await provider.search('', { categories: [2000, 5000], offset: 0, limit: 50 });
-  assert.equal(items.length, 8); // 2 sources x 4 fixture items each
+  assert.equal(items.length, 8);
 });
 
 test('1337x resolveMagnet() extracts the real magnet href from a detail page', async () => {
