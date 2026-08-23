@@ -3,15 +3,24 @@ import { cfFetch } from '../lib/browser.js';
 import { CATEGORIES } from '../lib/categories.js';
 import { TTLCache } from '../lib/cache.js';
 import { parseSize } from '../lib/parse.js';
-import type { MagnetRef, Provider, SearchItem, SearchOptions, SearchResult } from '../lib/types.js';
+import type { MagnetRef, Provider, ProviderCookie, SearchItem, SearchOptions, SearchResult } from '../lib/types.js';
 
 const BASE = 'https://eztvx.to';
 const DEPTH_CAP = 200;
 
 const CACHE_TTL_MS = Number(process.env.CACHE_TTL_MS) || 5 * 60 * 1000;
 
-// Search rows hide magnets behind a "Show links" button; POSTing
-// layout=def_wlinks re-renders the same results with magnets inlined.
+// Matches the Cardigann definition's cookie jar: reveals magnets inline,
+// raises the keywordless page size, and disables EZTV's default filters.
+const COOKIES: ProviderCookie[] = [
+  { name: 'layout', value: 'def_wlinks', domain: new URL(BASE).hostname },
+  { name: 'sort_no', value: '100', domain: new URL(BASE).hostname },
+  { name: 'q_filter', value: 'all', domain: new URL(BASE).hostname },
+  { name: 'q_filter_web', value: 'on', domain: new URL(BASE).hostname },
+  { name: 'q_filter_reality', value: 'on', domain: new URL(BASE).hostname },
+  { name: 'q_filter_x265', value: 'on', domain: new URL(BASE).hostname }
+];
+
 const magnetCache = new Map<string, string>();
 const MAGNET_CACHE_MAX = 500;
 
@@ -28,35 +37,54 @@ const keywordSearchCache = new TTLCache<SearchItem[]>(CACHE_TTL_MS);
 function parseSearchRows(html: string): SearchItem[] {
   const $ = cheerio.load(html);
   const items: SearchItem[] = [];
+  let rowsSeen = 0;
 
   $('tr[name="hover"].forum_header_border').each((_, el) => {
+    rowsSeen++;
     const $tr = $(el);
     const titleLink = $tr.find('a.epinfo').first();
     const href = titleLink.attr('href');
     if (!href) return;
+
+    // A torrent with no magnet on the listing has none on its detail page
+    // either, so resolveMagnet() would fail the grab - skip it here instead.
+    const magnet = $tr.find('a.magnet[href^="magnet:"]').first().attr('href');
+    if (!magnet) return;
+
     const detailUrl = new URL(href, BASE).toString();
 
     // Anchor text is truncated with "..."; the title attr holds the full
     // name plus a " (176 MB)" suffix, so size comes from there, not a <td>.
     const titleAttr = titleLink.attr('title') || titleLink.text();
     const sizeMatch = titleAttr.match(/\(([\d.,]+\s*(?:B|KB|MB|GB|TB))\)\s*$/i);
-    const title = (sizeMatch && sizeMatch.index !== undefined ? titleAttr.slice(0, sizeMatch.index) : titleAttr).trim();
+    const withoutSize = sizeMatch && sizeMatch.index !== undefined ? titleAttr.slice(0, sizeMatch.index) : titleAttr;
+    const title = withoutSize.replaceAll('[eztv]', '').replace(/\s*\([^()]*\)\s*$/, '').trim();
     const size = sizeMatch && sizeMatch[1] ? parseSize(sizeMatch[1]) : 0;
 
-    const magnet = $tr.find('a.magnet[href^="magnet:"]').first().attr('href');
-    if (magnet) rememberMagnet(detailUrl, magnet);
+    rememberMagnet(detailUrl, magnet);
+
+    // Guards against a non-numeric cell, e.g. if the site ever renders this
+    // column empty instead of omitting it.
+    const seedsText = $tr.find('td.forum_thread_post_end').last().text().trim();
+    const seeds = /^[\d,]+$/.test(seedsText) ? parseInt(seedsText.replace(/\D/g, ''), 10) || 0 : 0;
 
     items.push({
       title,
       detailUrl,
       id: null,
       size,
-      seeds: 0,
+      seeds,
       leechers: 0,
       category: CATEGORIES.TV,
       pubDate: new Date()
     });
   });
+
+  // A cookie that silently fails to apply hides every row behind the magnet
+  // filter above; without this check that looks identical to "no matches".
+  if (rowsSeen > 0 && items.length === 0) {
+    throw new Error('eztv: found rows but none had a magnet link - the layout=def_wlinks cookie is probably not applying.');
+  }
 
   return items;
 }
@@ -67,16 +95,9 @@ async function searchByKeyword(q: string): Promise<SearchItem[]> {
 
   const searchUrl = `${BASE}/search/?q1=${encodeURIComponent(q)}`;
 
-  // Required, not optional: the POST below fails unless the page already
-  // sits on /search/. Result discarded - only the priming side effect matters.
-  await cfFetch(searchUrl);
-
-  const html = await cfFetch(searchUrl, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-    body: new URLSearchParams({ layout: 'def_wlinks' }).toString()
-  });
-
+  // The COOKIES jar (registered on the browser context) reveals magnets
+  // inline, so one GET is enough - no priming request or reveal POST needed.
+  const html = await cfFetch(searchUrl);
   const items = parseSearchRows(html);
 
   if (items.length) keywordSearchCache.set(q, items);
@@ -180,6 +201,7 @@ export default {
   id: 'eztv',
   name: 'EZTV',
   keepAlive: { url: `${BASE}/search/?q1=the` },
+  cookies: COOKIES,
   categories: [CATEGORIES.TV],
   search,
   resolveMagnet

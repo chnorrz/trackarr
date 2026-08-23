@@ -30,6 +30,7 @@ let camoufoxCalls = 0;
 
 let newPageFails = false;
 let browserCloses = 0;
+let addCookiesCalls: unknown[] = [];
 
 const fakeContext = {
   newPage: async () => {
@@ -39,7 +40,10 @@ const fakeContext = {
     if (newPageFails) throw new Error('newPage: Target closed');
     return createFakePage();
   },
-  cookies: async () => []
+  cookies: async () => [],
+  addCookies: async (cookies: unknown) => {
+    addCookiesCalls.push(cookies);
+  }
 };
 
 const fakeBrowser = {
@@ -61,7 +65,7 @@ mock.module('camoufox-js', {
   }
 });
 
-const { cfFetch } = await import(path.join(ROOT, 'dist', 'lib', 'browser.js'));
+const { cfFetch, closeBrowser, registerDomainCookies } = await import(path.join(ROOT, 'dist', 'lib', 'browser.js'));
 
 test('concurrent cfFetch calls for the same new hostname only create one page', async () => {
   newPageCalls = 0;
@@ -118,4 +122,27 @@ test('a session that cannot open a page is torn down, not leaked', async () => {
 
   assert.equal(recovered, '<html><body>cleared, not a challenge</body></html>');
   assert.equal(camoufoxCalls, 1, 'the next call must launch a fresh browser');
+});
+
+test('cookies registered for a domain are re-applied after a session is discarded and relaunched', async () => {
+  addCookiesCalls = [];
+  // Force a fresh launchSession() call below, rather than reusing whatever
+  // context earlier tests already created (which was built with no cookies
+  // registered).
+  await closeBrowser();
+
+  registerDomainCookies([{ name: 'layout', value: 'def_wlinks', domain: 'cookie-test.example' }]);
+
+  await cfFetch('https://cookie-test.example/one');
+  assert.equal(addCookiesCalls.length, 1);
+  assert.deepEqual(addCookiesCalls[0], [{ name: 'layout', value: 'def_wlinks', domain: 'cookie-test.example', path: '/' }]);
+
+  // A distinct hostname, so this reaches context.newPage() rather than
+  // reusing the still-open persistent page from the call above.
+  newPageFails = true;
+  await assert.rejects(cfFetch('https://cookie-test-b.example/two'));
+  newPageFails = false;
+
+  await cfFetch('https://cookie-test-c.example/three');
+  assert.equal(addCookiesCalls.length, 2, 'cookies must be re-applied on the fresh context after the discarded session relaunches');
 });

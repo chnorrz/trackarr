@@ -1657,3 +1657,97 @@ problem and was neither. The question that cut through it fastest was
 **"can something *other than the browser* reach the site right now?"** —
 one `curl` through the same proxy, which took 47ms and eliminated half the
 hypothesis space. Ask it first.
+
+---
+
+## 16. EZTV
+
+Unlike ext.to and 1337x, EZTV's search page hides download links behind a
+site preference, and the response shape changes depending on it. This
+section exists because it was undocumented until seeds were found to be
+hardcoded to 0 with no rationale anywhere in this file or the commit
+history that added it — the gap outlived the original author's context.
+
+### Two response layouts
+
+- **Links revealed** (magnet visible): 6 `<td>`s per row — show-info icon,
+  title, magnet + mirror links, size, released, seeds.
+- **Links hidden**: 5 `<td>`s — the magnet `<td>` is **omitted entirely**,
+  not emptied. This shifts every later column's position by one, so a
+  positional selector (`nth-child(n)`) reads the wrong cell depending on
+  which layout rendered. Confirmed against two real captured rows of the
+  same torrent, one in each layout.
+
+| Field | Selector |
+|---|---|
+| title / detail URL | `a.epinfo` (`title` attr / `href`) |
+| size | parsed from the trailing `" (412.60 MB)"` in `a.epinfo`'s `title` attr, not a `<td>` — layout-independent, unlike the size cell |
+| magnet | `a.magnet[href^="magnet:"]` |
+| seeds | `td.forum_thread_post_end` (**class, not position** — see above) |
+
+**Leechers are not available.** There is no leechers column in either
+layout. `leechers` is always `0`, so Torznab's `peers = seeds + leechers`
+equals `seeds` for every EZTV result — a known imprecision, not a bug.
+
+### Revealing links: a cookie, not a POST
+
+Cardigann's own definition
+(`definitions/v11/eztv.yml`) sends a single cookie on an ordinary GET:
+
+```yaml
+headers:
+  cookie: ["sort_no=100; q_filter=all; q_filter_web=on; q_filter_reality=on; q_filter_x265=on; layout=def_wlinks"]
+```
+
+`providers/eztv.ts` matches this: `lib/browser.ts` exposes
+`registerDomainCookies()`, applied via `context.addCookies()` inside
+`launchSession()` — not once at boot, so a session discard/relaunch (see
+section 15) doesn't silently drop the cookie. `providers/index.ts`
+registers each provider's declared `cookies` at startup.
+
+This replaced an older two-request flow: a priming GET to `/search/`
+followed by a POST with `layout=def_wlinks` as the body, discarding the
+priming response and relying only on its side effect. The cookie halves
+Cloudflare round-trips per uncached search to one.
+
+### Rows with no download link are skipped, not listed
+
+Even with the cookie set, some EZTV torrents render with no magnet `<td>`
+at all — Cardigann's own row selector filters these too
+(`:has(a.magnet)`, commented *"some torrents don't have any download
+links so skip them"*). `parseSearchRows()` does the same: a row without
+`a.magnet[href^="magnet:"]` is dropped. Listing it would only produce a
+grab that fails later — `resolveMagnet()`'s detail-page fallback finds
+nothing there either, since the site itself has no link for that torrent.
+
+**This makes the cookie load-bearing in a new way.** If it ever stops
+applying, every row loses its magnet `<td>` and gets filtered, so a
+working search silently returns zero items — indistinguishable from "no
+matches" without the check below. `parseSearchRows()` guards against
+this explicitly: if rows were present but all were skipped, it throws
+instead of returning `[]`.
+
+### Title cleanup
+
+Aligned with Cardigann's `title` filters — `[eztv]` stripped, then the
+trailing size parenthetical stripped, then trimmed. One deliberate
+deviation: Cardigann's second filter is `re_replace: ["\(.*\)$", ""]`,
+which is **greedy** and matches from the *first* `(` in the title to the
+last `)`. On a title containing an earlier parenthetical (e.g. a year,
+`Show (2019) S01E01 ... (1.2 GB)`), that destroys everything from the
+first paren onward. `parseSearchRows()` uses an anchored,
+non-capturing-group form instead — `/\s*\([^()]*\)\s*$/` — which only
+strips the final parenthetical and produces identical output on
+well-formed titles.
+
+### Keyword-search vs. blank-query browse
+
+Only `searchByKeyword()` (the HTML scrape path) is affected by any of the
+above. Blank-query browsing (`browseLatest()`) calls `/api/get-torrents`
+with a plain `fetch()` — a different endpoint, not behind Cloudflare,
+already carrying real `seeds`/`peers` fields, and never touched by the
+cookie jar. Cardigann's own definition routes blank-query search through
+the HTML `home` page instead of an API, so `sort_no=100` (raising the
+keywordless result count to 100) does something for Cardigann that it
+cannot do here — worth knowing if EZTV's blank-query yield is ever
+compared against another Torznab indexer.

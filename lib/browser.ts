@@ -4,6 +4,7 @@ import type { Browser, BrowserContext, Page } from 'playwright-core';
 import { TTLCache } from './cache.js';
 import { isBlocked, solveChallenge } from './challenge.js';
 import { Response as PlaywrightResponse } from 'playwright-core';
+import type { ProviderCookie } from './types.js';
 
 // Must stay within the Xvfb geometry in the Dockerfile's CMD: a window larger
 // than the screen renders partly off-screen and is a detectable tell.
@@ -17,6 +18,14 @@ const DOMAIN_OVER_PROXY = (process.env.DOMAIN_OVER_PROXY || '')
 type BrowserSession = { browser: Browser; context: BrowserContext };
 
 let session: Promise<BrowserSession> | null = null;
+
+// Providers register cookies once at startup; applied to every fresh context
+// so a session discard/relaunch (e.g. after a browser crash) doesn't drop them.
+let registeredCookies: ProviderCookie[] = [];
+
+export function registerDomainCookies(cookies: ProviderCookie[]): void {
+  registeredCookies = registeredCookies.concat(cookies);
+}
 
 // XTEST input is global to the X display, and concurrent navigations to one
 // Cloudflare-protected host hang until the page.goto timeout.
@@ -98,7 +107,12 @@ async function launchSession(): Promise<BrowserSession> {
     ? await Camoufox({ headless, os, window: WINDOW_SIZE, ...(firefoxPrefs ? { firefox_user_prefs: firefoxPrefs } : {}) })
     : await Camoufox({ headless, window: WINDOW_SIZE, ...(firefoxPrefs ? { firefox_user_prefs: firefoxPrefs } : {}) });
 
-  return { browser, context: await browser.newContext() };
+  const context = await browser.newContext();
+  if (registeredCookies.length) {
+    await context.addCookies(registeredCookies.map((c) => ({ name: c.name, value: c.value, domain: c.domain, path: c.path ?? '/' })));
+  }
+
+  return { browser, context };
 }
 
 // Narrower than RequestInit on purpose: these values are serialized into

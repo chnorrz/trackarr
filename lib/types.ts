@@ -18,6 +18,13 @@ export interface KeepAliveTarget {
   url: string;
 }
 
+export interface ProviderCookie {
+  name: string;
+  value: string;
+  domain: string;
+  path?: string;
+}
+
 export interface SearchOptions {
   categories?: number[];
   offset: number;
@@ -33,6 +40,7 @@ export interface Provider {
   id: string;
   name: string;
   keepAlive?: KeepAliveTarget;
+  cookies?: ProviderCookie[];
   categories: number[];
   search(q: string, opts: SearchOptions): Promise<SearchResult>;
   resolveMagnet(ref: MagnetRef): Promise<string>;

@@ -15,18 +15,47 @@ mock.module(path.join(ROOT, 'dist', 'lib', 'browser.js'), {
 });
 const { default: provider } = await import(path.join(ROOT, 'dist', 'providers', 'eztv.js'));
 
-test('eztv search() parses the wlinks-revealed markup, including inline magnets', async () => {
+test('eztv search() parses the wlinks-revealed markup, including inline magnets and seeds', async () => {
   cfFetch.mock.mockImplementation(async () => SEARCH_HTML);
 
   const { items } = await provider.search('anything', { offset: 0, limit: 50 });
 
+  // 4 rows in the fixture, one has no magnet link and must be skipped.
   assert.equal(items.length, 3);
 
-  const [first] = items;
-  assert.equal(first.title, 'Example.Show.S01E01.720p.WEB.x264-FAKEGRP');
-  assert.equal(first.size, Math.round(412.6 * 1024 ** 2));
-  assert.equal(first.category, 5000);
-  assert.equal(first.seeds, 0);
+  const [first, second, third] = items;
+  assert.equal(first?.title, 'Example.Show.S01E01.720p.WEB.x264-FAKEGRP');
+  assert.equal(first?.size, Math.round(412.6 * 1024 ** 2));
+  assert.equal(first?.category, 5000);
+  assert.equal(first?.seeds, 29);
+  assert.equal(first?.leechers, 0);
+
+  assert.equal(second?.seeds, 88);
+
+  // Fourth fixture row: a non-numeric seeds cell ("-") must fall back to 0
+  // rather than being parsed as a number.
+  assert.equal(third?.seeds, 0);
+});
+
+test('eztv search() skips rows with no magnet link', async () => {
+  cfFetch.mock.mockImplementation(async () => SEARCH_HTML);
+
+  const { items } = await provider.search('anything', { offset: 0, limit: 50 });
+
+  assert.ok(!items.some((it: { title: string }) => it.title.startsWith('No.Links.Show')));
+});
+
+test('eztv search() throws when every row is filtered out, instead of returning an empty result', async () => {
+  const allLinklessHtml = SEARCH_HTML.replace(
+    /<a href="magnet:[^"]*" class="magnet"[^>]*>[\s\S]*?<\/tr>/g,
+    '</tr>'
+  );
+  cfFetch.mock.mockImplementation(async () => allLinklessHtml);
+
+  await assert.rejects(
+    () => provider.search('a-query-triggering-the-all-skipped-guard', { offset: 0, limit: 50 }),
+    /layout=def_wlinks cookie is probably not applying/
+  );
 });
 
 test('eztv resolveMagnet() serves from magnetCache after a prior search(), no second fetch', async () => {
@@ -73,13 +102,14 @@ test('eztv search() still returns results when TV is among several requested cat
   assert.equal(items.length, 3);
 });
 
-test('eztv search() passes the wlinks-reveal POST body/headers through to cfFetch', async () => {
+test('eztv search() makes exactly one cfFetch call - magnets are revealed via a cookie, not a priming GET + reveal POST', async () => {
   cfFetch.mock.mockImplementation(async () => SEARCH_HTML);
   // Distinct query: keywordSearchCache is a module-level singleton keyed only
   // by q, so reusing 'anything' here would be a cache hit that skips cfFetch.
+  const callsBefore = cfFetch.mock.callCount();
   await provider.search('a-query-not-used-elsewhere-in-this-file', { offset: 0, limit: 50 });
 
+  assert.equal(cfFetch.mock.callCount(), callsBefore + 1);
   const lastCall = cfFetch.mock.calls[cfFetch.mock.calls.length - 1];
-  assert.equal(lastCall?.arguments[1]?.method, 'POST');
-  assert.equal(lastCall?.arguments[1]?.body, 'layout=def_wlinks');
+  assert.equal(lastCall?.arguments[1], undefined, 'no method/body - a plain GET');
 });
