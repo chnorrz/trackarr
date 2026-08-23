@@ -2465,11 +2465,93 @@ restored the committed SHA pin. Not caused by this phase's own changes;
 caught only because `resolve.test.ts`'s existing test asserts the exact
 pinned SHA appears in the built URL.
 
-**Not yet done: a live test against kickass.torrentbay.st itself** (phase
-4, matching `NOTES.md` section 16's EZTV precedent) - everything above
-proves the engine executes real Cardigann syntax correctly and the boot
-sequence wires it in correctly; it does not prove kickass's actual live
-markup matches `kickasstorrents-to.yml`'s selectors. Cloudflare-protected,
-solvable (confirmed earlier this session: 403 challenge, not a 1006 ban, on
-both IPv4 and IPv6) - pending before this indexer is trusted with real
-traffic.
+---
+
+## 21. Live test against kickass.torrentbay.st (phase 4)
+
+Ran against the real site, matching `NOTES.md` section 16's EZTV precedent -
+every selector in `kickasstorrents-to.yml` proved correct against real
+markup on the first attempt, no fixture-guessing corrections needed this
+time.
+
+### A second real bug, found before the live test could even run
+
+`docker build` failed outright: `Error: Cannot find module
+'/app/scripts/copy-assets.mjs'`. Phase 1 added `scripts/copy-assets.mjs`
+and changed `npm run build` to `tsc && node scripts/copy-assets.mjs`, but
+the `Dockerfile` was never updated to `COPY scripts ./scripts` - **every
+Docker build on this branch has been broken since phase 1**, unnoticed
+because nobody had rebuilt the image until this live test. One-line fix,
+its own commit (`6a27af8`), unrelated to the Cardigann feature itself but
+found because of it.
+
+### Getting the container to see a definition and a config at all
+
+The `Dockerfile` bundles neither `definitions/` nor `config/` into the
+image - a deliberate non-decision (never asked to make that packaging
+call), not a bug. For this test, both were mounted read-only as volumes
+rather than baking them in:
+
+```bash
+docker run -d --name trackarr-live -p 9117:9117 \
+  -e API_KEY=livetest \
+  -e CONFIG_FILE=/app/config/trackarr.yml \
+  -e DEFINITIONS_DIR=/app/definitions \
+  -v "$(pwd)/definitions:/app/definitions:ro" \
+  -v "$(pwd)/config:/app/config:ro" \
+  trackarr:live
+```
+
+`DEFINITIONS_DIR` pointed at the mounted repo `definitions/` folder, so
+`kickasstorrents-to.yml` resolved via the volume-override path (section
+18's documented precedence) without any network fetch. Whether definitions
+should ship inside the image for a real deployment is a separate, open
+question - not decided here.
+
+### Results
+
+`t=search&q=ubuntu`, default limit: **50 items, 0 zero-size, 50 seeded, 0
+Torznab errors.** First item was a real book torrent
+("Ubuntu Linux Bible 11ed 2025"), correctly mapped to category **7000
+(Books)** - proving `category-mapping.ts`'s id-based lookup against
+`categorymappings` works on genuine site output, not just a synthetic
+fixture.
+
+**Multi-path concatenation confirmed against the real site**, the one
+piece of phase 3 with no equivalent in the hand-written providers:
+`limit=100&offset=0` returned `opensearch:totalResults=100` and 100 real
+items, 0 zero-size, 100 seeded - matching `kickasstorrents-to.yml`'s own
+"50 rows per page" comment exactly (2 unconditional paths x 50 = 100
+before slicing). Across the full 100, 4 distinct categories appeared
+(7000 Books, 8000 Other, 4000 PC, 5000 TV), all correctly mapped.
+
+Magnet resolution end to end: `/kickass/download` → `302` →
+`magnet:?xt=urn:btih:232CD67EB3FFBD7C37BF9EC3EE887417E5AE1EE6&dn=...` -
+matching the item's own title and a real infohash, confirming
+`kickasstorrents-to.yml`'s `download:` field (already a magnet URI at
+listing time, per section 20's magnet-priority order) resolves correctly
+through the whole request/response/RSS/redirect chain.
+
+Container logs: the keep-alive's own first request to
+`kickass.torrentbay.st` hit the expected Cloudflare interactive challenge,
+solved in **17.1s (3 clicks)** - same shape as ext.to/eztv's own challenges,
+nothing kickass-specific. The subsequent search request reused that
+`cf_clearance` (no second solve needed). 1337x's keep-alive failed in the
+same run with "probably your IP got blocked" - the pre-existing, already
+fully documented IPv4 ban (`NOTES.md` sections 3-4), unrelated to this test
+and not investigated further here (no proxy was configured for this run).
+
+### What this does and doesn't prove
+
+Proves: `kickasstorrents-to.yml`'s selectors (`category`, `title`,
+`details`, `download`, `size`, `date`, `seeders`, `leechers`), its two-path
+concatenation, its `requestDelay`, and the full adapter chain
+(`paths.ts` -> `cfFetch` -> `engine.ts` -> category mapping -> magnet
+resolution -> RSS -> `/download` redirect) all work correctly against the
+real, live site, today. Does not prove: long-term selector stability (the
+site can change its markup at any time, same caveat as every other
+provider in this project - see `NOTES.md` section 15's wedged-page and
+section 3's category-drift incidents for what that looks like when it
+happens), or that any of the other 75 runnable definitions this session's
+coverage scan found (section 17) work against their own real sites -
+each would need this same live-test treatment before being trusted.
