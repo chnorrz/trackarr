@@ -7,7 +7,7 @@ import { fileURLToPath } from 'node:url';
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.resolve(__dirname, '..', '..', '..');
 
-const { runSearch } = await import(path.join(ROOT, 'dist', 'lib', 'cardigann', 'engine.js'));
+const { runSearch, runSearchAll } = await import(path.join(ROOT, 'dist', 'lib', 'cardigann', 'engine.js'));
 const { validateDefinitionYaml } = await import(path.join(ROOT, 'dist', 'lib', 'cardigann', 'load.js'));
 
 function baseSearchCtx(overrides: Record<string, unknown> = {}) {
@@ -280,4 +280,46 @@ test('runSearch: end to end against the real definitions/kickasstorrents-to.yml 
   // assert it landed roughly 26h in the past, not an exact instant.
   const deltaMs = Date.now() - item.pubDate.getTime();
   assert.ok(deltaMs > 25.5 * 3600 * 1000 && deltaMs < 26.5 * 3600 * 1000, `expected ~26h ago, got ${deltaMs}ms`);
+});
+
+// ---- preprocessingfilters / runSearchAll ------------------------------------
+
+test('search.preprocessingfilters run on the raw body before row parsing', () => {
+  // A bare <tr> soup with no wrapping <table> - HTML5 parsing rules would
+  // foster-parent (drop) it. prepend/append wrap it in a real table first,
+  // proving preprocessingfilters actually ran before selectDomRows().
+  const bareRows = `
+    <tr class="row"><td><a class="title" href="/t/1">Bare Row</a></td><td class="cat">1</td>
+      <td class="size">1 GB</td><td class="seeds">5</td><td class="leech">1</td><td class="date">2024-01-01</td>
+      <td><a class="magnet" href="magnet:?xt=urn:btih:AAA">m</a></td></tr>`;
+  const definition = minimalHtmlDefinition({
+    preprocessingfilters: [
+      { name: 'prepend', args: '<table><tbody>' },
+      { name: 'append', args: '</tbody></table>' }
+    ]
+  });
+
+  const items = runSearch(definition, bareRows, baseSearchCtx());
+  assert.equal(items.length, 1);
+  assert.equal(items[0].title, 'Bare Row');
+});
+
+test('runSearch (HTML): caps.categories object form is also read, not just categorymappings array form', () => {
+  const definition = {
+    caps: { categories: { '1': 'Movies', '2': 'TV' } },
+    search: minimalHtmlDefinition().search
+  };
+  const items = runSearch(definition, HTML_BODY, baseSearchCtx());
+  assert.equal(items[0].category, 'Movies');
+  assert.equal(items[1].category, 'TV');
+});
+
+test('runSearchAll returns every item unsliced; runSearch slices to offset/limit on top of the same list', () => {
+  const definition = minimalHtmlDefinition();
+  const all = runSearchAll(definition, HTML_BODY, baseSearchCtx({ offset: 0, limit: 1 }));
+  assert.equal(all.length, 2, 'runSearchAll ignores offset/limit entirely');
+
+  const sliced = runSearch(definition, HTML_BODY, baseSearchCtx({ offset: 0, limit: 1 }));
+  assert.equal(sliced.length, 1);
+  assert.equal(sliced[0].title, all[0].title);
 });

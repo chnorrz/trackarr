@@ -2018,8 +2018,8 @@ wrong instance.
 Pure functions throughout - **no network I/O anywhere in this layer**. Given
 `(definition, an already-fetched response body, search context)`, `engine.ts`'s
 `runSearch()` returns `CardigannItem[]`. Fetching the response, `requestDelay`,
-cookies, and the definition -> `Provider` adapter are phase 3; nothing here
-is wired into `server.ts` or `providers/index.ts` yet.
+cookies, and the definition -> `Provider` adapter were phase 3 (section 20) -
+this layer stayed pure throughout; phase 3 wraps it, never touches it.
 
 Every piece was tested against the wiki's own worked examples
 (wiki.servarr.com/prowlarr/cardigann-yml-definition) wherever one existed -
@@ -2213,3 +2213,263 @@ end to end. It does **not** prove kickass.torrentbay.st's actual live
 markup matches those selectors - that is phase 4's live test, against real
 captured HTML, the same discipline this project applied to EZTV (section
 16) after getting burned by an unverified selector once already.
+
+---
+
+## 20. Wiring Cardigann into a real Provider (phase 3)
+
+`lib/cardigann/{category-mapping,inputs,download,paths,adapter}.ts`,
+`lib/categories.ts` extended to the full 71-entry vocabulary, `engine.ts`
+gained two real fixes, `providers/index.ts` and `server.ts` gained an async
+boot path. This is the phase that makes `kickasstorrents-to` a real running
+indexer for the first time - `/kickass/api` is a genuine Torznab endpoint
+after this, not just parseable definitions and a config file.
+
+### `lib/categories.ts`: the full 71-entry standard vocabulary
+
+Extended from 24 hand-picked entries to all 71, cross-verified against two
+independent sources rather than guessed: Prowlarr's own
+`NewznabStandardCategory.cs` (the numeric ids) and this repo's vendored
+`schema.json`'s `IndexerCategories` enum (which names are actually
+reachable by a `categorymappings[].cat` value we accept). The two disagree
+by exactly two entries - `Movies/x265` (2090) and `TV/x265` (5090) exist in
+Prowlarr's C# source but not in the vendored schema's enum - deliberately
+omitted, since no definition we accept can ever reference a name outside
+that enum. New `categoryIdByName()`/`categoryNameById()` lookups, used in
+both directions by the adapter (below). `CATEGORIES` (the hand-written
+providers' own shorthand consts) and `categoriesXml()` are unchanged.
+
+### `engine.ts`: two real gaps, found while building the adapter, not before
+
+1. **`search.preprocessingfilters` was accepted by the capability gate but
+   never applied.** The wiki documents them running on the raw response
+   body before any row parsing (e.g. wrapping bare `<tr>` soup in
+   `<table></table>` before HTML5's foster-parenting rules would otherwise
+   drop it). `runSearchAll()` now applies them first, templated the same as
+   any filter arg.
+2. **Only `caps.categorymappings` (array form) was read; `caps.categories`
+   (object form, the schema's documented alternative) was silently
+   ignored.** New `category-mapping.ts` exports `collectCategoryMappings()`,
+   reading both shapes into one normalized `{trackerId, standardName, desc?}`
+   list; `engine.ts`'s `resolveCategoryName()` and the adapter's reverse
+   (numeric id -> tracker ids) mapping both consume it, so the two
+   directions can never silently disagree about which shape a definition
+   used.
+
+`runSearch()` was split: **`runSearchAll()`** (new, exported) returns every
+item unsliced; `runSearch()` is now a thin `runSearchAll(...).slice(offset,
+offset+limit)` wrapper, kept for its own 15 existing tests' sake. The split
+exists because a multi-path search (below) needs the raw list from *each*
+path's own response to concatenate before slicing once - slicing per-path
+inside the old single-body `runSearch()` would have been wrong (offset 40
+with limit 10 could miss items entirely if page 1 alone had fewer than 40).
+
+### `inputs.ts`: rendering `search.paths[].inputs` / `download.before.inputs`
+
+One shared `buildQueryString()`, since both call sites are "map of key ->
+templated value, joined into a querystring or form body" with the same two
+documented special cases: an empty-rendered value is dropped unless
+`allowEmptyInputs`, and the `$raw` key is rendered as a template like any
+other value but its result is spliced into the query string verbatim - not
+`key=value`-wrapped, not URL-encoded (`{{ range .Categories
+}}category[]={{.}}&{{end}}`, the wiki's own example). One real bug caught
+by a test before merging: the first draft assumed `$raw` was *already*
+pre-rendered by the caller and just concatenated it raw, which meant the
+literal string `"{{ range .Categories }}..."` ended up in the URL,
+un-evaluated. Fixed by rendering `$raw` through the same template path as
+every other input. A second thing the wiki's own example reveals and this
+code deliberately does not "fix": that same `$raw` template has a trailing
+`&` inside its loop body, so a stray double-`&` before the next joined
+input is expected, real Cardigann output - a test originally asserted no
+double separator and was wrong, not the code.
+
+### `paths.ts`: building the actual HTTP request(s) for a search
+
+Confirmed against the wiki rather than guessed (worth stating explicitly -
+this is exactly the kind of thing that burned this project once already on
+EZTV): **every path in `search.paths[]` without its own `categories`
+restriction is fetched on *every* search, unconditionally, and their
+results are concatenated.** `kickasstorrents-to.yml`'s own two paths (page
+1, page 2 - no `categories` key on either) both fire on every search,
+matching its own comment about ~99 combined rows across two pages before
+offset/limit slicing. A path's `categories: [901, 902]` restricts it to
+only fire when at least one requested (tracker-native, already-mapped)
+category is in that list; a `"!"` first entry negates the logic (wiki's own
+porn-exclusion example, transcribed as a test). A restricted path is
+excluded from a blank/no-category search - it can only be *included* by a
+blank search if negated, matching the intuitive reading (a general/blank
+search should hit a "not porn" path, not a "porn only" one).
+
+`inheritinputs` (default true) merges `search`-level inputs as a base under
+each path's own; `false` replaces them entirely for that path. `method`
+defaults to GET (query string); POST sends the same rendered inputs as a
+`application/x-www-form-urlencoded` body instead.
+
+**Known, deliberate limitation:** `SearchPathBlock.response` (a per-path
+response-type override) is not read anywhere - every path's body is parsed
+using the top-level `search.response.type`, regardless of which path
+produced it. No definition in this project's own fixtures needs a per-path
+override; documented here rather than silently mishandled if one ever does.
+
+### `download.ts`: resolving a magnet when the listing doesn't already have one
+
+Implements the wiki's `before -> selectors -> infohash` chain. **Untested
+against any real live site** - `kickasstorrents-to.yml` doesn't exercise
+any of it at all (its own `download:` field selects a magnet URI directly
+from the listing), so this file's logic has zero coverage from the one real
+definition this project has fetched and lived with. Built faithfully from
+the documented shape and a synthetic (but wiki-example-derived) test suite,
+same caveat as `engine.ts`'s "mechanics, not live-site fidelity" framing.
+
+- `before.path` (a fixed template) or `before.pathselector` (resolved
+  against a fetch of the item's own captured download/detail link first,
+  matching the wiki's own "thankyou link" example) produces a pre-request;
+  its response is kept and made available to later steps that set
+  `usebeforeresponse: true`.
+- `selectors[]` is walked in order; the first one whose extraction is
+  non-empty wins. If the resolved value is `magnet:...`, done. If it's a
+  real HTTP link (a `.torrent` file URL), **this throws rather than
+  silently returning it** - there is no bencode parser anywhere in this
+  codebase and none is planned; trackarr only ever hands back magnet URIs
+  (`server.ts`'s `/download` route is a 302 to a magnet, always).
+- `infohash` builds `magnet:?xt=urn:btih:<hash>&dn=<title>&tr=...` from
+  `hash`/`title` sub-selectors. The tracker list has no canonical source
+  anywhere in the format's documentation - the four used here
+  (`tracker.opentrackr.org`, `open.stealth.si`, `tracker.torrent.eu.org`,
+  `tracker.dler.org`) are copied from a **real magnet URI captured live
+  this session** (an actual EZTV row), not an arbitrary invented list.
+- No `download:` block at all: falls back to scraping `a[href^="magnet:"]`
+  from the captured link, the exact same fallback all three hand-written
+  providers' own `resolveMagnet()` already use on their detail pages.
+
+### `adapter.ts`: `createCardigannProvider()` - the `Provider` itself
+
+Ties every module above, plus `cfFetch`, into something `providers/index.ts`
+can put straight into the provider map. Network-free by design like the
+rest of `lib/cardigann` - takes an injected `Fetcher` (real callers pass
+`cfFetch`; tests inject a fake), so nothing here needs a browser to test.
+
+- **`.Keywords` vs `.Query.Keywords`**: `search.keywordsfilters` are applied
+  to the raw query here (the wiki's own distinction - `.Keywords` is
+  post-filter, `.Query.Keywords` is the original), before any template
+  context is built.
+- **`.Categories`** (the tracker-native ids sent in the request): built by
+  mapping each *requested* numeric Torznab id to its standard name
+  (`categoryNameById`), then to every `categorymappings`/`caps.categories`
+  entry sharing that name (`collectCategoryMappings`). No parent/child
+  expansion - deliberately not needed, since real Sonarr/Radarr requests
+  already send both explicitly (confirmed from this project's own
+  production logs earlier this session: `cat=5000,5070`), not just the
+  parent.
+- **Multi-path concatenation**: each `paths.ts`-built request is fetched
+  and parsed via `runSearchAll()` (unsliced) independently; all items are
+  concatenated, *then* filtered by the caller's requested categories
+  (Cardigann definitions don't filter server-side beyond a path's own
+  `categories` restriction), *then* sliced once to the caller's
+  offset/limit - never per-path, for the reason `engine.ts`'s own split
+  exists (see above).
+- **`requestDelay`** (definition-level, seconds): one `createGatedFetch()`
+  wrapper applied once per provider instance, used for *every* HTTP call
+  that instance makes - search paths, a `resolveMagnet` cache-miss
+  fallback, and any `download.before`/`selectors` sub-fetches inside it.
+  Wrapping the fetch once, rather than sprinkling delay calls at each site,
+  guarantees nothing added later accidentally bypasses it.
+- **Magnet resolution priority at listing time** (cheapest first, no extra
+  fetch): a bare `magnet:` field, then a `download:` field that already
+  starts with `magnet:` (`kickasstorrents-to.yml`'s own shape - its
+  `download:` field selects a magnet URI directly), then a bare
+  `infohash:` field (builds a magnet immediately via
+  `download.ts`'s exported `buildMagnetFromInfohash`, no `download:` block
+  needed at all for this case). Whichever one resolves gets cached
+  immediately, keyed by the item's absolute `detailUrl`.
+- **`resolveMagnet()` cache-miss fallback**: `MagnetRef` only ever carries
+  `{id, url}` by the time it reaches here (`server.ts`'s `/download` route
+  round-trips only the query params it embedded at listing time) - the
+  original item's title and raw `download:` field value are long gone. On a
+  miss, falls back to `resolveCardigannDownload({downloadUri: url, itemTitle:
+  ''})`, re-deriving from the detail page directly - the exact same
+  trade-off `providers/eztv.ts`'s own `magnetCache` already makes on its
+  own cache-miss path. The cache itself is a plain bounded `Map` (500
+  entries, no TTL), copied verbatim from `providers/eztv.ts`'s own pattern.
+- **`provider.categories`** (advertised in `t=caps`): every standard id
+  reachable through the definition's `categorymappings`/`caps.categories`,
+  deduped.
+- **`provider.id`** is the **config key**, not the definition's own `id` -
+  required for two instances of one definition (e.g. `tpb`/`tpb-audio`,
+  phase 2a's design) to coexist with distinct URLs.
+
+**Known, deliberate limitations** (none block `kickasstorrents-to`, all
+documented rather than silently mishandled):
+- `.Query.*` only carries `Type` (hardcoded `"search"`), `Q`, `Keywords`,
+  `Categories`, `Offset`, `Limit` - `server.ts` itself doesn't parse
+  season/ep/imdbid/tvdbid/etc. from the request at all yet, so a definition
+  referencing any of those always sees `""`. Not a new gap introduced here;
+  the hand-written providers have never had this either.
+- A single path's fetch failure fails the whole search - no partial
+  degrade to whichever paths did succeed.
+
+### `providers/index.ts` / `server.ts`: the boot sequence
+
+`buildProviderMap()` is **async** (`resolveIndexerConfig` needs real
+network fetches for any `source:`-declared indexer), unlike the existing
+synchronous `providerMap` (the 3 hand-written providers, unchanged,
+still built at module-load time). `server.ts`'s `isMain` block now does
+`const providers = await buildProviderMap();` (Node ESM top-level `await`
+inside an `if` block - valid anywhere at module top level) before
+`app.listen()`; `scheduleKeepAlive()` gained a `providers` parameter
+instead of closing over the old module-level `providerMap` import, since
+the real map is no longer known until boot completes.
+
+Failure policy, unchanged from phase 2a's design, now actually load-bearing:
+- **Config file present but schema-invalid**: `loadConfig()` throws,
+  uncaught, straight through `buildProviderMap()` and the top-level
+  `await` - the process exits non-zero with the validation error printed.
+  Refuse to boot, verified live (see below) - crashes even though the 3
+  hand-written providers would have been fine.
+- **One indexer entry fails** (capability-blocked, a cross-check, or its
+  own definition can't be resolved/fetched): logged via `console.error`,
+  excluded from the result, everything else - hand-written and Cardigann
+  alike - still boots normally.
+- **No config file at all**: `buildProviderMap()` returns the exact same
+  `providerMap` object (not a copy) - zero behavioural change from before
+  this phase existed.
+
+`buildProviderMap()` takes an optional `{configFile, definitionsDir,
+cacheDir}`, each defaulting from its env var (`CONFIG_FILE`,
+`DEFINITIONS_DIR`, `CARDIGANN_CACHE_DIR`) when omitted - real boot calls it
+with no arguments; tests pass an explicit fixture path instead of fighting
+ESM's per-specifier module cache to override an env-read module constant.
+
+### Verification
+
+282 tests total (42 new this phase: 7 categories, 3 engine, 10 download, 10
+paths, 9 adapter, 6 `providers/index`). Beyond the unit suite, the real
+boot sequence was exercised **live**, three times, against a real running
+`node dist/server.js`:
+1. No config file → identical startup log to before this phase, `t=caps`
+   200 for the 3 hand-written providers, 404 for an unconfigured id.
+2. A config file naming `kickasstorrents-to` (bundled repo definition, no
+   network needed) → a real 4th provider, `/kickass/api?t=caps` returns a
+   genuine category tree built from the real definition's
+   `categorymappings`.
+3. One good entry + one entry naming a nonexistent definition → the bad one
+   logged and excluded, the good one and all 3 hand-written providers
+   otherwise unaffected; a schema-invalid config file separately confirmed
+   to exit the process non-zero with the validation error printed.
+
+One unrelated, pre-existing issue found and fixed along the way:
+`lib/cardigann/pins.json`'s `ref` had drifted to `"master"` in the working
+tree (left over from an earlier phase 2a manual smoke test of the pin
+refresh flow, never reverted) - `git checkout -- lib/cardigann/pins.json`
+restored the committed SHA pin. Not caused by this phase's own changes;
+caught only because `resolve.test.ts`'s existing test asserts the exact
+pinned SHA appears in the built URL.
+
+**Not yet done: a live test against kickass.torrentbay.st itself** (phase
+4, matching `NOTES.md` section 16's EZTV precedent) - everything above
+proves the engine executes real Cardigann syntax correctly and the boot
+sequence wires it in correctly; it does not prove kickass's actual live
+markup matches `kickasstorrents-to.yml`'s selectors. Cloudflare-protected,
+solvable (confirmed earlier this session: 403 challenge, not a 1006 ban, on
+both IPv4 and IPv6) - pending before this indexer is trusted with real
+traffic.

@@ -1,3 +1,4 @@
+import { collectCategoryMappings } from './category-mapping.js';
 import { applyFilter, andMatch, type FilterArgs, type FilterSpec } from './filters.js';
 import { renderTemplate, type TemplateContext } from './template.js';
 import { selectDomRows, selectJsonRows, type Row, type SelectorSpec } from './select.js';
@@ -55,6 +56,10 @@ interface SearchBlock {
   rows: RowsBlock;
   fields: FieldsBlock;
   response?: ResponseBlock;
+  /** Applied to the raw response body before any row parsing - e.g. wrapping
+   * a bare <tr> soup in <table></table>, or (not implemented - jsonjoinarray
+   * is capability-gated out) reshaping a JSON envelope. */
+  preprocessingfilters?: FilterSpec[];
 }
 
 function asRecord(v: unknown): Record<string, unknown> {
@@ -105,22 +110,22 @@ function extractField(row: Row, name: string, spec: SelectorSpec & { filters?: F
   return filtered;
 }
 
-// caps.categorymappings: [{id, cat, desc}]. `category` fields match by id
-// (tracker-native id, compared as a string so numeric YAML ids and string
-// selector output line up); `categorydesc` fields match by desc
-// case-insensitively - the schema's own documented alternative for sites
-// that only expose a category name, not an id.
+// `category` fields match a mapping by tracker id (compared as a string so
+// numeric YAML ids and string selector output line up); `categorydesc`
+// fields match by desc case-insensitively - the schema's own documented
+// alternative for sites that only expose a category name, not an id. Reads
+// both of caps.categorymappings (array) and caps.categories (object) via
+// category-mapping.ts, since a definition may use either shape.
 function resolveCategoryName(definition: Record<string, unknown>, categoryRaw: string | undefined, categoryDescRaw: string | undefined): string {
-  const caps = asRecord(definition.caps);
-  const mappings = Array.isArray(caps.categorymappings) ? (caps.categorymappings as Record<string, unknown>[]) : [];
+  const mappings = collectCategoryMappings(definition);
 
   if (categoryRaw !== undefined && categoryRaw !== '') {
-    const match = mappings.find((m) => String(m.id) === categoryRaw);
-    if (match) return String(match.cat);
+    const match = mappings.find((m) => m.trackerId === categoryRaw);
+    if (match) return match.standardName;
   }
   if (categoryDescRaw !== undefined && categoryDescRaw !== '') {
-    const match = mappings.find((m) => typeof m.desc === 'string' && m.desc.toLowerCase() === categoryDescRaw.toLowerCase());
-    if (match) return String(match.cat);
+    const match = mappings.find((m) => m.desc !== undefined && m.desc.toLowerCase() === categoryDescRaw.toLowerCase());
+    if (match) return match.standardName;
   }
   return 'Other';
 }
@@ -153,14 +158,31 @@ function parseDateOrNow(raw: string): Date {
   return Number.isNaN(parsed.getTime()) ? new Date() : parsed;
 }
 
-export function runSearch(definition: Record<string, unknown>, body: string, searchCtx: SearchContext): CardigannItem[] {
+// Unsliced: returns every item the response yields. runSearch() below is the
+// normal single-response entry point (slices to searchCtx.offset/limit); a
+// multi-path search (adapter.ts, phase 3) needs the raw list from each
+// path's own response so it can concatenate before slicing once, not once
+// per path.
+export function runSearchAll(definition: Record<string, unknown>, body: string, searchCtx: SearchContext): CardigannItem[] {
   const search = asRecord(definition.search) as unknown as SearchBlock;
   const responseType = search.response?.type;
 
+  const topCtx: TemplateContext = {
+    Keywords: searchCtx.keywords,
+    Query: searchCtx.query ?? {},
+    Categories: searchCtx.categories,
+    Config: searchCtx.config,
+    Result: {}
+  };
+  const preprocessed = (search.preprocessingfilters ?? []).reduce(
+    (v, f) => applyFilter(f.name, renderFilterArgs(f.args, topCtx), v),
+    body
+  );
+
   const rowsResult =
     responseType === 'json'
-      ? selectJsonRows(body, search.rows)
-      : { rows: selectDomRows(body, search.rows.selector, responseType === 'xml'), explicitNoResults: false };
+      ? selectJsonRows(preprocessed, search.rows)
+      : { rows: selectDomRows(preprocessed, search.rows.selector, responseType === 'xml'), explicitNoResults: false };
 
   if (rowsResult.explicitNoResults) return [];
 
@@ -219,5 +241,10 @@ export function runSearch(definition: Record<string, unknown>, body: string, sea
     items.push(item);
   }
 
+  return items;
+}
+
+export function runSearch(definition: Record<string, unknown>, body: string, searchCtx: SearchContext): CardigannItem[] {
+  const items = runSearchAll(definition, body, searchCtx);
   return items.slice(searchCtx.offset, searchCtx.offset + searchCtx.limit);
 }

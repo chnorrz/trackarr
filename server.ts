@@ -5,7 +5,7 @@ import { closeBrowser, cfFetch } from './lib/browser.js';
 import { categoriesXml } from './lib/categories.js';
 import { TTLCache } from './lib/cache.js';
 import { ProviderStatusTracker, renderStatusPage } from './lib/status.js';
-import { providerMap } from './providers/index.js';
+import { buildProviderMap } from './providers/index.js';
 import type { MagnetRef, Provider, SearchItem } from './lib/types.js';
 
 const PORT = process.env.PORT || 9117;
@@ -257,7 +257,7 @@ async function warmProvider(provider: Provider, statusTracker: ProviderStatusTra
 
 let keepAliveTimer: ReturnType<typeof setTimeout> | null = null;
 
-function scheduleKeepAlive(statusTracker: ProviderStatusTracker): void {
+function scheduleKeepAlive(statusTracker: ProviderStatusTracker, providers: Record<string, Provider>): void {
   if (!KEEPALIVE_INTERVAL_MS) {
     console.log('Keep-alive disabled (KEEPALIVE_INTERVAL_MS=0)');
     return;
@@ -267,7 +267,7 @@ function scheduleKeepAlive(statusTracker: ProviderStatusTracker): void {
   const tick = async () => {
     // Sequential, not parallel: solves are serialised anyway (XTEST input is
     // global), and this keeps at most one browser page open at a time.
-    for (const provider of Object.values(providerMap)) {
+    for (const provider of Object.values(providers)) {
       await warmProvider(provider, statusTracker);
     }
     const next = KEEPALIVE_INTERVAL_MS * (0.8 + Math.random() * 0.4);
@@ -286,16 +286,21 @@ async function shutdown(): Promise<void> {
 
 const isMain = import.meta.url === `file://${process.argv[1]}`;
 if (isMain) {
+  // Cardigann indexers with a source: URL need a real fetch to resolve, so
+  // this is awaited before listen() rather than built synchronously like
+  // the hand-written providers. A malformed config file throws out of here
+  // and crashes the boot - see buildProviderMap()'s own doc comment.
+  const providers = await buildProviderMap();
   const statusTracker = new ProviderStatusTracker();
-  const app = createApp(providerMap, { statusTracker });
+  const app = createApp(providers, { statusTracker });
   app.listen(PORT, () => {
     console.log(`Torznab server listening on http://localhost:${PORT}`);
     console.log(`  status page: http://localhost:${PORT}/`);
-    for (const provider of Object.values(providerMap)) {
+    for (const provider of Object.values(providers)) {
       console.log(`  ${provider.name}: http://localhost:${PORT}/${provider.id}/api`);
     }
     console.log(`API key: ${API_KEY}${API_KEY === 'changeme' ? ' (set API_KEY env var to something real!)' : ''}`);
-    scheduleKeepAlive(statusTracker);
+    scheduleKeepAlive(statusTracker, providers);
   });
 
   process.on('SIGINT', shutdown);
