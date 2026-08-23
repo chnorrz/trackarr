@@ -332,8 +332,13 @@ rg -o '<error[^>]*>' /tmp/r1.xml | head -1
 echo "req2 items=$(rg -c '<item>' /tmp/r2.xml || echo 0)"
 ```
 
-Expected: request 1 returns `<error code="900" ... has been closed />`,
-request 2 succeeds. Then confirm exactly one browser process remains — two
+Expected: request 1 returns `<error code="900" ... has been closed />`. The
+second request usually succeeds, but can also fail the same way — Playwright's
+`page.isClosed()` doesn't always reflect an external `kill -9` immediately,
+so a request landing in that window takes the slower discard path
+(`browserContext.newPage: ... has been closed`, not `page.goto: ...`) instead
+of relaunching directly. Not a regression by itself; keep retrying until one
+succeeds, then confirm exactly one browser process remains — more than one
 would mean the old session leaked:
 
 ```bash
