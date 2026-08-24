@@ -2769,7 +2769,12 @@ value is empty; the real POST body sends `hash=` and `name=` present-but-
 empty, which the API's tolerance for is unverified either way.
 
 Both are schema-patched onto `BeforeBlock` in `schema-extensions.json`,
-trackarr-only like everything else there.
+trackarr-only like everything else there. (`before.vars` ends up unused by
+`ext-to.yml` itself once the live test below prompted a redesign - kept as
+tested, documented general engine capability for a genuinely different case:
+a definition whose download resolution needs a per-grab token that only
+exists on a page distinct from the search response, e.g. a real
+"thankyou-link" flow. `allowEmptyInputs` stays load-bearing.)
 
 **Category mapping hit a real schema constraint**: `FieldsBlock`'s
 `oneOf: [{required:[category]}, {required:[categorydesc]}]` means exactly
@@ -2793,31 +2798,84 @@ fallback. Verified by running the built `engine.ts` against the real
 size, seed/leech count and pubDate year matched the hand-written provider's
 own test expectations exactly.
 
-**Torrent id at download time**: `resolveCardigannDownload`'s context never
-carried anything from `search.fields` forward (by design - see above), so
-`torrent_id` can't come from the row's own `data-id` attribute the way
-`providers/ext-to.ts` reads it. It's re-derived instead from the item's own
-permalink, which embeds it as the URL slug's trailing number
-(`.../<title>-<id>/`): `{{ regexp .DownloadUri.AbsolutePath "-([0-9]+)/?$" }}`,
-using the `.DownloadUri` context `download.ts` already builds from
-`opts.downloadUri`. Used twice (once for `torrent_id` itself, once inside
-the `hmac` input's `concat`) since the template engine has no local variable
-binding outside `range` - a small, commented duplication rather than more
-engine surface for one call site.
+This session's first draft re-derived `torrent_id` at download time from the
+permalink URL's own slug, and fetched the item's own detail page (via
+`before.vars`) to get `token`/`sessid` - both wrong, corrected below by the
+live test.
 
-Verified end-to-end (not just schema-valid) with one-off scripts run against
-the built `dist/`: `runSearch()` against the real search fixture reproduces
-every field `test/providers/ext-to.test.ts` asserts (title, size, seeds,
-leechers, category, pubDate year) for all four rows; `resolveCardigannDownload()`
-against a synthetic detail page reproduces the exact HMAC
-`providers/ext-to.ts`'s `computeHMAC` would compute for the same torrent id/
-timestamp/token, with `hash`/`name` present-but-empty in the POST body.
+### Live test - and a design correction it forced
 
-**Still unverified against the live site** (unchanged from earlier
-planning): whether the item's own permalink page carries the same
-`window.searchPageToken`/csrf-token meta the search listing does, and
-whether the API cares about `hash`/`name` being present-but-empty vs.
-absent. Both are exactly what live-testing (phase 4, part 2 - not done in
-this session) exists to answer. `providers/ext-to.ts` is untouched; nothing
-wires `ext-to.yml` into a running server yet, and nothing in `config/`
-references it.
+Ran against the real site: `config/trackarr.yml` (gitignored, local-only)
+configured the definition under the key `ext-to-cd` (deliberately distinct
+from the built-in `ext-to` provider id, so both coexist and are directly
+comparable - `providers/index.ts`'s id-collision guard would otherwise
+exclude it), with `definitions/` and `config/` volume-mounted exactly per
+section 21's precedent.
+
+Search worked first try: `t=search&q=matrix` → 50 items, 0 zero-size, 50
+seeded, real category ids spanning Movies (2000), TV (5000), PC (4000),
+Books/EBook (7020), TV/Anime (5070), PC/Games (4050) - the `category` field's
+regexp-alternation collapse logic (above) proven against genuine multi-
+category output, not just synthetic rows.
+
+Magnet resolution, first attempt, **failed**: `Download failed: Unexpected
+token '<', "<!DOCTYPE "... is not valid JSON` - the AJAX endpoint returned
+an HTML page instead of JSON. Isolated by fetching the hand-written
+provider's own download link for the *same* item (`/ext-to/download` -
+succeeds, `302` to a real magnet) and then, directly, by having the
+container's own `cfFetch` (reusing its already-solved Cloudflare session)
+fetch the item's own permalink page and check for the token:
+
+```
+has searchPageToken: false
+has csrf-token meta: true
+```
+
+Root cause, confirmed rather than guessed: **`window.searchPageToken` only
+exists on an actual search/browse listing page - never on an item's own
+permalink page**, which was exactly this definition's `before.vars` source.
+This is why `providers/ext-to.ts:180` fetches `/browse/?q=yify` rather than
+the item's detail page - a deliberate choice already documented there, not
+mentioned in this file until now.
+
+The user's question cut straight to the real fix: *why fetch anything at
+download time at all, when `token`/`sessid` are already sitting on the
+search page trackarr just fetched?* They are - phase 3's `search.vars`
+mechanism already extracts exactly this, once per response. The redesign
+moves `token`/`sessid` extraction from `download.before.vars` to
+`search.vars` (the search page itself, no separate fetch), adds a private
+`_id` field (`data-id`, must be declared before `download` - fields render
+in object-key order, and `download`'s template reads `.Result._id`), and
+builds the *entire signed AJAX request* into `fields.download` as a
+`text:` field (the same pattern `kickasstorrents-to.yml`'s
+`downloadvolumefactor: {text: 0}` already uses, just with a real template
+body) - `{{ .Config.sitelink }}ajax/getSearchMagnet.php?torrent_id=...
+&hmac={{ sha256 (concat .Result._id "|" .Now "|" .Vars.token) }}&...`. The
+`download:` block shrinks to replaying that URL's own query string as a
+POST body via `.DownloadUri.Query.*` (already-existing, unmodified
+machinery) against `.DownloadUri.AbsolutePath` - no `before.vars`, no
+`pathselector`, no page fetch of any kind. A grab is exactly one HTTP
+request, fewer than the hand-written provider's own two.
+
+Verified locally first (`runSearch()` against the real fixture, then
+`resolveCardigannDownload()` fed that exact `fields.download` value with a
+fetch stub that throws on any GET - confirming zero non-POST calls), then
+rebuilt the Docker image and re-ran the live test: same item, **`302` to
+`magnet:?xt=urn:btih:E0593A3DAB881080EFECB54BA6551D4B2D329BF1&...`** -
+byte-for-byte the same infohash the hand-written provider resolves for it.
+Container logs confirm no second Cloudflare challenge and no extra request
+for the download call - the reused session handled the single POST
+directly.
+
+**Both of this session's earlier "unverified" unknowns are now answered**:
+`hash`/`name` present-but-empty is accepted by the real API (the successful
+POST used exactly that shape); the permalink-page token question is moot -
+the redesign never asks that page anything.
+
+`providers/ext-to.ts` is untouched. Nothing in the repo's own `config/`
+references `ext-to.yml` - the local `config/trackarr.yml` used for this test
+was gitignored and removed after. Deciding whether to keep the hand-written
+provider or switch `server.ts` to the Cardigann definition (phase 4 item 9)
+is still open - this session proved the definition works correctly and
+does one fewer network request per grab, but switching the live `ext-to`
+route is a separate decision from proving the definition correct.

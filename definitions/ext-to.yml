@@ -47,6 +47,21 @@ search:
     - path: "browse/?{{ if .Keywords }}q={{ .Keywords }}{{ else }}sort=age&order=desc&age=4{{ end }}&page_size=100&page=1"
     - path: "browse/?{{ if .Keywords }}q={{ .Keywords }}{{ else }}sort=age&order=desc&age=4{{ end }}&page_size=100&page=2"
 
+  # Extracted once per response, not once per row - every row's magnet POST
+  # needs the same page-level token/sessid. Never fetched separately: this
+  # search page is the ONLY page that ever carries window.searchPageToken -
+  # confirmed live, the item's own permalink page does not have it (see
+  # NOTES.md).
+  vars:
+    token:
+      selector: 'script:contains("searchPageToken")'
+      filters:
+        - name: regexp
+          args: "searchPageToken\\s*=\\s*'([^']+)'"
+    sessid:
+      selector: 'meta[name="csrf-token"]'
+      attribute: content
+
   rows:
     selector: table.search-table > tbody > tr
 
@@ -65,13 +80,19 @@ search:
     details:
       selector: a.torrent-title-link
       attribute: href
-    # No distinct per-item download link exists (magnets are resolved via a
-    # signed AJAX POST, below) - reusing the item's own permalink here only
-    # satisfies the schema's anyOf(download|infohash|magnet); the download:
-    # block does the real work.
+    # The row's own numeric torrent id, needed below to compute the HMAC.
+    # Must be declared before `download` - fields render in declaration
+    # order, and download's text: template reads .Result._id.
+    _id:
+      selector: 'a.search-magnet-btn[data-id]'
+      attribute: data-id
+    # No per-item link exists at all (magnets are resolved via a signed AJAX
+    # POST) - the full signed request is built right here instead, from this
+    # response's own .Vars.token/.Vars.sessid plus the row's own _id and
+    # .Now. download: block below just replays it as a POST body - no
+    # further page fetch happens at grab time.
     download:
-      selector: a.torrent-title-link
-      attribute: href
+      text: "{{ .Config.sitelink }}ajax/getSearchMagnet.php?torrent_id={{ .Result._id }}&hash=&name=&timestamp={{ .Now }}&hmac={{ sha256 (concat .Result._id \"|\" .Now \"|\" .Vars.token) }}&sessid={{ .Vars.sessid }}"
     size:
       selector: "td:nth-child(2) span:last-child"
     date:
@@ -86,41 +107,27 @@ search:
     uploadvolumefactor:
       text: 1
 
-# The listing row carries no magnet, no thankyou link, nothing beyond a
-# data-id button - the real magnet comes from an HMAC-signed AJAX POST
-# (providers/ext-to.ts:175-217, ported here). torrent_id isn't available as
-# a template variable at download time (nothing from search.fields survives
-# into the download block - see NOTES.md); it's re-derived from the
-# permalink's own URL slug instead (".../<title>-<id>/"), which is the only
-# per-item value download.ts's context carries forward.
-#
-# UNVERIFIED against the live site (see NOTES.md, phase 4 live-test): (a)
-# that the item's own permalink page carries the same window.searchPageToken
-# / csrf-token meta the search listing does, and (b) whether the AJAX
-# endpoint tolerates hash/name sent empty-but-present vs. requiring them.
+# fields.download (above) already IS the fully-signed AJAX request, as a
+# GET-shaped URL captured at search time. This block just replays its own
+# query params as a POST body against its own path - the API requires POST
+# (providers/ext-to.ts:193-204), and does not accept the request as a plain
+# GET. No fetch happens here at all: .DownloadUri.Query.* reads straight
+# from the captured URL, so a grab is exactly one HTTP request, same as the
+# API call itself.
 download:
   headers:
     X-Requested-With: [XMLHttpRequest]
   before:
-    path: "{{ .Config.sitelink }}ajax/getSearchMagnet.php"
+    path: "{{ .DownloadUri.AbsolutePath }}"
     method: post
     allowEmptyInputs: true
-    vars:
-      token:
-        selector: 'script:contains("searchPageToken")'
-        filters:
-          - name: regexp
-            args: "searchPageToken\\s*=\\s*'([^']+)'"
-      sessid:
-        selector: 'meta[name="csrf-token"]'
-        attribute: content
     inputs:
-      torrent_id: "{{ regexp .DownloadUri.AbsolutePath \"-([0-9]+)/?$\" }}"
-      hash: ""
-      name: ""
-      timestamp: "{{ .Now }}"
-      hmac: "{{ sha256 (concat (regexp .DownloadUri.AbsolutePath \"-([0-9]+)/?$\") \"|\" .Now \"|\" .Vars.token) }}"
-      sessid: "{{ .Vars.sessid }}"
+      torrent_id: "{{ .DownloadUri.Query.torrent_id }}"
+      hash: "{{ .DownloadUri.Query.hash }}"
+      name: "{{ .DownloadUri.Query.name }}"
+      timestamp: "{{ .DownloadUri.Query.timestamp }}"
+      hmac: "{{ .DownloadUri.Query.hmac }}"
+      sessid: "{{ .DownloadUri.Query.sessid }}"
   selectors:
     - selector: "$.url"
       usebeforeresponse: true
