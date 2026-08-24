@@ -42,7 +42,7 @@ console.log(`  Failed: ${errors.length}`);
 if (ok.length > 0) {
   console.log('\n--- Resolved ---');
   for (const { key, resolved } of ok) {
-    console.log(`  ${key}: ${resolved.definitionId} (${resolved.from})`);
+    console.log(`  ${key}: ${resolved.definitionId} (${resolved.from})${resolved.portable ? '' : ' [trackarr-only]'}`);
   }
 }
 

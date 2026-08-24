@@ -43,11 +43,41 @@ search:
       attribute: href
 `;
 
-test('validateDefinitionYaml: a well-formed definition passes and returns its id', () => {
+test('validateDefinitionYaml: a well-formed definition passes, returns its id, and is portable (valid under the upstream schema as-is)', () => {
   const result = validateDefinitionYaml(VALID_YAML);
   assert.equal(result.ok, true);
   assert.equal(result.id, 'test-tracker');
   assert.equal(result.definition.name, 'Test Tracker');
+  assert.equal(result.portable, true);
+});
+
+test('validateDefinitionYaml: search.vars (a trackarr extension, not in the upstream schema) validates, but as not portable', () => {
+  const withVars = VALID_YAML.replace(
+    'search:\n  paths:',
+    'search:\n  vars:\n    token: { selector: "meta[name=csrf-token]", attribute: content }\n  paths:'
+  );
+  const result = validateDefinitionYaml(withVars);
+  assert.equal(result.ok, true, JSON.stringify(result.ok === false ? result.errors : null));
+  assert.equal(result.portable, false);
+});
+
+test('validateDefinitionYaml: a filters.name of "sha256" (a trackarr extension) validates, but as not portable', () => {
+  const withSha256 = VALID_YAML.replace(
+    'download:\n      selector: a\n      attribute: href',
+    'download:\n      selector: a\n      attribute: href\n      filters:\n        - name: sha256'
+  );
+  const result = validateDefinitionYaml(withSha256);
+  assert.equal(result.ok, true, JSON.stringify(result.ok === false ? result.errors : null));
+  assert.equal(result.portable, false);
+});
+
+test('validateDefinitionYaml: a genuinely invalid definition still fails even against the extended schema', () => {
+  const result = validateDefinitionYaml(VALID_YAML + '\nnotARealFieldAtAll: true\n');
+  assert.equal(result.ok, false);
+});
+
+test('validateDefinitionYaml: an explicit schemaPath that does not exist throws, naming the path', () => {
+  assert.throws(() => validateDefinitionYaml(VALID_YAML, '/definitely/does/not/exist/schema.json'), /no schema\.json found/);
 });
 
 test('validateDefinitionYaml: malformed YAML is rejected with a parse error, not a crash', () => {
@@ -102,6 +132,7 @@ test('loadDefinitions: scans a directory, separating valid from invalid files', 
 
     assert.equal(valid.length, 1);
     assert.equal(valid[0].id, 'good');
+    assert.equal(valid[0].portable, true);
     assert.equal(invalid.length, 1);
     assert.equal(invalid[0].file, 'bad.yml');
   } finally {

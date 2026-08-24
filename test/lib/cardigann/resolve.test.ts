@@ -52,6 +52,13 @@ function withTempDirs(fn: (dirs: { repo: string; volume: string; cache: string }
   return fn(dirs).finally(() => fs.rmSync(base, { recursive: true, force: true }));
 }
 
+// A volume mount is a self-contained override directory (see resolve.ts):
+// any test where the definition's origin is the volume dir needs its own
+// schema.json alongside it, same as a real deployment would.
+function giveVolumeItsOwnSchema(volume: string): void {
+  fs.copyFileSync(path.join(ROOT, 'definitions', 'schema.json'), path.join(volume, 'schema.json'));
+}
+
 test('resolveDefinition: finds a definition in the bundled repo dir', () =>
   withTempDirs(async ({ repo, volume, cache }) => {
     fs.writeFileSync(path.join(repo, 'foo.yml'), minimalDefinitionYaml('foo'));
@@ -63,6 +70,7 @@ test('resolveDefinition: finds a definition in the bundled repo dir', () =>
 
 test('resolveDefinition: DEFINITIONS_DIR (volume) wins over the repo dir even with no source given', () =>
   withTempDirs(async ({ repo, volume, cache }) => {
+    giveVolumeItsOwnSchema(volume);
     fs.writeFileSync(path.join(repo, 'foo.yml'), minimalDefinitionYaml('foo', 'Repo Version'));
     fs.writeFileSync(path.join(volume, 'foo.yml'), minimalDefinitionYaml('foo', 'Volume Override'));
 
@@ -72,6 +80,7 @@ test('resolveDefinition: DEFINITIONS_DIR (volume) wins over the repo dir even wi
 
 test('resolveDefinition: DEFINITIONS_DIR wins even over an explicit source (the override escape hatch)', () =>
   withTempDirs(async ({ repo, volume, cache }) => {
+    giveVolumeItsOwnSchema(volume);
     fs.writeFileSync(path.join(volume, 'foo.yml'), minimalDefinitionYaml('foo', 'Volume Override'));
     const fetchImpl = async () => {
       throw new Error('fetch should never be called - the volume copy must win first');
@@ -81,6 +90,16 @@ test('resolveDefinition: DEFINITIONS_DIR wins even over an explicit source (the 
       repoDefinitionsDir: repo, volumeDefinitionsDir: volume, cacheDir: cache, fetchImpl: fetchImpl as unknown as typeof fetch
     });
     assert.equal(result.definition.name, 'Volume Override');
+  }));
+
+test('resolveDefinition: a volume mount without its own schema.json fails that definition, rather than silently falling back to the bundled schema', () =>
+  withTempDirs(async ({ repo, volume, cache }) => {
+    fs.writeFileSync(path.join(volume, 'foo.yml'), minimalDefinitionYaml('foo', 'Volume Override'));
+
+    await assert.rejects(
+      () => resolveDefinition('foo', undefined, { repoDefinitionsDir: repo, volumeDefinitionsDir: volume, cacheDir: cache }),
+      /no schema\.json found/
+    );
   }));
 
 test('resolveDefinition: a source URL is fetched and cached to disk', () =>

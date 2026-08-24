@@ -2555,3 +2555,106 @@ section 3's category-drift incidents for what that looks like when it
 happens), or that any of the other 75 runnable definitions this session's
 coverage scan found (section 17) work against their own real sites -
 each would need this same live-test treatment before being trusted.
+
+## 22. Two adapter defects and a schema-extension mechanism, on the way to ext.to
+
+Groundwork for a Cardigann definition for ext.to (its `sha256(torrentId|
+timestamp|token)`-signed magnet endpoint needs both an engine filter and a
+schema property no upstream definition has ever needed). Two independent
+pieces of work, not ext.to itself yet.
+
+### Two adapter defects `adapter.test.ts` was accidentally not catching
+
+1. `resolveMagnet` only ever receives an item's `detailUrl` -
+   `server.ts` builds every RSS grab link from `it.detailUrl`, never
+   `it.download`. On a `magnetCache` miss, the adapter re-fetched that same
+   `detailUrl` even when the row had its own distinct, non-magnet
+   download/thankyou URL (`fields.download`) - that URL was captured
+   nowhere. Fixed with a second cache, `downloadUrlCache` (detailUrl ->
+   downloadUrl, same bound/eviction as `magnetCache`).
+
+   The existing `requestDelay` regression test masked this for an entire
+   phase: it called `resolveMagnet` with the row's raw `download` URL
+   directly rather than `items[0].detailUrl`, which isn't how the real
+   system ever calls it. A definition whose download link isn't already a
+   magnet (i.e. anything with a real `download:` block, which no checked-in
+   definition has exercised yet) would have silently resolved the wrong
+   page in production. Fixed to route through `items[0].detailUrl`, plus a
+   dedicated regression test with a deliberately wrong canned response for
+   the detail page, so a future regression fails loudly instead of quietly
+   fetching the wrong URL.
+
+2. `.Config.sitelink` - a Cardigann wiki-documented built-in definitions may
+   reference in templates - was never populated. Now injected as
+   `baseUrl` after `entry.config` is applied, so it can't be overridden by
+   a user's own config.
+
+### Schema patching: `definitions/schema.json` + `schema-extensions.json`
+
+`schema.json` moved from `lib/cardigann/` to `definitions/schema.json` -
+vendored beside the definitions it validates, versioned with them, per the
+decision to ship it bundled rather than require `source:` everywhere. It is
+**not** copied into `dist/` by `scripts/copy-assets.mjs`: it's read
+cwd-relative (`path.resolve('definitions', 'schema.json')`), same as the
+`.yml` files it validates, never `__dirname`-relative.
+
+`lib/cardigann/schema-extensions.json` is a plain RFC 6902 patch document
+(two ops so far: append `sha256`/`concat` to `FilterBlock.name`'s enum, add
+`Search.properties.vars`), applied via the `fast-json-patch` npm package
+(8M+ weekly downloads, zero deps, MIT) through `lib/cardigann/patch.ts`'s
+`applySchemaExtensions()`. Considered writing custom non-standard patch
+semantics (throw on any collision) before realizing that over-corrects: an
+enum entry upstream adds independently is convergence, not conflict, and
+should be silently skipped rather than blocking every definition using it.
+Landed on: standard patch document, standard `applyPatch`, but a
+precondition pass first -
+- an array-append op whose value already exists is **skipped + logged**
+  (upstream added the same extension - fine)
+- any other `add` whose target path already holds a value **throws**
+  (we would otherwise silently shadow an upstream property of the same
+  name, e.g. if a future schema version adds its own `vars`)
+- anything else (an unresolvable path, etc.) is left to `fast-json-patch`
+  itself
+
+`load.ts` no longer compiles one module-level schema singleton. It now
+caches `{strict, extended}` `ValidateFunction` pairs per resolved schema
+path (`loadSchemaPair()`), and `validateDefinitionYaml(raw, schemaPath?)`
+tries `strict` first, falls back to `extended`, and returns a new
+`portable: boolean` alongside `id`/`definition` - `false` means the
+definition only validates with trackarr's extensions applied, i.e. it
+would **not** run unmodified under Prowlarr/Jackett. `schemaPath` defaults
+to the bundled `definitions/schema.json` so the large majority of call
+sites are unaffected.
+
+`resolve.ts` picks the schema by a definition's actual origin: a
+`DEFINITIONS_DIR` volume mount is treated as a **self-contained override
+directory** and must carry its own `schema.json` alongside its `.yml`
+files - no fetch-from-pin fallback, no silent fallback to the bundled
+schema either, since either could validate against the wrong schema
+version without saying so. A volume-origin definition with no schema.json
+next to it fails to resolve, loudly, naming the path it looked for. A
+definition resolved from `source:` or the bundled `definitions/` directory
+always validates against the bundled schema. `loadDefinitions()` (the
+directory-scanner used by `cli.ts`, including for scanning an arbitrary
+clone of the upstream corpus) keeps defaulting to the bundled schema too,
+deliberately **not** requiring a scanned directory to carry its own -
+that tool's job is reporting how much of a directory validates against
+*our* schema, not enforcing the self-contained-mount policy that only
+applies to a live `DEFINITIONS_DIR`.
+
+`portable` now flows `ValidatedYaml` -> `ResolvedDefinition` -> `cli.ts`
+(annotates each runnable file `(trackarr-only)` if not portable) and
+`config-cli.ts` (`[trackarr-only]` per resolved indexer).
+
+### Verification
+
+Full gates (lint/typecheck/294 tests, up from 282) pass. New coverage:
+`patch.test.ts` (the precondition pass in isolation - append/skip-dup/
+new-property/collision-throws/non-mutation), `load.test.ts` (portable
+true/false via `search.vars` and a `sha256` filter, an explicit missing
+`schemaPath` throwing), `resolve.test.ts` (a volume mount without its own
+`schema.json` fails that definition), and two `providers/index.test.ts`
+fixtures updated to give their temp `definitionsDir` its own `schema.json`
+now that a volume mount requires one. Not yet exercised: the extended
+schema against a real definition that actually needs it (ext.to's own
+definition, not written yet) - only synthetic fixtures so far.

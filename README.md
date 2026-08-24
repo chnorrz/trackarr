@@ -179,7 +179,7 @@ All via environment variables.
 | `PROXY_URL` | *(unset)* | Upstream proxy, see below. Unset = direct |
 | `DOMAIN_OVER_PROXY` | *(unset)* | Comma-separated hostnames routed through the proxy (a listed name also matches its subdomains). **Unset or empty = none** - opt-in, not opt-out |
 | `CONFIG_FILE` | `config/trackarr.yml` | Cardigann indexer config - see below. Missing file = no Cardigann indexers, no effect on `ext-to`/`1337x`/`eztv` |
-| `DEFINITIONS_DIR` | *(unset)* | Volume of Cardigann `.yml` definitions, checked before the repo's bundled `definitions/` and before any `source:` fetch - drop an edited copy here to override one |
+| `DEFINITIONS_DIR` | *(unset)* | Volume of Cardigann `.yml` definitions, checked before the repo's bundled `definitions/` and before any `source:` fetch - drop an edited copy here to override one. **Must also contain its own `schema.json`** - a definition resolved from here never falls back to the bundled schema, so a mount missing it fails that definition rather than silently validating against the wrong schema version |
 | `CARDIGANN_CACHE_DIR` | `.cardigann-cache` | Disk cache for `source:`-fetched definitions, so a restart works offline |
 
 ### Cardigann indexer config (optional)

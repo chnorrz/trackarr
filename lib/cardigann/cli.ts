@@ -13,12 +13,12 @@ import { checkCapability } from './capability.js';
 const dir = path.resolve(process.argv[2] || 'definitions');
 const { valid, invalid } = loadDefinitions(dir);
 
-const supported: string[] = [];
+const supported: { file: string; portable: boolean }[] = [];
 const blocked: { file: string; reasons: string[] }[] = [];
 
-for (const { file, definition } of valid) {
+for (const { file, definition, portable } of valid) {
   const reasons = checkCapability(definition);
-  if (reasons.length === 0) supported.push(file);
+  if (reasons.length === 0) supported.push({ file, portable });
   else blocked.push({ file, reasons });
 }
 
@@ -65,6 +65,7 @@ if (blocked.length > 0) {
 }
 
 if (supported.length > 0) {
-  console.log('\n--- Runnable files ---');
-  for (const file of supported) console.log(`  ${file}`);
+  const trackarrOnly = supported.filter((s) => !s.portable).length;
+  console.log(`\n--- Runnable files (${trackarrOnly} trackarr-only, needs schema-extensions.json) ---`);
+  for (const { file, portable } of supported) console.log(`  ${file}${portable ? '' : ' (trackarr-only)'}`);
 }

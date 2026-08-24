@@ -49,6 +49,12 @@ function writeConfig(dir: string, yaml: string): string {
   return configFile;
 }
 
+// definitionsDir maps to resolve.ts's volumeDefinitionsDir - a self-contained
+// override directory that must carry its own schema.json.
+function giveItsOwnSchema(dir: string): void {
+  fs.copyFileSync(path.join(ROOT, 'definitions', 'schema.json'), path.join(dir, 'schema.json'));
+}
+
 test('buildProviderMap() with no config file present returns exactly the 3 hand-written providers', () =>
   withScratch(async (dir) => {
     const result = await buildProviderMap({ configFile: path.join(dir, 'does-not-exist.yml') });
@@ -58,6 +64,7 @@ test('buildProviderMap() with no config file present returns exactly the 3 hand-
 
 test('buildProviderMap() with a valid config adds a real Cardigann provider alongside the built-in ones', () =>
   withScratch(async (dir) => {
+    giveItsOwnSchema(dir);
     fs.writeFileSync(path.join(dir, 'synth.yml'), SYNTH_DEF_YAML);
     const configFile = writeConfig(dir, 'indexers:\n  synth:\n    definition: synth\n');
 
@@ -86,6 +93,7 @@ test('buildProviderMap() excludes an indexer whose key collides with a built-in 
 
 test('buildProviderMap() excludes one bad indexer entry but still boots the rest, hand-written and Cardigann alike', () =>
   withScratch(async (dir) => {
+    giveItsOwnSchema(dir);
     fs.writeFileSync(path.join(dir, 'synth.yml'), SYNTH_DEF_YAML);
     const configFile = writeConfig(
       dir,

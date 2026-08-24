@@ -2,13 +2,62 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import YAML from 'yaml';
-import type { ErrorObject } from 'ajv';
+import type { ErrorObject, ValidateFunction } from 'ajv';
+import type { Operation } from 'fast-json-patch';
 import { compileSchema } from './ajv.js';
+import { applySchemaExtensions } from './patch.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
-const schema = JSON.parse(fs.readFileSync(path.join(__dirname, 'schema.json'), 'utf8')) as object;
-const validateSchema = compileSchema(schema);
+// The trackarr-owned extensions (sha256/concat filters, search.vars, ...)
+// layered onto whatever base schema a given definitions directory carries -
+// same extensions regardless of which upstream schema they're applied to,
+// so this is loaded once here rather than per schema directory.
+const extensions = JSON.parse(fs.readFileSync(path.join(__dirname, 'schema-extensions.json'), 'utf8')) as Operation[];
+
+// "Bundled" means the schema shipped alongside this repo's own
+// definitions/ directory - resolved relative to cwd, same convention
+// cli.ts/config-cli.ts already use for repoDefinitionsDir, and independent
+// of whatever directory a given caller passes as its own repoDefinitionsDir
+// override (test fixtures in particular use temp dirs that don't carry
+// their own schema.json - they're meant to validate against this one).
+function defaultSchemaPath(): string {
+  return path.resolve('definitions', 'schema.json');
+}
+
+interface CompiledSchemaPair {
+  /** Validates against the schema exactly as it ships upstream. */
+  strict: ValidateFunction;
+  /** strict + lib/cardigann/schema-extensions.json applied on top. */
+  extended: ValidateFunction;
+}
+
+// Keyed by resolved schema.json path - a definitions directory's schema
+// rarely changes at runtime, so compiling it once per distinct path (rather
+// than once globally, as before phase 2) is enough while still supporting
+// multiple directories (a volume mount's own schema.json vs the bundled
+// one) with a single validator instance each.
+const schemaCache = new Map<string, CompiledSchemaPair>();
+
+function loadSchemaPair(schemaPath: string): CompiledSchemaPair {
+  const resolved = path.resolve(schemaPath);
+  const cached = schemaCache.get(resolved);
+  if (cached) return cached;
+
+  if (!fs.existsSync(resolved)) {
+    throw new Error(`Cardigann: no schema.json found at ${resolved}`);
+  }
+
+  const base = JSON.parse(fs.readFileSync(resolved, 'utf8')) as object;
+  const extended = applySchemaExtensions(base, extensions);
+  const pair: CompiledSchemaPair = { strict: compileSchema(base), extended: compileSchema(extended) };
+  schemaCache.set(resolved, pair);
+  return pair;
+}
+
+function formatErrors(errors: ErrorObject[] | null | undefined): string[] {
+  return (errors || []).map((e) => `${e.instancePath || '/'} ${e.message}`);
+}
 
 // Mirrors a quirk documented in Prowlarr's own Python validator
 // (CONTRIBUTING.md): the schema requires string values inside `options` and
@@ -33,6 +82,10 @@ export interface LoadedDefinition {
   file: string;
   id: string;
   definition: Record<string, unknown>;
+  /** true if valid against the schema exactly as it ships upstream (no
+   * trackarr extensions needed) - i.e. this definition would also run
+   * unmodified under Prowlarr/Jackett. */
+  portable: boolean;
 }
 
 export interface RejectedDefinition {
@@ -46,14 +99,24 @@ export interface LoadResult {
 }
 
 export type ValidatedYaml =
-  | { ok: true; id: string; definition: Record<string, unknown> }
+  | { ok: true; id: string; definition: Record<string, unknown>; portable: boolean }
   | { ok: false; errors: string[] };
 
 // The one place both the directory scanner below and lib/cardigann/resolve.ts
 // (single definition, by id, from a local dir or a fetched URL) run schema
-// validation - kept as a single Ajv instance/compiled validator rather than
-// two, so both paths reject exactly the same things the same way.
-export function validateDefinitionYaml(raw: string): ValidatedYaml {
+// validation - so both paths reject exactly the same things the same way.
+//
+// schemaPath defaults to the bundled definitions/schema.json so existing
+// call sites (most of them) don't need to know about schema resolution at
+// all; resolve.ts passes an explicit path when a definition's own directory
+// (a DEFINITIONS_DIR volume mount) carries a schema.json of its own.
+//
+// A definition is tried against the schema exactly as it ships upstream
+// first; only on failure is it retried against that same schema with
+// lib/cardigann/schema-extensions.json applied, so trackarr-only fields
+// (search.vars, the sha256/concat filters, ...) can validate. Whichever one
+// it validated under decides `portable`.
+export function validateDefinitionYaml(raw: string, schemaPath: string = defaultSchemaPath()): ValidatedYaml {
   let parsed: unknown;
 
   try {
@@ -64,9 +127,17 @@ export function validateDefinitionYaml(raw: string): ValidatedYaml {
 
   normalizeBooleanMaps(parsed);
 
-  if (!validateSchema(parsed)) {
-    const errors = (validateSchema.errors || []).map((e: ErrorObject) => `${e.instancePath || '/'} ${e.message}`);
-    return { ok: false, errors };
+  const { strict, extended } = loadSchemaPair(schemaPath);
+
+  let portable = true;
+  if (!strict(parsed)) {
+    portable = false;
+    if (!extended(parsed)) {
+      // The extended schema is a superset, so once both have failed its
+      // errors are the ones that matter - a strict-only complaint like
+      // "vars is not a known property" would otherwise mask the real one.
+      return { ok: false, errors: formatErrors(extended.errors) };
+    }
   }
 
   const definition = parsed as Record<string, unknown>;
@@ -76,10 +147,14 @@ export function validateDefinitionYaml(raw: string): ValidatedYaml {
     return { ok: false, errors: ['missing or non-string id after schema validation (unexpected)'] };
   }
 
-  return { ok: true, id, definition };
+  return { ok: true, id, definition, portable };
 }
 
-export function loadDefinitions(dir: string): LoadResult {
+// schemaPath defaults the same way validateDefinitionYaml does (see there);
+// pass an explicit one to scan a self-contained directory that carries its
+// own schema.json rather than validating everything in it against the
+// bundled one.
+export function loadDefinitions(dir: string, schemaPath: string = defaultSchemaPath()): LoadResult {
   const valid: LoadedDefinition[] = [];
   const invalid: RejectedDefinition[] = [];
 
@@ -98,13 +173,13 @@ export function loadDefinitions(dir: string): LoadResult {
       continue;
     }
 
-    const result = validateDefinitionYaml(raw);
+    const result = validateDefinitionYaml(raw, schemaPath);
     if (!result.ok) {
       invalid.push({ file, errors: result.errors });
       continue;
     }
 
-    valid.push({ file, id: result.id, definition: result.definition });
+    valid.push({ file, id: result.id, definition: result.definition, portable: result.portable });
   }
 
   return { valid, invalid };

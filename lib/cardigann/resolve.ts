@@ -18,6 +18,9 @@ export interface ResolvedDefinition {
   /** Human-readable origin, for logs/errors - a file path or a fetch URL. */
   from: string;
   definition: Record<string, unknown>;
+  /** true if valid against the schema exactly as it ships upstream - see
+   * load.ts's ValidatedYaml. */
+  portable: boolean;
 }
 
 export interface ResolveOptions {
@@ -94,9 +97,17 @@ export async function resolveDefinition(
   // deliberate "I'm overriding this" escape hatch (e.g. a definition whose
   // links[] are all dead upstream, edited locally while a PR is pending).
   let found: { from: string; raw: string } | null = null;
+  // A volume mount is a self-contained override directory: it must carry
+  // its own schema.json (no network fetch fallback - a missing schema
+  // fails this definition, loudly, rather than silently falling back to
+  // the bundled schema and risking a false pass/fail against the wrong
+  // upstream version). Definitions from source: or the bundled repo dir
+  // always validate against the bundled definitions/schema.json.
+  let fromVolume = false;
 
   if (opts.volumeDefinitionsDir) {
     found = readLocal(opts.volumeDefinitionsDir, definitionId);
+    if (found) fromVolume = true;
   }
 
   if (!found && source) {
@@ -112,7 +123,8 @@ export async function resolveDefinition(
     throw new Error(`definition "${definitionId}" not found (tried: ${tried.join(', ')})`);
   }
 
-  const result = validateDefinitionYaml(found.raw);
+  const schemaPath = fromVolume ? path.join(opts.volumeDefinitionsDir as string, 'schema.json') : undefined;
+  const result = schemaPath ? validateDefinitionYaml(found.raw, schemaPath) : validateDefinitionYaml(found.raw);
   if (!result.ok) {
     throw new Error(`${found.from}: ${result.errors.join('; ')}`);
   }
@@ -120,5 +132,5 @@ export async function resolveDefinition(
     throw new Error(`${found.from}: definition declares id "${result.id}", but was requested as "${definitionId}"`);
   }
 
-  return { definitionId, from: found.from, definition: result.definition };
+  return { definitionId, from: found.from, definition: result.definition, portable: result.portable };
 }

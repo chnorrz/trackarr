@@ -1,8 +1,9 @@
 #!/usr/bin/env node
 // tsc only compiles .ts to .js - it does not copy non-TS assets into dist.
-// lib/cardigann/schema.json is imported at runtime via a relative
-// fs.readFileSync from the compiled lib/cardigann/load.js, so it must exist
-// alongside it in dist too.
+// These are read at runtime via a relative fs.readFileSync from their
+// compiled lib/cardigann/*.js, so they must exist alongside it in dist too.
+// (definitions/schema.json is NOT here: it's read cwd-relative, same as the
+// .yml definition files it validates, so it never needs a dist copy.)
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -11,7 +12,7 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const root = path.resolve(__dirname, '..');
 
 const assets = [
-  ['lib/cardigann/schema.json', 'dist/lib/cardigann/schema.json'],
+  ['lib/cardigann/schema-extensions.json', 'dist/lib/cardigann/schema-extensions.json'],
   ['lib/cardigann/config-schema.json', 'dist/lib/cardigann/config-schema.json'],
   ['lib/cardigann/pins.json', 'dist/lib/cardigann/pins.json']
 ];
