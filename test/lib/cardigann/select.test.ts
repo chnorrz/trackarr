@@ -6,7 +6,7 @@ import { fileURLToPath } from 'node:url';
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.resolve(__dirname, '..', '..', '..');
 
-const { selectDomRows, selectJsonRows, resolveJsonPath } = await import(path.join(ROOT, 'dist', 'lib', 'cardigann', 'select.js'));
+const { selectDomRows, selectDocumentRow, selectJsonRows, resolveJsonPath } = await import(path.join(ROOT, 'dist', 'lib', 'cardigann', 'select.js'));
 
 // ---- HTML backend ----------------------------------------------------------
 
@@ -200,4 +200,27 @@ test('resolveJsonPath: a numeric field value is stringified for a text-selector 
   // string-based) work on it.
   const { rows } = selectJsonRows(JSON.stringify([{ seeders: 42 }]), { selector: '$' });
   assert.equal(rows[0].extract({ selector: 'seeders' }).raw, '42');
+});
+
+// ---- selectDocumentRow (search.vars) ----------------------------------------
+
+test('selectDocumentRow (HTML): reaches anywhere in the page, not just inside the results table', () => {
+  const body = `
+    <html><head><meta name="csrf-token" content="tok-abc"></head>
+    <body><table><tr class="row"><td class="title">Ubuntu</td></tr></table></body></html>
+  `;
+  const row = selectDocumentRow(body, undefined);
+  assert.equal(row.extract({ selector: 'meta[name=csrf-token]', attribute: 'content' }).raw, 'tok-abc');
+});
+
+test('selectDocumentRow (XML): xmlMode parses case-sensitive tags at the document root', () => {
+  const xml = '<Root><Token>tok-xml</Token><Items><Item><Title>Foo</Title></Item></Items></Root>';
+  const row = selectDocumentRow(xml, 'xml');
+  assert.equal(row.extract({ selector: 'Token' }).raw, 'tok-xml');
+});
+
+test('selectDocumentRow (JSON): inner and outer are both the parsed root value', () => {
+  const body = JSON.stringify({ token: 'tok-json', results: [{ title: 'A' }] });
+  const row = selectDocumentRow(body, 'json');
+  assert.equal(row.extract({ selector: 'token' }).raw, 'tok-json');
 });

@@ -71,6 +71,17 @@ test('nested or(eq, or(eq, eq)) - the wiki\'s own worked nesting example', () =>
   assert.equal(renderTemplate(tpl, baseCtx({ Result: { cat: 'tv' } })), '512 MB');
 });
 
+test('.Vars.* resolves search.vars, extracted once per response - a missing key is empty, like .Result', () => {
+  assert.equal(renderTemplate('{{ .Vars.token }}', baseCtx({ Vars: { token: 'abc123' } })), 'abc123');
+  assert.equal(renderTemplate('{{ .Vars.missing }}', baseCtx({ Vars: { token: 'abc123' } })), '');
+  assert.equal(renderTemplate('{{ .Vars.token }}', baseCtx()), '');
+});
+
+test('.Now resolves to whatever unix-seconds string the caller bound - not computed live by the template engine itself', () => {
+  assert.equal(renderTemplate('{{ .Now }}', baseCtx({ Now: '1700000000' })), '1700000000');
+  assert.equal(renderTemplate('{{ .Now }}', baseCtx()), '');
+});
+
 test('.True / .False special variables', () => {
   assert.equal(renderTemplate('{{ if .True }}yes{{ else }}no{{ end }}', baseCtx()), 'yes');
   assert.equal(renderTemplate('{{ if .False }}yes{{ else }}no{{ end }}', baseCtx()), 'no');

@@ -27,6 +27,12 @@ export interface TemplateContext {
   Config: Record<string, string>;
   Result: Record<string, string>;
   DownloadUri?: DownloadUri;
+  /** search.vars, extracted once per response (not once per row) - see engine.ts. Deliberately does not flow into download.ts's context (stays scoped to the search response, per design). */
+  Vars?: Record<string, string>;
+  /** Unix seconds, bound once by the caller (engine.ts) for a whole
+   * response - NOT computed live per-reference like .Today.Year, so a
+   * body's timestamp and a hash of that timestamp can't drift apart mid-request. */
+  Now?: string;
 }
 
 interface EvalContext extends TemplateContext {
@@ -276,6 +282,8 @@ function resolvePath(path: string, ctx: EvalContext): string {
   if (root === 'Categories') return ctx.Categories.join(',');
   if (root === 'Config') return ctx.Config[parts[1] ?? ''] ?? '';
   if (root === 'Result') return ctx.Result[parts[1] ?? ''] ?? '';
+  if (root === 'Vars') return ctx.Vars?.[parts[1] ?? ''] ?? '';
+  if (root === 'Now') return ctx.Now ?? '';
   if (root === 'Query') return ctx.Query[parts.slice(1).join('.')] ?? '';
   if (root === 'DownloadUri') {
     if (!ctx.DownloadUri) return '';

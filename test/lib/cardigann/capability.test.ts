@@ -85,6 +85,15 @@ test('checkCapability: an unsupported row filter is rejected using the RowFilter
   assert.match(reasons[0], /search\.rows\.filters/);
 });
 
+test('checkCapability: sha256/concat (trackarr-only extension filters) are accepted as field filters', () => {
+  const def = baseDefinition();
+  (def.search as { fields: Record<string, unknown> }).fields.title = {
+    selector: 'a',
+    filters: [{ name: 'concat', args: 'x' }, { name: 'sha256' }]
+  };
+  assert.deepEqual(checkCapability(def), []);
+});
+
 test('checkCapability: known row filters (andmatch, strdump) are accepted', () => {
   const def = baseDefinition();
   (def.search as Record<string, unknown>).rows = {

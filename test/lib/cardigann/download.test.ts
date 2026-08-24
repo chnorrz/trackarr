@@ -70,6 +70,39 @@ test('download.selectors[]: first matching selector wins, reading the default (n
   assert.equal(calls.length, 1);
 });
 
+test('download.headers is forwarded on the default-page fetch, multi-value entries joined per HTTP\'s combination rule', async () => {
+  const { fn, calls } = fakeFetch({
+    'https://example.test/t/3b': '<html><body><a href="magnet:?xt=urn:btih:CCC&dn=Y">dl</a></body></html>'
+  });
+  const definition = {
+    download: {
+      headers: { Cookie: ['a=1', 'b=2'], 'X-Requested-With': ['XMLHttpRequest'] },
+      selectors: [{ selector: 'a', attribute: 'href' }]
+    }
+  };
+  await resolveCardigannDownload({ definition, downloadUri: 'https://example.test/t/3b', itemTitle: 'Y', fetch: fn });
+  const call = calls[0] as { opts: { headers: Record<string, string> } };
+  assert.equal(call.opts.headers.Cookie, 'a=1, b=2');
+  assert.equal(call.opts.headers['X-Requested-With'], 'XMLHttpRequest');
+});
+
+test('download.headers is forwarded on before/pathselector fetches too, merged (not replaced) with the POST Content-Type', async () => {
+  const { fn, calls } = fakeFetch({
+    'https://example.test/get_srv_details2.php': '<html><body><a class="real" href="magnet:?xt=urn:btih:FFF&dn=V">m</a></body></html>'
+  });
+  const definition = {
+    download: {
+      headers: { 'X-Api-Key': ['secret'] },
+      before: { path: 'get_srv_details2.php', method: 'post', inputs: { action: 2 } },
+      selectors: [{ selector: 'a.real', attribute: 'href', usebeforeresponse: true }]
+    }
+  };
+  await resolveCardigannDownload({ definition, downloadUri: 'https://example.test/torrents-details2.php', itemTitle: 'V', fetch: fn });
+  const call = calls[0] as { opts: { headers: Record<string, string> } };
+  assert.equal(call.opts.headers['X-Api-Key'], 'secret');
+  assert.equal(call.opts.headers['Content-Type'], 'application/x-www-form-urlencoded');
+});
+
 test('download.selectors[] resolving to a non-magnet URL throws instead of silently returning it', async () => {
   const { fn } = fakeFetch({
     'https://example.test/t/4': '<html><body><a href="download.php?id=1" class="dl">dl</a></body></html>'
@@ -124,6 +157,15 @@ test('download.before with a pathselector: resolved against a fetch of the captu
   const result = await resolveCardigannDownload({ definition, downloadUri: 'https://example.test/details/5', itemTitle: 'W', fetch: fn });
   assert.equal(result, 'magnet:?xt=urn:btih:EEE&dn=W');
   assert.equal(calls.length, 2, 'one fetch for the pathselector source page, one for the resolved before target');
+});
+
+test('download.selectors[]: a "$"-prefixed selector reads the response as JSON instead of HTML', async () => {
+  const { fn } = fakeFetch({
+    'https://example.test/t/json': JSON.stringify({ download: { url: 'magnet:?xt=urn:btih:GGG&dn=J' } })
+  });
+  const definition = { download: { selectors: [{ selector: '$.download.url' }] } };
+  const result = await resolveCardigannDownload({ definition, downloadUri: 'https://example.test/t/json', itemTitle: 'J', fetch: fn });
+  assert.equal(result, 'magnet:?xt=urn:btih:GGG&dn=J');
 });
 
 test('download.infohash: builds a magnet from hash + title selectors, appending a fixed public tracker list', async () => {

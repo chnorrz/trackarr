@@ -2658,3 +2658,80 @@ fixtures updated to give their temp `definitionsDir` its own `schema.json`
 now that a volume mount requires one. Not yet exercised: the extended
 schema against a real definition that actually needs it (ext.to's own
 definition, not written yet) - only synthetic fixtures so far.
+
+## 23. Engine support for the trackarr-only extensions (phase 3 of the ext.to work)
+
+Six additions to `lib/cardigann/{select,template,engine,filters,capability,
+download}.ts`, each independently testable, none of it wired to a real
+definition yet:
+
+1. **`search.vars` -> `.Vars.*`.** New `selectDocumentRow(body, responseType)`
+   in `select.ts` builds a whole-document `Row` (HTML/XML: `cheerio.load(...)
+   .root()` as the element, so a selector reaches anywhere on the page, not
+   just inside the results table; JSON: the parsed root, inner===outer).
+   `engine.ts`'s `runSearchAll` extracts `search.vars` once per response
+   (not once per row) via this row, using the same `extractField()` machinery
+   as ordinary fields - reusing `topCtx` as extraction scratch space since
+   it isn't consulted again after preprocessing. The resulting
+   `Record<string,string>` is threaded into every row's own `TemplateContext`
+   as `.Vars`, alongside `.Result` (which stays per-row). Motivating case: a
+   page-level csrf/session token every row's download link needs, that
+   doesn't live inside any individual row's markup.
+
+2. **`sha256`/`concat` filters** (`filters.ts`). Not upstream Cardigann
+   filters - a trackarr-only pair added via `schema-extensions.json`'s enum
+   patch, for building HMAC-signed links (ext.to's own flow: `sha256(id|
+   timestamp|token)`). `concat(value, args)` inserts no separator of its own
+   - `{{ sha256 (concat .A "|" .B "|" .C) }}` needs no template-engine
+   change since it's just another `evalCall` dispatch; the pipes are literal
+   args the definition author supplies. `capability.ts`'s
+   `SUPPORTED_FIELD_FILTERS` gained both names - otherwise a definition using
+   them would validate (extended schema, `portable:false`) but then get
+   rejected at the separate runnability gate, which checks a different thing
+   (can trackarr execute this filter at all) than portability does.
+
+3. **`.Now`** (`template.ts`/`engine.ts`) - unix seconds, bound *once* by
+   `runSearchAll` and threaded through `topCtx` and every row's `ctx`,
+   deliberately not computed live inside `resolvePath()` the way
+   `.Today.Year` is. The reason: a body's timestamp field and a hash computed
+   from that same timestamp must read the same clock value, or an HMAC built
+   from `.Now` and a `{{ .Now }}` rendered elsewhere in the same row could
+   silently drift across a clock-second boundary mid-request.
+
+4. **`download.headers` now actually reaches the network.** The field
+   existed on `DownloadBlockDef` since the format was first modeled but was
+   never read anywhere. `flattenHeaders()` joins Cardigann's own multi-value
+   shape (`Record<string,string[]>`, e.g. repeated `Cookie`s) into the plain
+   `Record<string,string>` the `Fetcher` interface expects, applied to every
+   fetch a download resolution can make (`before`'s pathselector source page,
+   the before-target itself, and the default page) - merged ahead of, not
+   replacing, the hardcoded POST `Content-Type`.
+
+5. **`$`-prefixed download selectors read JSON.** The download block has no
+   `response.type` declaration the way `search` does, so a JSON API response
+   is detected from the selector string itself - `extractFromBody()` (renamed
+   from `extractFromHtml`) checks for a leading `$` and, if present,
+   `JSON.parse`s the body and resolves the path via `select.ts`'s exported
+   `resolveJsonPath`, the same function `search.rows`'s JSON backend uses -
+   rather than reimplementing JSON-path resolution a second time.
+
+6. Capability reporting stays coherent by construction, no extra code
+   needed: a definition using `sha256`/`concat` already fails strict-schema
+   validation and only passes the extended one (`load.ts`, phase 2), so it's
+   already labeled `portable:false` before `checkCapability()` ever runs -
+   the runnability gate and the portability label are two independent
+   mechanisms that happen to agree.
+
+### Verification
+
+Full gates pass: lint clean, typecheck clean, 309/309 tests (up from 294).
+New coverage across `select.test.ts` (`selectDocumentRow`, all three
+backends), `template.test.ts` (`.Vars`, `.Now`), `engine.test.ts`
+(`search.vars` end-to-end on HTML and JSON, `.Now` identical across every
+row in one response), `filters.test.ts` (`sha256`/`concat` against known
+test vectors, not a wiki example - these aren't upstream filters),
+`capability.test.ts` (both accepted as field filters), and
+`download.test.ts` (headers forwarded and joined correctly, merged not
+clobbering POST's Content-Type, a `$`-prefixed JSON selector). Still
+nothing here has run against a real site - that's phase 4 (writing and
+live-testing `definitions/ext-to.yml`), not started yet.

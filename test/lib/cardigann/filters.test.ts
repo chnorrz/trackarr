@@ -164,6 +164,19 @@ test('applyFilter: an unimplemented filter name throws rather than silently pass
   assert.throws(() => applyFilter('jsonjoinarray', undefined, 'x'), /unsupported filter/);
 });
 
+// sha256/concat are a trackarr-only extension, not upstream Cardigann
+// filters - see filters.ts's comment. Verified against known test vectors,
+// not a wiki example.
+test('sha256: hex digest of the input string', () => {
+  assert.equal(applyFilter('sha256', undefined, ''), 'e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855');
+  assert.equal(applyFilter('sha256', undefined, 'abc'), 'ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad');
+});
+
+test('concat: joins the piped-in value with its args, no implicit separator', () => {
+  assert.equal(applyFilter('concat', ['|', 'B', '|', 'C'], 'A'), 'A|B|C');
+  assert.equal(applyFilter('concat', 'B', 'A'), 'AB');
+});
+
 test('andMatch: true only when every keyword appears in the row text', () => {
   assert.equal(andMatch('The Matrix 1999 1080p BluRay', 'matrix 1999', undefined), true);
   assert.equal(andMatch('The Matrix Reloaded', 'matrix 1999', undefined), false);

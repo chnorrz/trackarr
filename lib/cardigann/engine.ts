@@ -1,7 +1,7 @@
 import { collectCategoryMappings } from './category-mapping.js';
 import { applyFilter, andMatch, type FilterArgs, type FilterSpec } from './filters.js';
 import { renderTemplate, type TemplateContext } from './template.js';
-import { selectDomRows, selectJsonRows, type Row, type SelectorSpec } from './select.js';
+import { selectDomRows, selectDocumentRow, selectJsonRows, type Row, type SelectorSpec } from './select.js';
 
 // No network I/O anywhere in this file, deliberately - everything here is a
 // pure function of (definition, an already-fetched response body, search
@@ -60,6 +60,9 @@ interface SearchBlock {
    * a bare <tr> soup in <table></table>, or (not implemented - jsonjoinarray
    * is capability-gated out) reshaping a JSON envelope. */
   preprocessingfilters?: FilterSpec[];
+  /** Extracted once per response (not once per row) into .Vars.* - e.g. a
+   * page-level csrf/session token that every row's download link needs. */
+  vars?: FieldsBlock;
 }
 
 function asRecord(v: unknown): Record<string, unknown> {
@@ -167,12 +170,18 @@ export function runSearchAll(definition: Record<string, unknown>, body: string, 
   const search = asRecord(definition.search) as unknown as SearchBlock;
   const responseType = search.response?.type;
 
+  // Bound once for the whole response, not read live per-reference - so a
+  // rendered timestamp field and a hash computed from that same timestamp
+  // (e.g. an HMAC) can't observe two different clock reads mid-request.
+  const now = String(Math.floor(Date.now() / 1000));
+
   const topCtx: TemplateContext = {
     Keywords: searchCtx.keywords,
     Query: searchCtx.query ?? {},
     Categories: searchCtx.categories,
     Config: searchCtx.config,
-    Result: {}
+    Result: {},
+    Now: now
   };
   const preprocessed = (search.preprocessingfilters ?? []).reduce(
     (v, f) => applyFilter(f.name, renderFilterArgs(f.args, topCtx), v),
@@ -185,6 +194,17 @@ export function runSearchAll(definition: Record<string, unknown>, body: string, 
       : { rows: selectDomRows(preprocessed, search.rows.selector, responseType === 'xml'), explicitNoResults: false };
 
   if (rowsResult.explicitNoResults) return [];
+
+  // Document-scoped, extracted once regardless of row count - topCtx.Result
+  // is reused as scratch space here (extractField writes to it) since
+  // topCtx isn't consulted again after this point.
+  const docVars: Record<string, string> = {};
+  if (search.vars) {
+    const docRow = selectDocumentRow(preprocessed, responseType);
+    for (const [name, spec] of Object.entries(search.vars)) {
+      docVars[name] = extractField(docRow, name, spec, topCtx);
+    }
+  }
 
   const items: CardigannItem[] = [];
 
@@ -210,7 +230,9 @@ export function runSearchAll(definition: Record<string, unknown>, body: string, 
       Query: searchCtx.query ?? {},
       Categories: searchCtx.categories,
       Config: searchCtx.config,
-      Result: {}
+      Result: {},
+      Vars: docVars,
+      Now: now
     };
 
     const fieldNames = Object.keys(search.fields);

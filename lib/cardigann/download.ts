@@ -1,6 +1,7 @@
 import * as cheerio from 'cheerio';
 import { applyFilters, type FilterSpec } from './filters.js';
 import { buildQueryString, type InputsBlock } from './inputs.js';
+import { resolveJsonPath } from './select.js';
 import { renderTemplate, type DownloadUri, type TemplateContext } from './template.js';
 
 // Resolves the wiki's "Download" section: when a listing doesn't already
@@ -71,9 +72,33 @@ function buildDownloadUri(url: string): DownloadUri {
   };
 }
 
-function extractFromHtml(html: string, spec: SimpleSelectorSpec): string {
+// DownloadBlockDef.headers is Record<string,string[]> (Cardigann's own
+// multi-value header shape, e.g. repeated Cookie values); Fetcher's opts
+// take a plain Record<string,string>, so multiple values for one name are
+// joined per HTTP's standard combination rule.
+function flattenHeaders(headers: Record<string, string[]> | undefined): Record<string, string> | undefined {
+  if (!headers) return undefined;
+  const flat: Record<string, string> = {};
+  for (const [key, values] of Object.entries(headers)) flat[key] = values.join(', ');
+  return flat;
+}
+
+// A "$"-prefixed selector means the download response is JSON, same
+// convention search.fields uses (select.ts's resolveJsonPath) - the download
+// block has no separate response.type declaration, so this is detected from
+// the selector itself rather than any surrounding config.
+function extractFromBody(body: string, spec: SimpleSelectorSpec): string {
   if (!spec.selector) return '';
-  const $ = cheerio.load(html);
+
+  if (spec.selector.startsWith('$')) {
+    const root: unknown = JSON.parse(body);
+    const value = resolveJsonPath(root, spec.selector);
+    if (value === undefined) return '';
+    const raw = typeof value === 'string' ? value : JSON.stringify(value);
+    return applyFilters(spec.filters, raw);
+  }
+
+  const $ = cheerio.load(body);
   const found = $(spec.selector).first();
   if (found.length === 0) return '';
   const raw = spec.attribute !== undefined ? (found.attr(spec.attribute) ?? '') : found.text().trim();
@@ -120,10 +145,12 @@ export async function resolveCardigannDownload(opts: ResolveOptions): Promise<st
     // to be a real page containing a magnet, same fallback our hand-written
     // providers (ext-to/1337x/eztv) all use on their detail pages.
     const html = await opts.fetch(opts.downloadUri);
-    const magnet = extractFromHtml(html, { selector: 'a[href^="magnet:"]', attribute: 'href' });
+    const magnet = extractFromBody(html, { selector: 'a[href^="magnet:"]', attribute: 'href' });
     if (magnet) return magnet;
     throw new Error(`Cardigann: no download block and no magnet link found on ${opts.downloadUri}`);
   }
+
+  const headers = flattenHeaders(download.headers);
 
   let beforeResponseBody: string | undefined;
 
@@ -132,8 +159,8 @@ export async function resolveCardigannDownload(opts: ResolveOptions): Promise<st
     if (!beforePath && download.before.pathselector) {
       // The wiki's own "thankyou link" example: the pathselector's source
       // page is the item's captured download/detail page, fetched fresh.
-      const sourceHtml = await opts.fetch(opts.downloadUri);
-      beforePath = extractFromHtml(sourceHtml, download.before.pathselector);
+      const sourceHtml = await opts.fetch(opts.downloadUri, headers ? { headers } : undefined);
+      beforePath = extractFromBody(sourceHtml, download.before.pathselector);
     }
     if (!beforePath) {
       throw new Error(`Cardigann: download.before resolved to no path for ${opts.downloadUri}`);
@@ -146,11 +173,11 @@ export async function resolveCardigannDownload(opts: ResolveOptions): Promise<st
 
     if (method === 'GET') {
       if (qs) beforeUrl.search = beforeUrl.search ? `${beforeUrl.search}&${qs}` : qs;
-      beforeResponseBody = await opts.fetch(beforeUrl.toString());
+      beforeResponseBody = await opts.fetch(beforeUrl.toString(), headers ? { headers } : undefined);
     } else {
       beforeResponseBody = await opts.fetch(beforeUrl.toString(), {
         method,
-        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+        headers: { ...headers, 'Content-Type': 'application/x-www-form-urlencoded' },
         body: qs
       });
     }
@@ -162,13 +189,13 @@ export async function resolveCardigannDownload(opts: ResolveOptions): Promise<st
       if (beforeResponseBody === undefined) throw new Error('Cardigann: usebeforeresponse:true but no download.before block ran');
       return beforeResponseBody;
     }
-    if (defaultResponseBody === undefined) defaultResponseBody = await opts.fetch(opts.downloadUri);
+    if (defaultResponseBody === undefined) defaultResponseBody = await opts.fetch(opts.downloadUri, headers ? { headers } : undefined);
     return defaultResponseBody;
   };
 
   for (const selector of download.selectors ?? []) {
     const html = await bodyFor(selector.usebeforeresponse);
-    const resolved = extractFromHtml(html, selector);
+    const resolved = extractFromBody(html, selector);
     if (!resolved) continue;
     if (resolved.startsWith('magnet:')) return resolved;
     throw new Error(
@@ -178,9 +205,9 @@ export async function resolveCardigannDownload(opts: ResolveOptions): Promise<st
 
   if (download.infohash) {
     const html = await bodyFor(download.infohash.usebeforeresponse);
-    const hash = extractFromHtml(html, download.infohash.hash);
+    const hash = extractFromBody(html, download.infohash.hash);
     if (!hash) throw new Error(`Cardigann: download.infohash.hash did not match on ${opts.downloadUri}`);
-    const title = extractFromHtml(html, download.infohash.title) || opts.itemTitle;
+    const title = extractFromBody(html, download.infohash.title) || opts.itemTitle;
     return buildMagnetFromInfohash(hash, title);
   }
 

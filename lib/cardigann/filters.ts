@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto';
 import * as cheerio from 'cheerio';
 import { formatRFC1123, parseWithFormat } from './date-format.js';
 import { parseFuzzyTime, parseTimeAgo } from './relative-time.js';
@@ -7,6 +8,12 @@ import { parseFuzzyTime, parseTimeAgo } from './relative-time.js';
 // transcribed from wiki.servarr.com/prowlarr/cardigann-yml-definition
 // ("Filters" section) - each filter's test asserts its own wiki example,
 // which is the closest thing to a spec this format has.
+//
+// sha256/concat below are NOT upstream Cardigann filters - they're a
+// trackarr-only extension (lib/cardigann/schema-extensions.json adds them to
+// FilterBlock's name enum), for building HMAC-signed download links like
+// ext.to's. A definition using either validates only under the extended
+// schema (load.ts's `portable: false`).
 export type FilterArgs = string | number | string[] | undefined;
 
 function toStringArg(args: FilterArgs): string {
@@ -128,6 +135,16 @@ function strdump(value: string, args: FilterArgs): string {
   return value;
 }
 
+function sha256(value: string): string {
+  return createHash('sha256').update(value).digest('hex');
+}
+
+// No separator is inserted - callers pass any needed separators as their own
+// literal args, e.g. {{ sha256 (concat .A "|" .B "|" .C) }}.
+function concat(value: string, args: FilterArgs): string {
+  return value + toArgsArray(args).join('');
+}
+
 type FilterFn = (value: string, args: FilterArgs) => string;
 
 const FILTERS: Record<string, FilterFn> = {
@@ -154,7 +171,9 @@ const FILTERS: Record<string, FilterFn> = {
   validfilename,
   diacritics,
   hexdump,
-  strdump
+  strdump,
+  sha256,
+  concat
 };
 
 export interface FilterSpec {

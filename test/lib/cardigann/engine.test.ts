@@ -172,6 +172,46 @@ test('runSearch (HTML): a row that fails to match at all is simply excluded, not
   assert.deepEqual(items, []);
 });
 
+// ---- search.vars (.Vars.*) --------------------------------------------------
+
+test('runSearch (HTML): search.vars is extracted once per response, from anywhere in the page, and reused by every row', () => {
+  const def = minimalHtmlDefinition();
+  (def.search as Record<string, unknown>).vars = { token: { selector: 'meta[name=csrf-token]', attribute: 'content' } };
+  (def.search.fields as Record<string, unknown>).description = { text: 'token={{ .Vars.token }}' };
+  const body = `<html><head><meta name="csrf-token" content="page-tok"></head><body>${HTML_BODY}</body></html>`;
+  const items = runSearch(def, body, baseSearchCtx());
+  assert.equal(items.length, 2);
+  assert.equal(items[0].description, 'token=page-tok');
+  assert.equal(items[1].description, 'token=page-tok');
+});
+
+test('runSearch (HTML): a var with no match and no default resolves to empty, not an error', () => {
+  const def = minimalHtmlDefinition();
+  (def.search as Record<string, unknown>).vars = { token: { selector: 'meta[name=nonexistent]', attribute: 'content' } };
+  (def.search.fields as Record<string, unknown>).description = { text: 'token=[{{ .Vars.token }}]' };
+  const items = runSearch(def, HTML_BODY, baseSearchCtx());
+  assert.equal(items[0].description, 'token=[]');
+});
+
+test('runSearch (HTML): .Now is bound once per response - every row sees the exact same value', () => {
+  const def = minimalHtmlDefinition();
+  (def.search.fields as Record<string, unknown>).description = { text: '{{ .Now }}' };
+  const items = runSearch(def, HTML_BODY, baseSearchCtx());
+  assert.equal(items.length, 2);
+  assert.match(items[0].description as string, /^\d+$/);
+  assert.equal(items[0].description, items[1].description);
+});
+
+test('runSearch (JSON): search.vars reads from the parsed root, alongside the row array', () => {
+  const def = minimalJsonDefinition();
+  (def.search as Record<string, unknown>).vars = { token: { selector: 'meta.token' } };
+  (def.search.fields as Record<string, unknown>).details = { text: '{{ .Vars.token }}/{{ .Result._id }}' };
+  const body = JSON.stringify({ meta: { token: 'json-tok' }, results: JSON.parse(JSON_BODY) });
+  (def.search.rows as Record<string, unknown>).selector = 'results';
+  const items = runSearch(def, body, baseSearchCtx());
+  assert.equal(items[0].detailUrl, 'json-tok/42');
+});
+
 // ---- JSON backend, synthetic minimal definition -----------------------------
 
 function minimalJsonDefinition() {

@@ -91,6 +91,22 @@ export function selectDomRows(body: string, rowsSelector: string, xmlMode: boole
     .map((el) => new DomRow($, el, kind));
 }
 
+// A whole-document "row" - used for search.vars, which are extracted once
+// per response (not once per result row) via the same SelectorSpec/Row
+// mechanism the per-row fields use. HTML/XML: the document root, so a
+// selector reaches anywhere in the page (e.g. a page-level csrf token
+// outside the results table). JSON: the parsed root value, inner===outer
+// since there's no outer/inner distinction without a rows.attribute.
+export function selectDocumentRow(body: string, responseType: 'json' | 'xml' | undefined): Row {
+  if (responseType === 'json') {
+    const root: unknown = JSON.parse(body);
+    return new JsonRow(root, root);
+  }
+  const xmlMode = responseType === 'xml';
+  const $ = cheerio.load(body, { xmlMode });
+  return new DomRow($, $.root()[0] as AnyNode, xmlMode ? 'xml' : 'html');
+}
+
 // ---------------------------------------------------------------------------
 // JSON backend. Cardigann's JSON selectors are dot-paths (with a leading "$"
 // for the document root) whose segments can carry :has()/:not()/:contains()
