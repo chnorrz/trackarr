@@ -1,0 +1,126 @@
+---
+id: ext-to
+name: ext.to
+description: "ext.to is a Public torrent index for MOVIES / TV / MUSIC / GAMES / APPLICATIONS / BOOKS"
+language: en-US
+type: public
+encoding: UTF-8
+links:
+  - https://ext.to/
+
+caps:
+  categorymappings:
+    # The schema allows exactly one of category/categorydesc per definition
+    # (oneOf), so there's no separate fallback field - the category field's
+    # own regexp filter (below) does both jobs in one pass: return the full
+    # href for these six distinguished subcategories, else collapse to the
+    # bare top-level href. Matches providers/ext-to.ts's CATEGORY_RULES
+    # exactly (verified against all its category-classification tests).
+    - {id: "/books/audio-books/", cat: Audio/Audiobook}
+    - {id: "/books/ebooks/", cat: Books/EBook}
+    - {id: "/games/pc-games/", cat: PC/Games}
+    - {id: "/games/other-games/", cat: Console/Other}
+    - {id: "/applications/mac/", cat: PC/Mac}
+    - {id: "/applications/android/", cat: PC/Mobile-Android}
+    # Every other row collapses to its bare top-level href.
+    - {id: "/movies/", cat: Movies}
+    - {id: "/tv/", cat: TV}
+    - {id: "/anime/", cat: TV/Anime}
+    - {id: "/music/", cat: Audio}
+    - {id: "/books/", cat: Books}
+    - {id: "/games/", cat: PC/Games}
+    - {id: "/applications/", cat: PC}
+
+  modes:
+    search: [q]
+    tv-search: [q]
+    movie-search: [q]
+    music-search: [q]
+    book-search: [q]
+
+settings:
+  - name: info_flaresolverr
+    type: info_flaresolverr
+
+search:
+  paths:
+    - path: "browse/?{{ if .Keywords }}q={{ .Keywords }}{{ else }}sort=age&order=desc&age=4{{ end }}&page_size=100&page=1"
+    - path: "browse/?{{ if .Keywords }}q={{ .Keywords }}{{ else }}sort=age&order=desc&age=4{{ end }}&page_size=100&page=2"
+
+  rows:
+    selector: table.search-table > tbody > tr
+
+  fields:
+    # Takes the row's most-specific category link, then collapses it down to
+    # a known categorymappings id: kept as-is for the six distinguished
+    # subcategories, else truncated to just the leading /segment/.
+    category:
+      selector: '.related-posted a[href^="/"]:not([href^="/user/"]):last'
+      attribute: href
+      filters:
+        - name: regexp
+          args: "^(/books/audio-books/|/books/ebooks/|/games/pc-games/|/games/other-games/|/applications/mac/|/applications/android/|/[^/]+/)"
+    title:
+      selector: a.torrent-title-link
+    details:
+      selector: a.torrent-title-link
+      attribute: href
+    # No distinct per-item download link exists (magnets are resolved via a
+    # signed AJAX POST, below) - reusing the item's own permalink here only
+    # satisfies the schema's anyOf(download|infohash|magnet); the download:
+    # block does the real work.
+    download:
+      selector: a.torrent-title-link
+      attribute: href
+    size:
+      selector: "td:nth-child(2) span:last-child"
+    date:
+      selector: "td:nth-child(4) span:last-child"
+      attribute: title
+    seeders:
+      selector: "td:nth-child(5) span:last-child"
+    leechers:
+      selector: "td:nth-child(6) span:last-child"
+    downloadvolumefactor:
+      text: 0
+    uploadvolumefactor:
+      text: 1
+
+# The listing row carries no magnet, no thankyou link, nothing beyond a
+# data-id button - the real magnet comes from an HMAC-signed AJAX POST
+# (providers/ext-to.ts:175-217, ported here). torrent_id isn't available as
+# a template variable at download time (nothing from search.fields survives
+# into the download block - see NOTES.md); it's re-derived from the
+# permalink's own URL slug instead (".../<title>-<id>/"), which is the only
+# per-item value download.ts's context carries forward.
+#
+# UNVERIFIED against the live site (see NOTES.md, phase 4 live-test): (a)
+# that the item's own permalink page carries the same window.searchPageToken
+# / csrf-token meta the search listing does, and (b) whether the AJAX
+# endpoint tolerates hash/name sent empty-but-present vs. requiring them.
+download:
+  headers:
+    X-Requested-With: [XMLHttpRequest]
+  before:
+    path: "{{ .Config.sitelink }}ajax/getSearchMagnet.php"
+    method: post
+    allowEmptyInputs: true
+    vars:
+      token:
+        selector: 'script:contains("searchPageToken")'
+        filters:
+          - name: regexp
+            args: "searchPageToken\\s*=\\s*'([^']+)'"
+      sessid:
+        selector: 'meta[name="csrf-token"]'
+        attribute: content
+    inputs:
+      torrent_id: "{{ regexp .DownloadUri.AbsolutePath \"-([0-9]+)/?$\" }}"
+      hash: ""
+      name: ""
+      timestamp: "{{ .Now }}"
+      hmac: "{{ sha256 (concat (regexp .DownloadUri.AbsolutePath \"-([0-9]+)/?$\") \"|\" .Now \"|\" .Vars.token) }}"
+      sessid: "{{ .Vars.sessid }}"
+  selectors:
+    - selector: "$.url"
+      usebeforeresponse: true

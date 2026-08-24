@@ -159,6 +159,101 @@ test('download.before with a pathselector: resolved against a fetch of the captu
   assert.equal(calls.length, 2, 'one fetch for the pathselector source page, one for the resolved before target');
 });
 
+test('download.before.vars extracts named values from the item\'s own page, usable in this same before block\'s path/inputs templates', async () => {
+  const { fn, calls } = fakeFetch({
+    'https://example.test/torrent/9': '<html><head><meta name="csrf-token" content="tok-abc"></head><body></body></html>',
+    'https://example.test/ajax/magnet.php': JSON.stringify({ url: 'magnet:?xt=urn:btih:HHH&dn=N' })
+  });
+  const definition = {
+    download: {
+      before: {
+        path: 'https://example.test/ajax/magnet.php',
+        method: 'post',
+        vars: { sessid: { selector: 'meta[name="csrf-token"]', attribute: 'content' } },
+        inputs: { sessid: '{{ .Vars.sessid }}' }
+      },
+      selectors: [{ selector: '$.url', usebeforeresponse: true }]
+    }
+  };
+  const result = await resolveCardigannDownload({ definition, downloadUri: 'https://example.test/torrent/9', itemTitle: 'N', fetch: fn });
+  assert.equal(result, 'magnet:?xt=urn:btih:HHH&dn=N');
+  assert.equal(calls.length, 2, 'one fetch of the item\'s own page for vars, one POST to the fixed before.path');
+  const postCall = calls[1] as { url: string; opts: { method: string; body: string } };
+  assert.equal(postCall.url, 'https://example.test/ajax/magnet.php');
+  assert.equal(postCall.opts.body, 'sessid=tok-abc');
+});
+
+test('download.before.vars: missing values resolve empty, same as any other unmatched selector', async () => {
+  const { fn } = fakeFetch({
+    'https://example.test/torrent/9b': '<html><head></head><body></body></html>',
+    'https://example.test/ajax/magnet2.php': JSON.stringify({ url: 'magnet:?xt=urn:btih:III&dn=M' })
+  });
+  const definition = {
+    download: {
+      before: {
+        path: 'https://example.test/ajax/magnet2.php',
+        method: 'post',
+        vars: { sessid: { selector: 'meta[name="csrf-token"]', attribute: 'content' } },
+        inputs: { sessid: '{{ .Vars.sessid }}' }
+      },
+      selectors: [{ selector: '$.url', usebeforeresponse: true }]
+    }
+  };
+  const result = await resolveCardigannDownload({ definition, downloadUri: 'https://example.test/torrent/9b', itemTitle: 'M', fetch: fn });
+  assert.equal(result, 'magnet:?xt=urn:btih:III&dn=M');
+});
+
+test('download.before.allowEmptyInputs keeps empty-valued inputs in the request instead of dropping them', async () => {
+  const { fn, calls } = fakeFetch({
+    'https://example.test/ajax/magnet3.php': JSON.stringify({ url: 'magnet:?xt=urn:btih:JJJ&dn=P' })
+  });
+  const definition = {
+    download: {
+      before: {
+        path: 'https://example.test/ajax/magnet3.php',
+        method: 'post',
+        allowEmptyInputs: true,
+        inputs: { hash: '', name: '', id: '5' }
+      },
+      selectors: [{ selector: '$.url', usebeforeresponse: true }]
+    }
+  };
+  const result = await resolveCardigannDownload({ definition, downloadUri: 'https://example.test/torrent/10', itemTitle: 'P', fetch: fn });
+  assert.equal(result, 'magnet:?xt=urn:btih:JJJ&dn=P');
+  const call = calls[0] as { opts: { body: string } };
+  assert.equal(call.opts.body, 'hash=&name=&id=5');
+});
+
+test('download.before without allowEmptyInputs drops empty-valued inputs (inputs.ts\'s existing default)', async () => {
+  const { fn, calls } = fakeFetch({
+    'https://example.test/ajax/magnet4.php': JSON.stringify({ url: 'magnet:?xt=urn:btih:KKK&dn=Q' })
+  });
+  const definition = {
+    download: {
+      before: { path: 'https://example.test/ajax/magnet4.php', method: 'post', inputs: { hash: '', id: '5' } },
+      selectors: [{ selector: '$.url', usebeforeresponse: true }]
+    }
+  };
+  await resolveCardigannDownload({ definition, downloadUri: 'https://example.test/torrent/11', itemTitle: 'Q', fetch: fn });
+  const call = calls[0] as { opts: { body: string } };
+  assert.equal(call.opts.body, 'id=5');
+});
+
+test('.Now is available inside download.before templates, freshly bound per call', async () => {
+  const { fn, calls } = fakeFetch({
+    'https://example.test/ajax/magnet5.php': JSON.stringify({ url: 'magnet:?xt=urn:btih:LLL&dn=R' })
+  });
+  const definition = {
+    download: {
+      before: { path: 'https://example.test/ajax/magnet5.php', method: 'post', inputs: { timestamp: '{{ .Now }}' } },
+      selectors: [{ selector: '$.url', usebeforeresponse: true }]
+    }
+  };
+  await resolveCardigannDownload({ definition, downloadUri: 'https://example.test/torrent/12', itemTitle: 'R', fetch: fn });
+  const call = calls[0] as { opts: { body: string } };
+  assert.match(call.opts.body, /^timestamp=\d+$/);
+});
+
 test('download.selectors[]: a "$"-prefixed selector reads the response as JSON instead of HTML', async () => {
   const { fn } = fakeFetch({
     'https://example.test/t/json': JSON.stringify({ download: { url: 'magnet:?xt=urn:btih:GGG&dn=J' } })

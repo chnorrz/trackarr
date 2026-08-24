@@ -2735,3 +2735,89 @@ test vectors, not a wiki example - these aren't upstream filters),
 clobbering POST's Content-Type, a `$`-prefixed JSON selector). Still
 nothing here has run against a real site - that's phase 4 (writing and
 live-testing `definitions/ext-to.yml`), not started yet.
+
+## 24. `definitions/ext-to.yml` - a real, non-portable definition (phase 4, part 1)
+
+Writing this definition surfaced two gaps section 23's engine work didn't
+anticipate, both closed before the YAML could be written:
+
+**`extractField`/`renderFilterArgs` factored out of `engine.ts` into a new
+`lib/cardigann/extract.ts`.** Was private to `engine.ts`; `download.ts` needed
+the exact same "run a selector spec against a `Row`, apply its filters,
+render into the template context" logic for the addition below, and
+duplicating it would let the two drift. `engine.ts`'s own behavior is
+unchanged - it now imports the same functions it used to define locally.
+
+**`download.before.vars`, mirroring `search.vars`, plus `.Now` threaded into
+`download.ts`'s context (`before.vars`, `download.ts`).** ext.to's magnet
+comes from an HMAC-signed AJAX POST (`providers/ext-to.ts:175-217`): fetch a
+page, scrape a page-level token, POST `sha256(id|timestamp|token)`. Nothing
+in `download.ts` could extract a *named* value from a fetched page before
+this - `before.pathselector` extracts one string used as the *next URL*,
+nothing more. `before.vars` fetches `opts.downloadUri` (the item's own page;
+shared with `pathselector`'s existing source-page fetch when both are
+declared) via the new `selectDocumentRow`-based extraction, exposing the
+result as `.Vars.*` inside that *same* before block's `path`/`inputs`
+templates. Each `resolveCardigannDownload` call re-fetches and re-extracts
+independently - nothing carries over from `search.vars` or between calls,
+same statelessness `search.vars` already committed to.
+
+**`download.before.allowEmptyInputs`**, forwarded to `inputs.ts`'s existing
+`buildQueryString` (which already supported it - `download.ts` just never
+passed it through). Cardigann's default is to drop a key whose rendered
+value is empty; the real POST body sends `hash=` and `name=` present-but-
+empty, which the API's tolerance for is unverified either way.
+
+Both are schema-patched onto `BeforeBlock` in `schema-extensions.json`,
+trackarr-only like everything else there.
+
+**Category mapping hit a real schema constraint**: `FieldsBlock`'s
+`oneOf: [{required:[category]}, {required:[categorydesc]}]` means exactly
+one of the two fields, never both - so the two-field "precise href, else
+fall back to a text description" design this note's first draft used is
+invalid; `validate:definitions` caught it immediately (`/search/fields must
+match exactly one schema in oneOf`). Fixed with a single `category` field:
+selector takes the row's most specific `.related-posted` link (`:last`),
+then one `regexp` filter alternation does what the fallback would have -
+`^(/books/audio-books/|/books/ebooks/|/games/pc-games/|/games/other-games/
+|/applications/mac/|/applications/android/|/[^/]+/)` matches one of the six
+literal subcategory paths `providers/ext-to.ts`'s `CATEGORY_RULES`
+distinguishes and returns it whole, or falls through to the generic
+`/[^/]+/` alternative and returns just the leading segment - collapsing
+every other subcategory (Movies/Highres, TV/Episodes HD, Books/Comics, ...)
+to its parent, exactly like the hand-written provider's own substring-match
+fallback. Verified by running the built `engine.ts` against the real
+`test/fixtures/ext-to-search.html` fixture and against
+`test/providers/ext-to.test.ts`'s six synthetic subcategory rows
+(audiobooks/ebooks/pc-games/other-games/mac/android) - every category,
+size, seed/leech count and pubDate year matched the hand-written provider's
+own test expectations exactly.
+
+**Torrent id at download time**: `resolveCardigannDownload`'s context never
+carried anything from `search.fields` forward (by design - see above), so
+`torrent_id` can't come from the row's own `data-id` attribute the way
+`providers/ext-to.ts` reads it. It's re-derived instead from the item's own
+permalink, which embeds it as the URL slug's trailing number
+(`.../<title>-<id>/`): `{{ regexp .DownloadUri.AbsolutePath "-([0-9]+)/?$" }}`,
+using the `.DownloadUri` context `download.ts` already builds from
+`opts.downloadUri`. Used twice (once for `torrent_id` itself, once inside
+the `hmac` input's `concat`) since the template engine has no local variable
+binding outside `range` - a small, commented duplication rather than more
+engine surface for one call site.
+
+Verified end-to-end (not just schema-valid) with one-off scripts run against
+the built `dist/`: `runSearch()` against the real search fixture reproduces
+every field `test/providers/ext-to.test.ts` asserts (title, size, seeds,
+leechers, category, pubDate year) for all four rows; `resolveCardigannDownload()`
+against a synthetic detail page reproduces the exact HMAC
+`providers/ext-to.ts`'s `computeHMAC` would compute for the same torrent id/
+timestamp/token, with `hash`/`name` present-but-empty in the POST body.
+
+**Still unverified against the live site** (unchanged from earlier
+planning): whether the item's own permalink page carries the same
+`window.searchPageToken`/csrf-token meta the search listing does, and
+whether the API cares about `hash`/`name` being present-but-empty vs.
+absent. Both are exactly what live-testing (phase 4, part 2 - not done in
+this session) exists to answer. `providers/ext-to.ts` is untouched; nothing
+wires `ext-to.yml` into a running server yet, and nothing in `config/`
+references it.

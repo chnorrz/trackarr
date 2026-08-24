@@ -1,7 +1,8 @@
 import * as cheerio from 'cheerio';
+import { extractField, type FieldsBlock } from './extract.js';
 import { applyFilters, type FilterSpec } from './filters.js';
 import { buildQueryString, type InputsBlock } from './inputs.js';
-import { resolveJsonPath } from './select.js';
+import { resolveJsonPath, selectDocumentRow } from './select.js';
 import { renderTemplate, type DownloadUri, type TemplateContext } from './template.js';
 
 // Resolves the wiki's "Download" section: when a listing doesn't already
@@ -26,6 +27,16 @@ export interface BeforeBlock {
   method?: string;
   inputs?: InputsBlock;
   queryseparator?: string;
+  /** Extracted once from the item's own page (opts.downloadUri, fetched
+   * fresh on this call - not carried over from search.vars, which stays
+   * scoped to the search response) into .Vars.*, for use inside this same
+   * before block's path/inputs templates - e.g. a page-level csrf token
+   * needed to sign a POST body. Trackarr-only; not a wiki-documented field. */
+  vars?: FieldsBlock;
+  /** Forwarded to inputs.ts's buildQueryString - by default an input whose
+   * rendered value is empty is dropped from the request entirely; some APIs
+   * require the key present-but-empty instead. Trackarr-only. */
+  allowEmptyInputs?: boolean;
 }
 
 export interface InfoHashBlock {
@@ -131,13 +142,17 @@ export async function resolveCardigannDownload(opts: ResolveOptions): Promise<st
 
   const download = (opts.definition.download as DownloadBlockDef | undefined) ?? undefined;
   const downloadUriCtx = buildDownloadUri(opts.downloadUri);
+  // Bound once per call, not carried over from any earlier search response -
+  // each resolveCardigannDownload call is its own fresh grab.
+  const now = String(Math.floor(Date.now() / 1000));
   const ctx: TemplateContext = {
     Keywords: '',
     Query: {},
     Categories: [],
     Config: {},
     Result: { title: opts.itemTitle },
-    DownloadUri: downloadUriCtx
+    DownloadUri: downloadUriCtx,
+    Now: now
   };
 
   if (!download) {
@@ -156,11 +171,25 @@ export async function resolveCardigannDownload(opts: ResolveOptions): Promise<st
 
   if (download.before) {
     let beforePath = download.before.path;
-    if (!beforePath && download.before.pathselector) {
-      // The wiki's own "thankyou link" example: the pathselector's source
-      // page is the item's captured download/detail page, fetched fresh.
+
+    // A source-page fetch happens if pathselector needs it (the wiki's own
+    // "thankyou link" example: the next path is scraped off the item's own
+    // page) and/or if vars are declared (a page-level token needed inside
+    // this same before block's path/inputs templates) - one fetch covers
+    // both needs when a definition uses them together.
+    if ((!beforePath && download.before.pathselector) || download.before.vars) {
       const sourceHtml = await opts.fetch(opts.downloadUri, headers ? { headers } : undefined);
-      beforePath = extractFromBody(sourceHtml, download.before.pathselector);
+      if (!beforePath && download.before.pathselector) {
+        beforePath = extractFromBody(sourceHtml, download.before.pathselector);
+      }
+      if (download.before.vars) {
+        const docRow = selectDocumentRow(sourceHtml, undefined);
+        const docVars: Record<string, string> = {};
+        for (const [name, spec] of Object.entries(download.before.vars)) {
+          docVars[name] = extractField(docRow, name, spec, ctx);
+        }
+        ctx.Vars = docVars;
+      }
     }
     if (!beforePath) {
       throw new Error(`Cardigann: download.before resolved to no path for ${opts.downloadUri}`);
@@ -168,7 +197,10 @@ export async function resolveCardigannDownload(opts: ResolveOptions): Promise<st
 
     const method = (download.before.method ?? 'get').toUpperCase();
     const renderedPath = renderTemplate(beforePath, ctx);
-    const qs = buildQueryString(download.before.inputs, ctx, { queryseparator: download.before.queryseparator });
+    const qs = buildQueryString(download.before.inputs, ctx, {
+      queryseparator: download.before.queryseparator,
+      allowEmptyInputs: download.before.allowEmptyInputs
+    });
     const beforeUrl = new URL(renderedPath, opts.downloadUri);
 
     if (method === 'GET') {

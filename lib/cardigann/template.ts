@@ -27,7 +27,10 @@ export interface TemplateContext {
   Config: Record<string, string>;
   Result: Record<string, string>;
   DownloadUri?: DownloadUri;
-  /** search.vars, extracted once per response (not once per row) - see engine.ts. Deliberately does not flow into download.ts's context (stays scoped to the search response, per design). */
+  /** Populated from either search.vars (engine.ts, once per search response)
+   * or download.before.vars (download.ts, once per grab call) - never both,
+   * and never carried from one into the other: each is extracted fresh from
+   * its own response, by design (see NOTES.md). */
   Vars?: Record<string, string>;
   /** Unix seconds, bound once by the caller (engine.ts) for a whole
    * response - NOT computed live per-reference like .Today.Year, so a

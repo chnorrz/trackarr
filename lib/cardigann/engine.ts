@@ -1,7 +1,8 @@
 import { collectCategoryMappings } from './category-mapping.js';
-import { applyFilter, andMatch, type FilterArgs, type FilterSpec } from './filters.js';
-import { renderTemplate, type TemplateContext } from './template.js';
-import { selectDomRows, selectDocumentRow, selectJsonRows, type Row, type SelectorSpec } from './select.js';
+import { applyFilter, andMatch, type FilterSpec } from './filters.js';
+import { extractField, renderFilterArgs, type FieldSpec, type FieldsBlock } from './extract.js';
+import type { TemplateContext } from './template.js';
+import { selectDomRows, selectDocumentRow, selectJsonRows } from './select.js';
 
 // No network I/O anywhere in this file, deliberately - everything here is a
 // pure function of (definition, an already-fetched response body, search
@@ -37,10 +38,6 @@ export interface CardigannItem {
   imdbid?: string;
 }
 
-interface FieldsBlock {
-  [name: string]: SelectorSpec & { filters?: FilterSpec[] };
-}
-
 interface RowsBlock {
   selector: string;
   filters?: FilterSpec[];
@@ -67,50 +64,6 @@ interface SearchBlock {
 
 function asRecord(v: unknown): Record<string, unknown> {
   return v !== null && typeof v === 'object' ? (v as Record<string, unknown>) : {};
-}
-
-// text:/default: values are author-written templates and must be rendered;
-// selector/attribute/case-extracted values are real scraped content and
-// must NOT be (a title could coincidentally contain literal "{{").
-function renderFilterArgs(args: FilterArgs, ctx: TemplateContext): FilterArgs {
-  if (args === undefined) return undefined;
-  if (Array.isArray(args)) return args.map((a) => renderTemplate(a, ctx));
-  return renderTemplate(String(args), ctx);
-}
-
-function extractField(row: Row, name: string, spec: SelectorSpec & { filters?: FilterSpec[] }, ctx: TemplateContext): string {
-  const result = row.extract(spec);
-
-  let value: string;
-  if (!result.matched) {
-    value = spec.optional && spec.default !== undefined ? renderTemplate(spec.default, ctx) : '';
-  } else if (spec.text !== undefined) {
-    // A case match also flows through here when spec.case was used and
-    // matched (select.ts returns matched:true with the case's own literal
-    // value as `raw`) - case values are NOT templates and must not be
-    // re-rendered, so this branch is guarded to text: specifically, not
-    // "matched && has no selector".
-    value = spec.case ? result.raw : renderTemplate(spec.text, ctx);
-  } else if (spec.case) {
-    value = result.raw; // case's resolved literal - not a template
-  } else {
-    value = result.raw; // scraped content - not a template
-  }
-
-  // "Processing ends after the first case selector matches" (wiki) - a
-  // case-resolved value skips the filter chain entirely.
-  if (spec.case && result.matched) {
-    ctx.Result[name] = value;
-    return value;
-  }
-
-  const filtered = (spec.filters ?? []).reduce(
-    (v, f) => applyFilter(f.name, renderFilterArgs(f.args, ctx), v),
-    value
-  );
-
-  ctx.Result[name] = filtered;
-  return filtered;
 }
 
 // `category` fields match a mapping by tracker id (compared as a string so
@@ -237,7 +190,7 @@ export function runSearchAll(definition: Record<string, unknown>, body: string, 
 
     const fieldNames = Object.keys(search.fields);
     for (const name of fieldNames) {
-      extractField(row, name, search.fields[name] as SelectorSpec & { filters?: FilterSpec[] }, ctx);
+      extractField(row, name, search.fields[name] as FieldSpec, ctx);
     }
 
     const r = ctx.Result;
