@@ -152,16 +152,77 @@ test('requestDelay gates every fetch this provider instance makes, including a r
     { fetch: fn, sleep: async (ms: number) => { sleeps.push(ms); } }
   );
 
-  await provider.search('x', { offset: 0, limit: 50 });
+  const { items } = await provider.search('x', { offset: 0, limit: 50 });
   // First call: no prior request, no wait.
   assert.equal(sleeps.length, 0);
 
-  await provider.resolveMagnet({ id: null, url: 'https://synth.example/detail/1' });
+  // The real flow (server.ts) only ever hands resolveMagnet the item's
+  // detailUrl, never its download field - never the raw download URL.
+  await provider.resolveMagnet({ id: null, url: items[0]?.detailUrl ?? '' });
   // Second call (a different URL, not cached - "download" field here is a
   // real link, not a magnet, so it's not cached at listing time either):
   // must be gated behind the same 3s requestDelay as the first.
   assert.equal(sleeps.length, 1);
   assert.ok((sleeps[0] as number) > 0 && (sleeps[0] as number) <= 3000);
+});
+
+test('resolveMagnet cache miss follows the row\'s own download URL, not the detail page, when they differ', async () => {
+  const definition = syntheticDefinition();
+  const { fn, calls } = fakeFetch({
+    'https://synth.example/search?q=x': `<table><tbody>${syntheticRow(1, '1', 'https://synth.example/thankyou/1')}</tbody></table>`,
+    'https://synth.example/thankyou/1': '<html><body><a href="magnet:?xt=urn:btih:FROMDOWNLOADPAGE">m</a></body></html>',
+    // A canned (wrong) response for the detail page itself, so the test
+    // fails loudly if resolveMagnet regresses to fetching it instead.
+    'https://synth.example/t/1': '<html><body>no magnet here</body></html>'
+  });
+
+  const provider = createCardigannProvider(
+    { key: 'synth', entry: { definition: 'synth' }, resolved: { definitionId: 'synth', from: 'test', definition } },
+    { fetch: fn, sleep: noSleep }
+  );
+
+  const { items } = await provider.search('x', { offset: 0, limit: 50 });
+  assert.equal(items[0]?.detailUrl, 'https://synth.example/t/1');
+
+  const magnet = await provider.resolveMagnet({ id: null, url: items[0]?.detailUrl ?? '' });
+  assert.match(magnet, /FROMDOWNLOADPAGE/);
+  assert.ok(
+    calls.some((c) => c.url === 'https://synth.example/thankyou/1'),
+    'must have fetched the row\'s own download URL'
+  );
+  assert.ok(
+    !calls.some((c) => c.url === 'https://synth.example/t/1'),
+    'must not have fetched the detail page instead'
+  );
+});
+
+test('.Config.sitelink is always the resolved base URL, not user-overridable via entry.config', async () => {
+  const definition = syntheticDefinition({
+    search: {
+      path: '{{ .Config.sitelink }}search?q={{ .Keywords }}',
+      rows: { selector: 'tr.row' },
+      fields: {
+        title: { selector: 'a.title' },
+        details: { selector: 'a.title', attribute: 'href' },
+        category: { selector: 'td.cat' },
+        size: { selector: 'td.size' },
+        seeders: { selector: 'td.seeds' },
+        leechers: { selector: 'td.leech' },
+        date: { selector: 'td.date' },
+        download: { selector: 'a.dl', attribute: 'href' }
+      }
+    }
+  });
+  const { fn, calls } = fakeFetch({
+    'https://synth.example/search?q=x': '<table><tbody></tbody></table>'
+  });
+
+  const provider = createCardigannProvider(
+    { key: 'synth', entry: { definition: 'synth', config: { sitelink: 'https://attacker.example/' } }, resolved: { definitionId: 'synth', from: 'test', definition } },
+    { fetch: fn, sleep: noSleep }
+  );
+  await provider.search('x', { offset: 0, limit: 50 });
+  assert.equal(calls[0]?.url, 'https://synth.example/search?q=x');
 });
 
 test('directMagnet priority: a bare magnet field wins over a magnet-shaped download field', async () => {

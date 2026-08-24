@@ -91,6 +91,10 @@ export function createCardigannProvider(indexer: ResolvedIndexerLike, opts: Crea
 
   const config: Record<string, string> = {};
   for (const [k, v] of Object.entries(entry.config ?? {})) config[k] = String(v);
+  // Cardigann's ".Config.sitelink" is a wiki-documented built-in, always the
+  // resolved base URL - not something a user sets via indexer config, so
+  // this is applied after (and can't be overridden by) the loop above.
+  config.sitelink = baseUrl;
 
   const mappings = collectCategoryMappings(definition);
   const advertisedCategories = [...new Set(mappings.map((m) => categoryIdByName(m.standardName)))];
@@ -105,6 +109,20 @@ export function createCardigannProvider(indexer: ResolvedIndexerLike, opts: Crea
       if (oldest !== undefined) magnetCache.delete(oldest);
     }
     magnetCache.set(url, magnet);
+  }
+
+  // MagnetRef only ever carries the item's detailUrl (server.ts builds RSS
+  // grab links from it.detailUrl, never it.download) - so on a magnetCache
+  // miss, resolveMagnet must know which download URL a given detailUrl had,
+  // or it silently re-fetches the detail page instead of the row's own
+  // download/thankyou link. Same bound/eviction policy as magnetCache.
+  const downloadUrlCache = new Map<string, string>();
+  function rememberDownloadUrl(detailUrl: string, downloadUrl: string): void {
+    if (downloadUrlCache.size >= MAGNET_CACHE_MAX) {
+      const oldest = downloadUrlCache.keys().next().value;
+      if (oldest !== undefined) downloadUrlCache.delete(oldest);
+    }
+    downloadUrlCache.set(detailUrl, downloadUrl);
   }
 
   async function search(q: string, searchOpts: SearchOptions): Promise<SearchResult> {
@@ -167,7 +185,11 @@ export function createCardigannProvider(indexer: ResolvedIndexerLike, opts: Crea
     const searchItems: SearchItem[] = page.map((it) => {
       const detailUrl = resolveUrl(it.detailUrl, baseUrl);
       const magnet = directMagnet(it);
-      if (magnet) rememberMagnet(detailUrl, magnet);
+      if (magnet) {
+        rememberMagnet(detailUrl, magnet);
+      } else if (it.download) {
+        rememberDownloadUrl(detailUrl, resolveUrl(it.download, baseUrl));
+      }
 
       return {
         title: it.title,
@@ -190,11 +212,13 @@ export function createCardigannProvider(indexer: ResolvedIndexerLike, opts: Crea
     const cached = magnetCache.get(url);
     if (cached) return cached;
 
-    // Cache miss: the original item's title/download-field are gone by now
-    // (MagnetRef only carries id/url) - fall back to re-deriving a magnet
-    // from the detail page itself, same trade-off our hand-written
-    // providers make on their own cache-miss path.
-    const magnet = await resolveCardigannDownload({ definition, downloadUri: url, itemTitle: '', fetch: gatedFetch });
+    // Cache miss: the original item's title is gone by now (MagnetRef only
+    // carries id/url) - fall back to re-deriving a magnet from whichever
+    // page this detailUrl's row pointed at (its own download link if it had
+    // a distinct one, else the detail page itself), same trade-off our
+    // hand-written providers make on their own cache-miss path.
+    const downloadUri = downloadUrlCache.get(url) ?? url;
+    const magnet = await resolveCardigannDownload({ definition, downloadUri, itemTitle: '', fetch: gatedFetch });
     rememberMagnet(url, magnet);
     return magnet;
   }
