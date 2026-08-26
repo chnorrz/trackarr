@@ -8,34 +8,25 @@ const ROOT = path.resolve(__dirname, '..', '..', '..');
 
 const { resolveCardigannDownload } = await import(path.join(ROOT, 'dist', 'lib', 'cardigann', 'download.js'));
 
-function fakeFetch(responses: Record<string, string>) {
+// A single Fetcher now covers both text pages and raw file selectors (see
+// lib/browser.ts's CfResponse) - a canned response can be a plain string
+// (the common case) or {data, filename} for a test simulating a resolved
+// .torrent file's real bytes/Content-Disposition name.
+type FakeBody = string | { data: Buffer; filename?: string };
+
+function fakeFetch(responses: Record<string, FakeBody>) {
   const calls: { url: string; opts?: unknown }[] = [];
   const fn = async (url: string, opts?: unknown) => {
     calls.push({ url, opts });
     const body = responses[url];
     if (body === undefined) throw new Error(`fakeFetch: no canned response for ${url}`);
-    return body;
-  };
-  return { fn, calls };
-}
-
-// Most tests never resolve to a .torrent link at all - this throws if
-// fetchBinary is somehow reached unexpectedly, rather than silently
-// returning something that would mask a real regression.
-const noFetchBinary = async (): Promise<{ data: Buffer; filename: string }> => {
-  throw new Error('fetchBinary: unexpected call - this test only expects a magnet resolution');
-};
-
-// BinaryFetcher's real shape (lib/browser.ts's downloadFile()) returns the
-// Content-Disposition-derived filename alongside the bytes - responses
-// keyed by url below carry both.
-function fakeFetchBinary(responses: Record<string, { data: Buffer; filename: string }>) {
-  const calls: { url: string; opts?: unknown }[] = [];
-  const fn = async (url: string, opts?: unknown) => {
-    calls.push({ url, opts });
-    const body = responses[url];
-    if (body === undefined) throw new Error(`fakeFetchBinary: no canned response for ${url}`);
-    return body;
+    const buf = typeof body === 'string' ? Buffer.from(body, 'utf-8') : body.data;
+    const filename = typeof body === 'string' ? undefined : body.filename;
+    return {
+      text: async () => buf.toString('utf-8'),
+      buffer: async () => buf,
+      filename
+    };
   };
   return { fn, calls };
 }
@@ -46,8 +37,7 @@ test('a downloadUri that is already a magnet: URI is returned without any fetch'
     definition: {},
     downloadUri: 'magnet:?xt=urn:btih:AAA&dn=Title',
     itemTitle: 'Title',
-    fetch: fn,
-    fetchBinary: noFetchBinary
+    fetch: fn
   });
   assert.deepEqual(result, { kind: 'magnet', magnet: 'magnet:?xt=urn:btih:AAA&dn=Title' });
   assert.equal(calls.length, 0);
@@ -61,8 +51,7 @@ test('no download block: falls back to a[href^="magnet:"] on the captured link, 
     definition: {},
     downloadUri: 'https://example.test/torrent/1',
     itemTitle: 'X',
-    fetch: fn,
-    fetchBinary: noFetchBinary
+    fetch: fn
   });
   assert.deepEqual(result, { kind: 'magnet', magnet: 'magnet:?xt=urn:btih:BBB&dn=X' });
 });
@@ -70,7 +59,7 @@ test('no download block: falls back to a[href^="magnet:"] on the captured link, 
 test('no download block, no magnet on the page: throws a clear error', async () => {
   const { fn } = fakeFetch({ 'https://example.test/torrent/2': '<html><body>no links here</body></html>' });
   await assert.rejects(
-    resolveCardigannDownload({ definition: {}, downloadUri: 'https://example.test/torrent/2', itemTitle: 'X', fetch: fn, fetchBinary: noFetchBinary }),
+    resolveCardigannDownload({ definition: {}, downloadUri: 'https://example.test/torrent/2', itemTitle: 'X', fetch: fn }),
     /no magnet link found/
   );
 });
@@ -87,7 +76,7 @@ test('download.selectors[]: first matching selector wins, reading the default (n
       ]
     }
   };
-  const result = await resolveCardigannDownload({ definition, downloadUri: 'https://example.test/t/3', itemTitle: 'Y', fetch: fn, fetchBinary: noFetchBinary });
+  const result = await resolveCardigannDownload({ definition, downloadUri: 'https://example.test/t/3', itemTitle: 'Y', fetch: fn });
   assert.deepEqual(result, { kind: 'magnet', magnet: 'magnet:?xt=urn:btih:CCC&dn=Y' });
   // Only one fetch of the default page, reused across both selector attempts.
   assert.equal(calls.length, 1);
@@ -103,7 +92,7 @@ test('download.headers is forwarded on the default-page fetch, multi-value entri
       selectors: [{ selector: 'a', attribute: 'href' }]
     }
   };
-  await resolveCardigannDownload({ definition, downloadUri: 'https://example.test/t/3b', itemTitle: 'Y', fetch: fn, fetchBinary: noFetchBinary });
+  await resolveCardigannDownload({ definition, downloadUri: 'https://example.test/t/3b', itemTitle: 'Y', fetch: fn });
   const call = calls[0] as { opts: { headers: Record<string, string> } };
   assert.equal(call.opts.headers.Cookie, 'a=1, b=2');
   assert.equal(call.opts.headers['X-Requested-With'], 'XMLHttpRequest');
@@ -120,7 +109,7 @@ test('download.headers is forwarded on before/pathselector fetches too, merged (
       selectors: [{ selector: 'a.real', attribute: 'href', usebeforeresponse: true }]
     }
   };
-  await resolveCardigannDownload({ definition, downloadUri: 'https://example.test/torrents-details2.php', itemTitle: 'V', fetch: fn, fetchBinary: noFetchBinary });
+  await resolveCardigannDownload({ definition, downloadUri: 'https://example.test/torrents-details2.php', itemTitle: 'V', fetch: fn });
   const call = calls[0] as { opts: { headers: Record<string, string> } };
   assert.equal(call.opts.headers['X-Api-Key'], 'secret');
   assert.equal(call.opts.headers['Content-Type'], 'application/x-www-form-urlencoded');
@@ -128,10 +117,8 @@ test('download.headers is forwarded on before/pathselector fetches too, merged (
 
 test('download.selectors[] resolving to a non-magnet URL fetches its real bytes and returns a torrent result, using the fetcher\'s real filename', async () => {
   const torrentBytes = Buffer.from('d8:announce...e');
-  const { fn } = fakeFetch({
-    'https://example.test/t/4': '<html><body><a href="download.php?id=1" class="dl">dl</a></body></html>'
-  });
-  const { fn: fnBinary, calls: binaryCalls } = fakeFetchBinary({
+  const { fn, calls } = fakeFetch({
+    'https://example.test/t/4': '<html><body><a href="download.php?id=1" class="dl">dl</a></body></html>',
     'https://example.test/t/download.php?id=1': { data: torrentBytes, filename: 'real-name.torrent' }
   });
   const definition = { download: { selectors: [{ selector: 'a.dl', attribute: 'href' }] } };
@@ -139,19 +126,16 @@ test('download.selectors[] resolving to a non-magnet URL fetches its real bytes 
     definition,
     downloadUri: 'https://example.test/t/4',
     itemTitle: 'My Title',
-    fetch: fn,
-    fetchBinary: fnBinary
+    fetch: fn
   });
   assert.deepEqual(result, { kind: 'torrent', data: torrentBytes, filename: 'real-name.torrent' });
-  assert.equal(binaryCalls[0]?.url, 'https://example.test/t/download.php?id=1');
+  assert.equal(calls[1]?.url, 'https://example.test/t/download.php?id=1');
 });
 
 test('download.selectors[]: falls back to the item title when the fetcher has no filename', async () => {
   const torrentBytes = Buffer.from('d8:announce...e');
   const { fn } = fakeFetch({
-    'https://example.test/t/4c': '<html><body><a href="download.php?id=1" class="dl">dl</a></body></html>'
-  });
-  const { fn: fnBinary } = fakeFetchBinary({
+    'https://example.test/t/4c': '<html><body><a href="download.php?id=1" class="dl">dl</a></body></html>',
     'https://example.test/t/download.php?id=1': { data: torrentBytes, filename: '' }
   });
   const definition = { download: { selectors: [{ selector: 'a.dl', attribute: 'href' }] } };
@@ -159,22 +143,19 @@ test('download.selectors[]: falls back to the item title when the fetcher has no
     definition,
     downloadUri: 'https://example.test/t/4c',
     itemTitle: 'My Title',
-    fetch: fn,
-    fetchBinary: fnBinary
+    fetch: fn
   });
   assert.deepEqual(result, { kind: 'torrent', data: torrentBytes, filename: 'My Title.torrent' });
 });
 
 test('download.selectors[] resolving to a non-magnet URL: fetched content that isn\'t bencoded throws a clear error', async () => {
   const { fn } = fakeFetch({
-    'https://example.test/t/4b': '<html><body><a href="download.php?id=1" class="dl">dl</a></body></html>'
-  });
-  const { fn: fnBinary } = fakeFetchBinary({
+    'https://example.test/t/4b': '<html><body><a href="download.php?id=1" class="dl">dl</a></body></html>',
     'https://example.test/t/download.php?id=1': { data: Buffer.from('<html>not a torrent, an error page</html>'), filename: 'error.html' }
   });
   const definition = { download: { selectors: [{ selector: 'a.dl', attribute: 'href' }] } };
   await assert.rejects(
-    resolveCardigannDownload({ definition, downloadUri: 'https://example.test/t/4b', itemTitle: 'Y', fetch: fn, fetchBinary: fnBinary }),
+    resolveCardigannDownload({ definition, downloadUri: 'https://example.test/t/4b', itemTitle: 'Y', fetch: fn }),
     /isn't a valid \.torrent file/
   );
 });
@@ -184,15 +165,14 @@ test('download.selectors[]: a selector whose link is dead (fetch throws) falls t
   // magnet: as its own documented fallback ("we suggest using the magnet
   // link as a fallback") - a selector matching a real but dead link must
   // not stop the whole resolution before that documented fallback runs.
-  const { fn } = fakeFetch({
-    'https://example.test/t/dead': '<html><body>' +
-      '<a href="http://dead.example/torrent/AAA.torrent" class="primary">torrent</a>' +
-      '<a href="magnet:?xt=urn:btih:FALLBACK" class="fallback">magnet</a>' +
-      '</body></html>'
-  });
-  const fetchBinary = async (url: string) => {
+  const html = '<html><body>' +
+    '<a href="http://dead.example/torrent/AAA.torrent" class="primary">torrent</a>' +
+    '<a href="magnet:?xt=urn:btih:FALLBACK" class="fallback">magnet</a>' +
+    '</body></html>';
+  const fn = async (url: string) => {
+    if (url === 'https://example.test/t/dead') return { text: async () => html, buffer: async () => Buffer.from(html) };
     if (url === 'http://dead.example/torrent/AAA.torrent') throw new Error('cfFetch: fetch failed even after session recovery.');
-    throw new Error(`fakeFetchBinary: no canned response for ${url}`);
+    throw new Error(`fakeFetch: no canned response for ${url}`);
   };
   const definition = {
     download: {
@@ -202,15 +182,14 @@ test('download.selectors[]: a selector whose link is dead (fetch throws) falls t
       ]
     }
   };
-  const result = await resolveCardigannDownload({ definition, downloadUri: 'https://example.test/t/dead', itemTitle: 'D', fetch: fn, fetchBinary });
+  const result = await resolveCardigannDownload({ definition, downloadUri: 'https://example.test/t/dead', itemTitle: 'D', fetch: fn });
   assert.deepEqual(result, { kind: 'magnet', magnet: 'magnet:?xt=urn:btih:FALLBACK' });
 });
 
 test('download.selectors[]: if every selector\'s link is dead, throws the last one\'s real error, not a generic exhausted message', async () => {
-  const { fn } = fakeFetch({
-    'https://example.test/t/alldead': '<html><body><a href="http://dead.example/one.torrent" class="a">one</a><a href="http://dead.example/two.torrent" class="b">two</a></body></html>'
-  });
-  const fetchBinary = async (url: string) => {
+  const html = '<html><body><a href="http://dead.example/one.torrent" class="a">one</a><a href="http://dead.example/two.torrent" class="b">two</a></body></html>';
+  const fn = async (url: string) => {
+    if (url === 'https://example.test/t/alldead') return { text: async () => html, buffer: async () => Buffer.from(html) };
     throw new Error(`network error for ${url}`);
   };
   const definition = {
@@ -222,7 +201,7 @@ test('download.selectors[]: if every selector\'s link is dead, throws the last o
     }
   };
   await assert.rejects(
-    resolveCardigannDownload({ definition, downloadUri: 'https://example.test/t/alldead', itemTitle: 'D', fetch: fn, fetchBinary }),
+    resolveCardigannDownload({ definition, downloadUri: 'https://example.test/t/alldead', itemTitle: 'D', fetch: fn }),
     /network error for http:\/\/dead\.example\/two\.torrent/
   );
 });
@@ -245,8 +224,7 @@ test('download.before with a fixed path, POST, inputs templated from .DownloadUr
     definition,
     downloadUri: 'https://example.test/torrents-details.php?id=37346&hit=yes',
     itemTitle: 'Z',
-    fetch: fn,
-    fetchBinary: noFetchBinary
+    fetch: fn
   });
   assert.deepEqual(result, { kind: 'magnet', magnet: 'magnet:?xt=urn:btih:DDD&dn=Z' });
   assert.equal(calls.length, 1);
@@ -268,7 +246,7 @@ test('download.before with a pathselector: resolved against a fetch of the captu
       selectors: [{ selector: 'a.real', attribute: 'href', usebeforeresponse: true }]
     }
   };
-  const result = await resolveCardigannDownload({ definition, downloadUri: 'https://example.test/details/5', itemTitle: 'W', fetch: fn, fetchBinary: noFetchBinary });
+  const result = await resolveCardigannDownload({ definition, downloadUri: 'https://example.test/details/5', itemTitle: 'W', fetch: fn });
   assert.deepEqual(result, { kind: 'magnet', magnet: 'magnet:?xt=urn:btih:EEE&dn=W' });
   assert.equal(calls.length, 2, 'one fetch for the pathselector source page, one for the resolved before target');
 });
@@ -289,7 +267,7 @@ test('download.before.vars extracts named values from the item\'s own page, usab
       selectors: [{ selector: '$.url', usebeforeresponse: true }]
     }
   };
-  const result = await resolveCardigannDownload({ definition, downloadUri: 'https://example.test/torrent/9', itemTitle: 'N', fetch: fn, fetchBinary: noFetchBinary });
+  const result = await resolveCardigannDownload({ definition, downloadUri: 'https://example.test/torrent/9', itemTitle: 'N', fetch: fn });
   assert.deepEqual(result, { kind: 'magnet', magnet: 'magnet:?xt=urn:btih:HHH&dn=N' });
   assert.equal(calls.length, 2, 'one fetch of the item\'s own page for vars, one POST to the fixed before.path');
   const postCall = calls[1] as { url: string; opts: { method: string; body: string } };
@@ -313,7 +291,7 @@ test('download.before.vars: missing values resolve empty, same as any other unma
       selectors: [{ selector: '$.url', usebeforeresponse: true }]
     }
   };
-  const result = await resolveCardigannDownload({ definition, downloadUri: 'https://example.test/torrent/9b', itemTitle: 'M', fetch: fn, fetchBinary: noFetchBinary });
+  const result = await resolveCardigannDownload({ definition, downloadUri: 'https://example.test/torrent/9b', itemTitle: 'M', fetch: fn });
   assert.deepEqual(result, { kind: 'magnet', magnet: 'magnet:?xt=urn:btih:III&dn=M' });
 });
 
@@ -332,7 +310,7 @@ test('download.before.allowEmptyInputs keeps empty-valued inputs in the request 
       selectors: [{ selector: '$.url', usebeforeresponse: true }]
     }
   };
-  const result = await resolveCardigannDownload({ definition, downloadUri: 'https://example.test/torrent/10', itemTitle: 'P', fetch: fn, fetchBinary: noFetchBinary });
+  const result = await resolveCardigannDownload({ definition, downloadUri: 'https://example.test/torrent/10', itemTitle: 'P', fetch: fn });
   assert.deepEqual(result, { kind: 'magnet', magnet: 'magnet:?xt=urn:btih:JJJ&dn=P' });
   const call = calls[0] as { opts: { body: string } };
   assert.equal(call.opts.body, 'hash=&name=&id=5');
@@ -348,7 +326,7 @@ test('download.before without allowEmptyInputs drops empty-valued inputs (inputs
       selectors: [{ selector: '$.url', usebeforeresponse: true }]
     }
   };
-  await resolveCardigannDownload({ definition, downloadUri: 'https://example.test/torrent/11', itemTitle: 'Q', fetch: fn, fetchBinary: noFetchBinary });
+  await resolveCardigannDownload({ definition, downloadUri: 'https://example.test/torrent/11', itemTitle: 'Q', fetch: fn });
   const call = calls[0] as { opts: { body: string } };
   assert.equal(call.opts.body, 'id=5');
 });
@@ -363,7 +341,7 @@ test('.Now is available inside download.before templates, freshly bound per call
       selectors: [{ selector: '$.url', usebeforeresponse: true }]
     }
   };
-  await resolveCardigannDownload({ definition, downloadUri: 'https://example.test/torrent/12', itemTitle: 'R', fetch: fn, fetchBinary: noFetchBinary });
+  await resolveCardigannDownload({ definition, downloadUri: 'https://example.test/torrent/12', itemTitle: 'R', fetch: fn });
   const call = calls[0] as { opts: { body: string } };
   assert.match(call.opts.body, /^timestamp=\d+$/);
 });
@@ -373,7 +351,7 @@ test('download.selectors[]: a "$"-prefixed selector reads the response as JSON i
     'https://example.test/t/json': JSON.stringify({ download: { url: 'magnet:?xt=urn:btih:GGG&dn=J' } })
   });
   const definition = { download: { selectors: [{ selector: '$.download.url' }] } };
-  const result = await resolveCardigannDownload({ definition, downloadUri: 'https://example.test/t/json', itemTitle: 'J', fetch: fn, fetchBinary: noFetchBinary });
+  const result = await resolveCardigannDownload({ definition, downloadUri: 'https://example.test/t/json', itemTitle: 'J', fetch: fn });
   assert.deepEqual(result, { kind: 'magnet', magnet: 'magnet:?xt=urn:btih:GGG&dn=J' });
 });
 
@@ -392,7 +370,7 @@ test('download.infohash: builds a magnet from hash + title selectors, appending 
       }
     }
   };
-  const result = await resolveCardigannDownload({ definition, downloadUri: 'https://example.test/t/6', itemTitle: 'fallback', fetch: fn, fetchBinary: noFetchBinary });
+  const result = await resolveCardigannDownload({ definition, downloadUri: 'https://example.test/t/6', itemTitle: 'fallback', fetch: fn });
   assert.equal(result.kind, 'magnet');
   assert.match(result.magnet, /^magnet:\?xt=urn:btih:FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF&dn=Real%20Title/);
   assert.match(result.magnet, /&tr=/, 'a tracker list must be appended');
@@ -410,7 +388,7 @@ test('download.infohash falls back to the item\'s own title when the title selec
       }
     }
   };
-  const result = await resolveCardigannDownload({ definition, downloadUri: 'https://example.test/t/7', itemTitle: 'Fallback Title', fetch: fn, fetchBinary: noFetchBinary });
+  const result = await resolveCardigannDownload({ definition, downloadUri: 'https://example.test/t/7', itemTitle: 'Fallback Title', fetch: fn });
   assert.equal(result.kind, 'magnet');
   assert.match(result.magnet, /dn=Fallback%20Title/);
 });
@@ -418,7 +396,7 @@ test('download.infohash falls back to the item\'s own title when the title selec
 test('a download block with neither selectors nor infohash throws instead of silently returning nothing', async () => {
   const { fn } = fakeFetch({ 'https://example.test/t/8': '<html><body>x</body></html>' });
   await assert.rejects(
-    resolveCardigannDownload({ definition: { download: {} }, downloadUri: 'https://example.test/t/8', itemTitle: 'X', fetch: fn, fetchBinary: noFetchBinary }),
+    resolveCardigannDownload({ definition: { download: {} }, downloadUri: 'https://example.test/t/8', itemTitle: 'X', fetch: fn }),
     /exhausted with no magnet resolved/
   );
 });

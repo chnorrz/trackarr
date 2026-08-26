@@ -3029,93 +3029,125 @@ fires before Cloudflare's own challenge would even be reached), and a
 cross-origin `page.evaluate()` `fetch()` can't read the response body either
 (no CORS headers anywhere in that chain). Neither is "the site is dead."
 
-**`lib/browser.ts`'s `downloadFile()`** - a second, deliberately separate
-fetch path used only for raw files (`.torrent`s), not pages: Playwright's
-own Download API (`page.waitForEvent('download')`), on a scratch page, not
-`context.request` (a first version of this fix used `context.request` and
-was wrong - see below, corrected same-day by the user pushing back on the
-approach itself, not just a bug in it). Confirmed live:
-`2B8A2BE521DB175999AE3664B3378288BEA3352B`'s real `.torrent` file, 136265
-bytes, straight off `downloadlink`'s first (`iTorrents.org`) selector - no
-fallback to `downloadlink2` (`magnet:`) needed, in Docker under the real
-Linux `headless: false` + Xvfb path, not just the host's headless one.
+**Three iterations of this, in order - the middle one (`context.request`)
+should never be reintroduced, and the second-to-final one (a standalone
+`downloadFile()`) is also superseded, folded into `cfFetch` itself.**
 
-**The first version of this (superseded, do not reintroduce) used
-`context.request` instead - simpler-looking, and wrong in a way that only
-surfaced from a direct question, not from testing.** The user asked "is
-there no way to just fetch raw bytes through `page.evaluate(() => fetch())`
-... there must be an API to download files in Camoufox". Re-derived from
-first principles rather than defended: `page.evaluate(fetch())` genuinely
-can't work here regardless (no CORS headers anywhere in iTorrents' redirect
-chain, confirmed via `curl -D -`, a Fetch-spec security invariant, not a
-Playwright limitation) - but Playwright's own source shows Firefox's
-`_onDownloadCreated` calls `frameAbortedNavigation(..., "Download is
-starting")` at the *exact* point it fires the page's `'download'` event -
-the error the original fix was treating as a dead end **is the download
-signal**, one `page.waitForEvent('download')` away from a real
-`Download` object (`createReadStream()`, `suggestedFilename()` from the
-real `Content-Disposition`, `failure()`). Verified live before touching any
-code: `goto()` + `waitForEvent('download')` and an anchor-click variant (no
-navigation at all, `page.url()` unchanged) both yield the real bytes.
+**Iteration 1 (rejected on sight): `context.request`.** Simplest-looking -
+a Node-side HTTP client Playwright bundles - and wrong in a way that only
+surfaced from the user asking a direct question, not from testing:
+*"could I always use `context.request.fetch()` instead of
+`page.evaluate(fetch())`?"* Verified by reading `playwright-core`'s bundled
+source: `context.request` is backed by Node's own `http`/`https`
+(`coreBundle.js`), a real HTTP client entirely separate from the browser
+engine - shares the context's cookie jar, but none of Camoufox's
+fingerprint spoofing, useless for a challenge-protected page. Its proxy
+resolution (same source) is Playwright's own `newContext({proxy})` option
+or `HTTP_PROXY`/`HTTPS_PROXY` env vars - neither of which this project sets
+(`DOMAIN_OVER_PROXY`/`PROXY_URL` configure a *Firefox* preference, a PAC
+file, consulted only by the real browser's own navigations). Proven live
+with a throwaway PAC routing `itorrents.org`/`.net` through a dead port:
+the real browser download is blocked by it (**PAC honored**), while a
+parallel `context.request` call to the same host egresses direct
+regardless. Fixing that gap needed a second, hand-rolled,
+explicitly-proxied `APIRequestContext` - correct, but exactly the kind of
+parallel, easy-to-miss mechanism that's fragile by construction.
 
-Two follow-up questions the user then asked settled *why* to prefer this
-over `context.request`, not just that it also works:
+**Iteration 2 (also superseded): a standalone `downloadFile()`, Playwright's
+real Download API, on its own scratch page.** `page.goto()` throwing
+`"Download is starting"` for a direct file response isn't a dead end - it's
+the *exact* signal Firefox fires the page's `'download'` event on (verified
+by reading `playwright-core`'s source: `_onDownloadCreated` calls
+`frameAbortedNavigation(..., "Download is starting")` at the point it
+dispatches the event) - `page.waitForEvent('download')`, armed before the
+`goto()`, resolves to a real `Download` (`createReadStream()`,
+`suggestedFilename()` from the real `Content-Disposition`, `failure()`).
+Confirmed live: `2B8A2BE521DB175999AE3664B3378288BEA3352B`'s real `.torrent`
+file, straight off `downloadlink`'s first (`iTorrents.org`) selector, one
+network stack, `DOMAIN_OVER_PROXY`'s existing PAC just works with no second
+proxy mechanism to keep in sync.
 
-1. *"could I always use `context.request.fetch()` instead of
-   `page.evaluate(fetch())`?"* - Not for a challenge-protected page:
-   verified by reading `playwright-core`'s bundled source, `context.request`
-   is backed by Node's own `http`/`https` (`coreBundle.js`), a real HTTP
-   client entirely separate from the browser engine, sharing the context's
-   cookie jar but none of Camoufox's fingerprint spoofing.
-2. *"then it should use the proxy too, right?"* - this is what actually
-   killed `context.request` as the download mechanism. Its proxy resolution
-   (same source) is Playwright's own `newContext({proxy})` option or
-   `HTTP_PROXY`/`HTTPS_PROXY` env vars - neither of which this project sets
-   (`DOMAIN_OVER_PROXY`/`PROXY_URL` configure a *Firefox* preference, a PAC
-   file, consulted only by the real browser's own navigations). Proven live
-   with a throwaway PAC routing `itorrents.org`/`.net` through a dead port:
-   the real browser download is blocked by it (**PAC honored**), while a
-   parallel `context.request` call to the same host egresses direct
-   regardless (confirmed via the same experiment). The first version of
-   this fix "solved" that gap with a second, hand-rolled, explicitly-proxied
-   `APIRequestContext` (`hostMatchesProxyDomain()` gating
-   `request.newContext({proxy: {server: PROXY_URL}})`) - correct, but
-   exactly the kind of parallel, easy-to-miss proxy mechanism the user
-   objected to as "ugly" once it worked. `downloadFile()` deletes all of
-   it: one network stack (the real browser), DOMAIN_OVER_PROXY's existing
-   PAC just works for downloads the same way it already does for pages, no
-   second thing to keep in sync.
+**Iteration 3 (final): `downloadFile()` is deleted; `cfFetch` itself
+auto-detects a download.** The user's own next question - *"can `cfFetch`
+just return a stream of bytes in both cases and choose the download API or
+`page.evaluate(fetch())` based on the task at hand, so the public API stays
+simple?"* - and, when asked whether an `OPTIONS` probe could decide which
+path to use first: rejected on two independent grounds, not just one. An
+`OPTIONS` request has exactly the same CORS problem it's meant to solve
+(reading its response cross-origin needs the same headers iTorrents doesn't
+send), and even a same-origin `OPTIONS` doesn't reliably describe what a
+subsequent GET would return - most servers don't implement it meaningfully
+for a static file. The actual answer: **`page.goto()` already is the
+probe** - "Download is starting" *is* detection, and by the time you know,
+`waitForEvent('download')`'s bytes are already in flight, so there is no
+separate probe step to add. One live check settled the remaining unknown
+before writing any code: does a download-triggering `goto()` on an
+**already-warm, persistent per-hostname page** (not a scratch one) leave
+that page's URL, JS context, cookies and further usability intact?
+Confirmed live, all of it: `page.url()` unchanged, `window`-scoped state
+preserved, a subsequent in-page `fetch()` and a further real navigation
+both still worked. That single result removed the scratch-page requirement
+entirely - the existing persistent page serves both cases.
 
-Runs on its own scratch page (`context.newPage()`), not a persistent
-per-hostname one: the anchor-click download variant navigates nowhere on a
-genuine download (`page.url()` unchanged, confirmed live), but a url that
-turns out *not* to be a download does navigate the page for real - fine to
-throw away on a scratch page, not fine to silently clobber a shared page's
-location. A `Cookie` header is still routed through
-`page.context().addCookies()` (same mechanism `cfFetch` already needed for
-EZTV) since a browser download can't carry request headers the way
-`fetch()` can; any other header is logged and dropped rather than silently
-vanishing (nothing vendored so far ever reaches this - only `ext-to.yml`
-sets `download.headers`, and it always resolves to a magnet).
+`lib/browser.ts`'s `navigateOrDownload(page, url, allowDownload)` replaces
+both `gotoPreferringExactUrl()` (iteration 1/2's page-only nav helper) and
+`downloadFile()`: one navigation, resolving to `{kind:'page', response}` or
+`{kind:'download', base64, filename}`. `allowDownload` is
+`method === 'GET' && !body` - the one real correctness hazard introduced by
+folding detection into every navigation: a POST's own warm-up nav landing
+on a url that happens to serve a download must **never** be treated as one
+(silently returning downloaded bytes instead of ever performing the POST
+would be a real, non-obvious bug) - when `allowDownload` is false,
+`"Download is starting"` still falls back to warming the bare origin, this
+function's own prior behavior, and the actual POST still goes out via
+`tryFetch`'s in-page `fetch()` afterwards, untouched. Covered by a
+dedicated test (`test/lib/browser.test.ts`) sending a real POST body at a
+url configured to look like a download, asserting both the origin fallback
+*and* that the POST itself still went through with the right method/body.
+An armed-but-unused `waitForEvent('download')` (the common case - most GETs
+aren't downloads) can't be manually cancelled, so it's left to reject on
+its own timeout, deliberately swallowed (`.catch(() => {})`) rather than
+surfacing as an unhandled rejection - a dedicated test proves this too (a
+non-triggering GET now just succeeds as a normal page, instead of a
+`downloadFile()`-only call having no path to succeed on that same url at
+all, which was iteration 2's actual weak point, not this session's own
+finding but visible in hindsight).
 
-**`lib/cardigann/download.ts`**: `BinaryFetcher` now returns
-`{data: Buffer; filename: string}`, not a bare `Buffer` - `downloadFile()`'s
-real `Content-Disposition` filename (`suggestedFilename()`) flows all the
-way through instead of being thrown away. `sanitizeFilename()` (strips
-control characters, falls back to `'download'` if nothing's left, appends
-`.torrent` only if the name doesn't already end in it - the real
-`suggestedFilename()` already does) now runs against that real name first,
-falling back to `opts.itemTitle` only if the fetcher's own filename is
-empty. Previously every grab was literally named `download.torrent`
-(`resolveMagnet`'s cache-miss path in `adapter.ts` always passes
-`itemTitle: ''`) - a real, if minor, bug fixed as a side effect of this
-change, not the point of it. `download.selectors[]`, on a resolved value
-that isn't `magnet:`, resolves it to an absolute URL (selector values can
-be relative, same as any other extracted attribute), fetches it via the
-new `fetchBinary`, and validates the first byte is ASCII `'d'` - every
-valid `.torrent` file is a top-level bencoded dictionary, so this catches
-"the selector matched but the link actually serves an HTML error page"
-with a clear message instead of handing a client unparseable bytes.
+`CfResponse` gains an optional `filename` - populated either from a real
+`Download.suggestedFilename()`, or (new) `tryFetch()`'s own regex parse of
+a **same-origin** file's `Content-Disposition` header: CORS only restricts
+*cross-origin* response bodies, so a same-origin `.torrent` (relative
+selector paths on the tracker's own domain are the documented common case,
+just not one any vendored definition currently exercises) already read
+fine through plain in-page `fetch()` - it just never had a way to expose
+the filename before.
+
+**`lib/cardigann`'s `Fetcher`/`BinaryFetcher` split collapses back into one
+`Fetcher`**, returning a `CfResponse`-shaped object
+(`{text(); buffer(); filename?}`) - structurally identical to `cfFetch`'s
+own return type, so `providers/index.ts` passes `cfFetch` straight through
+with no adapter lambda at all (`createCardigannProvider(indexer, { fetch:
+cfFetch })`). `adapter.ts`'s `createGatedFetchers` (two gated functions,
+one shared rate-limit clock) collapses to `createGatedFetch` (one gated
+`Fetcher`). Five `opts.fetch(...)` call sites in `download.ts` gained
+`.text()`; the one selector site that resolves to a raw file uses
+`.buffer()` and `.filename` instead of a second injected function.
+`sanitizeFilename()` (unchanged from iteration 2: strips control
+characters, falls back to `'download'`, appends `.torrent` only if the name
+doesn't already end in it) still runs against the fetcher's real filename
+first, `opts.itemTitle` only if that's empty - `resolveMagnet`'s cache-miss
+path in `adapter.ts` always passes `itemTitle: ''`, so every grab used to
+be named the generic `download.torrent` before iteration 2's filename
+threading fixed it as a side effect.
+
+Net public surface: `cfFetch` + `registerDomainCookies` + `closeBrowser`
+from `lib/browser.ts` (`downloadFile`/`DownloadedFile`/`fetchFileDirect`
+all gone), one `Fetcher` from `lib/cardigann`. Line count in
+`lib/browser.ts` is roughly break-even, not smaller - `cfFetch` absorbs the
+branch `downloadFile` used to own - the actual wins are one entry point, no
+second call site to wire in `providers/index.ts`, `DOMAIN_OVER_PROXY`
+applying uniformly with nothing parallel to keep in sync, and a real
+(if minor) filename bug fixed along the way.
 
 **The `selectors[]` loop is a fallback chain, and now behaves like one -
 kept even though `iTorrents.org` turned out fine.** `1337x.yml`'s own
@@ -3156,13 +3188,13 @@ existing IPv4-ban workaround (confirmed still needed: direct IPv4 gives
 `error code: 1006` in 17 bytes; IPv6 gives a real, solvable challenge page).
 
 - **`1337x-cd`**: `q=ubuntu` -> 50 items, 0 zero-size, 50 seeded. Grab (after
-  `downloadFile()`, above, re-tested in Docker under the real Linux
-  `headless: false`/Xvfb path, not just headless on the host):
-  `downloadlink` (iTorrents) succeeds on the first selector, no fallback to
-  `downloadlink2` needed - `200`, `content-type: application/x-bittorrent`,
-  a real bencoded `.torrent`, filename the real
-  `Content-Disposition`-derived infohash name rather than the generic
-  `download.torrent` every grab used to get.
+  the unified `cfFetch`, above, re-tested in Docker under the real Linux
+  `headless: false`/Xvfb path, not just headless on the host, across all
+  three iterations of this fix): `downloadlink` (iTorrents) succeeds on the
+  first selector, no fallback to `downloadlink2` needed - `200`,
+  `content-type: application/x-bittorrent`, a real bencoded `.torrent`,
+  filename the real `Content-Disposition`-derived infohash name rather than
+  the generic `download.torrent` every grab used to get.
 - **`eztv-cd`**: needed one more fix mid-session, not listed above since it
   isn't 1337x-specific - `search.headers.cookie` (`layout=def_wlinks`,
   needed to reveal magnet links/real seed counts inline) was being sent as
@@ -3183,7 +3215,7 @@ existing IPv4-ban workaround (confirmed still needed: direct IPv4 gives
   anyway as a regression check (same item as section 24's live test,
   same infohash `E0593A3DAB881080EFECB54BA6551D4B2D329BF1`).
 
-335 tests passing (up from 314 at the end of section 24), lint/typecheck
+338 tests passing (up from 314 at the end of section 24), lint/typecheck
 clean. `providers/{ext-to,1337x,eztv}.ts` are still the live `server.ts`
 routes - nothing has been switched over. Whether to retire them now that
 all three Cardigann equivalents are proven correct end-to-end (search,

@@ -259,10 +259,12 @@ export default {
 ```
 
 Register it in `providers/index.ts`. It gets `/<id>/api` and `/<id>/download`
-automatically. Use `cfFetch(url, opts?)` from `lib/browser.ts`
-to fetch pages - same shape as `fetch()` (`method`/`headers`/`body`) except
-it resolves the body text directly, and it handles Cloudflare, caching and
-proxy routing for you.
+automatically. Use `cfFetch(url, opts?)` from `lib/browser.ts` for every
+fetch - same request shape as `fetch()` (`method`/`headers`/`body`), and it
+handles Cloudflare, caching and proxy routing for you. It returns a
+`CfResponse` (`.text()`/`.buffer()`, both re-readable), auto-detecting a raw
+file download (a `.torrent` link) vs. a normal page - no separate function
+needed for either.
 
 `providers/1337x.ts` is the simpler reference (magnets sit in the HTML);
 `providers/ext-to.ts` shows the signed-API case.

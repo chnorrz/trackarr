@@ -10,37 +10,30 @@ const ROOT = path.resolve(__dirname, '..', '..', '..');
 const { createCardigannProvider } = await import(path.join(ROOT, 'dist', 'lib', 'cardigann', 'adapter.js'));
 const { validateDefinitionYaml } = await import(path.join(ROOT, 'dist', 'lib', 'cardigann', 'load.js'));
 
-function fakeFetch(responses: Record<string, string>) {
+// A single Fetcher now covers both text pages and raw file selectors (see
+// lib/browser.ts's CfResponse) - a canned response can be a plain string
+// (the common case) or {data, filename} for a test simulating a resolved
+// .torrent file's real bytes/Content-Disposition name.
+type FakeBody = string | { data: Buffer; filename?: string };
+
+function fakeFetch(responses: Record<string, FakeBody>) {
   const calls: { url: string; opts?: { method?: string; headers?: Record<string, string>; body?: string } }[] = [];
   const fn = async (url: string, opts?: { method?: string; headers?: Record<string, string>; body?: string }) => {
     calls.push({ url, opts });
     const body = responses[url];
     if (body === undefined) throw new Error(`fakeFetch: no canned response for ${url}`);
-    return body;
+    const buf = typeof body === 'string' ? Buffer.from(body, 'utf-8') : body.data;
+    const filename = typeof body === 'string' ? undefined : body.filename;
+    return {
+      text: async () => buf.toString('utf-8'),
+      buffer: async () => buf,
+      filename
+    };
   };
   return { fn, calls };
 }
 
 const noSleep = async () => {};
-
-// Every test here resolves a magnet, never a .torrent link - this throws if
-// fetchBinary is somehow reached unexpectedly.
-const noFetchBinary = async (): Promise<{ data: Buffer; filename: string }> => {
-  throw new Error('fetchBinary: unexpected call - this test only expects a magnet resolution');
-};
-
-// BinaryFetcher's real shape (lib/browser.ts's downloadFile()) returns the
-// Content-Disposition-derived filename alongside the bytes.
-function fakeFetchBinary(responses: Record<string, { data: Buffer; filename: string }>) {
-  const calls: { url: string; opts?: unknown }[] = [];
-  const fn = async (url: string, opts?: unknown) => {
-    calls.push({ url, opts });
-    const body = responses[url];
-    if (body === undefined) throw new Error(`fakeFetchBinary: no canned response for ${url}`);
-    return body;
-  };
-  return { fn, calls };
-}
 
 // ---- real definitions/kickasstorrents-to.yml, both its real pages ----------
 
@@ -80,7 +73,7 @@ test('kickasstorrents-to.yml: search fetches both its real paths and concatenate
 
   const provider = createCardigannProvider(
     { key: 'kickass', entry: { definition: 'kickasstorrents-to' }, resolved: { definitionId: 'kickasstorrents-to', from: 'test', definition: result.definition } },
-    { fetch: fn, fetchBinary: noFetchBinary, sleep: noSleep }
+    { fetch: fn, sleep: noSleep }
   );
 
   assert.equal(provider.id, 'kickass');
@@ -109,7 +102,7 @@ test('kickasstorrents-to.yml: a magnet already present in the listing is cached,
 
   const provider = createCardigannProvider(
     { key: 'kickass', entry: { definition: 'kickasstorrents-to' }, resolved: { definitionId: 'kickasstorrents-to', from: 'test', definition: result.definition } },
-    { fetch: fn, fetchBinary: noFetchBinary, sleep: noSleep }
+    { fetch: fn, sleep: noSleep }
   );
 
   const { items } = await provider.search('x', { offset: 0, limit: 50 });
@@ -169,7 +162,7 @@ test('requestDelay gates every fetch this provider instance makes, including a r
   const sleeps: number[] = [];
   const provider = createCardigannProvider(
     { key: 'synth', entry: { definition: 'synth' }, resolved: { definitionId: 'synth', from: 'test', definition } },
-    { fetch: fn, fetchBinary: noFetchBinary, sleep: async (ms: number) => { sleeps.push(ms); } }
+    { fetch: fn, sleep: async (ms: number) => { sleeps.push(ms); } }
   );
 
   const { items } = await provider.search('x', { offset: 0, limit: 50 });
@@ -198,7 +191,7 @@ test('resolveMagnet cache miss follows the row\'s own download URL, not the deta
 
   const provider = createCardigannProvider(
     { key: 'synth', entry: { definition: 'synth' }, resolved: { definitionId: 'synth', from: 'test', definition } },
-    { fetch: fn, fetchBinary: noFetchBinary, sleep: noSleep }
+    { fetch: fn, sleep: noSleep }
   );
 
   const { items } = await provider.search('x', { offset: 0, limit: 50 });
@@ -240,7 +233,7 @@ test('.Config.sitelink is always the resolved base URL, not user-overridable via
 
   const provider = createCardigannProvider(
     { key: 'synth', entry: { definition: 'synth', config: { sitelink: 'https://attacker.example/' } }, resolved: { definitionId: 'synth', from: 'test', definition } },
-    { fetch: fn, fetchBinary: noFetchBinary, sleep: noSleep }
+    { fetch: fn, sleep: noSleep }
   );
   await provider.search('x', { offset: 0, limit: 50 });
   assert.equal(calls[0]?.url, 'https://synth.example/search?q=x');
@@ -274,7 +267,7 @@ test('directMagnet priority: a bare magnet field wins over a magnet-shaped downl
 
   const provider = createCardigannProvider(
     { key: 'synth', entry: { definition: 'synth' }, resolved: { definitionId: 'synth', from: 'test', definition } },
-    { fetch: fn, fetchBinary: noFetchBinary, sleep: noSleep }
+    { fetch: fn, sleep: noSleep }
   );
   const { items } = await provider.search('x', { offset: 0, limit: 50 });
   const resolved = await provider.resolveMagnet({ id: null, url: items[0].detailUrl });
@@ -308,7 +301,7 @@ test('a bare fields.infohash builds a magnet immediately at listing time, no dow
 
   const provider = createCardigannProvider(
     { key: 'synth', entry: { definition: 'synth' }, resolved: { definitionId: 'synth', from: 'test', definition } },
-    { fetch: fn, fetchBinary: noFetchBinary, sleep: noSleep }
+    { fetch: fn, sleep: noSleep }
   );
   const { items } = await provider.search('x', { offset: 0, limit: 50 });
   const callsAfterSearch = calls.length;
@@ -342,7 +335,7 @@ test('a requested category not present in categorymappings excludes the path ent
 
   const provider = createCardigannProvider(
     { key: 'synth', entry: { definition: 'synth' }, resolved: { definitionId: 'synth', from: 'test', definition } },
-    { fetch: fn, fetchBinary: noFetchBinary, sleep: noSleep }
+    { fetch: fn, sleep: noSleep }
   );
 
   // Requesting Torznab id 2000 (Movies) maps to this tracker's native "1",
@@ -357,7 +350,7 @@ test('provider.categories advertises every standard id reachable via categorymap
   const definition = syntheticDefinition();
   const provider = createCardigannProvider(
     { key: 'synth', entry: { definition: 'synth' }, resolved: { definitionId: 'synth', from: 'test', definition } },
-    { fetch: async () => '', fetchBinary: noFetchBinary, sleep: noSleep }
+    { fetch: async () => ({ text: async () => '', buffer: async () => Buffer.from('') }), sleep: noSleep }
   );
   assert.deepEqual([...provider.categories].sort(), [2000, 5000]);
 });
@@ -369,7 +362,7 @@ test('entry.link overrides links[0] as the base URL', async () => {
   });
   const provider = createCardigannProvider(
     { key: 'synth', entry: { definition: 'synth', link: 'https://mirror.example/' }, resolved: { definitionId: 'synth', from: 'test', definition } },
-    { fetch: fn, fetchBinary: noFetchBinary, sleep: noSleep }
+    { fetch: fn, sleep: noSleep }
   );
   await provider.search('x', { offset: 0, limit: 50 });
   assert.equal(calls.length, 1);
@@ -406,7 +399,7 @@ test('caps.settings[].default seeds .Config, overridable by entry.config; boolea
   });
   const provider1 = createCardigannProvider(
     { key: 'synth', entry: { definition: 'synth' }, resolved: { definitionId: 'synth', from: 'test', definition } },
-    { fetch: fn1, fetchBinary: noFetchBinary, sleep: noSleep }
+    { fetch: fn1, sleep: noSleep }
   );
   await provider1.search('x', { offset: 0, limit: 50 });
   assert.equal(calls1.length, 1, 'strict default (false) rendered as .False-equal, verbose default (true) rendered truthy, label absent entirely');
@@ -423,7 +416,7 @@ test('caps.settings[].default seeds .Config, overridable by entry.config; boolea
       entry: { definition: 'synth', config: { sort: 'seeders', strict: true, verbose: false, label: 'custom' } },
       resolved: { definitionId: 'synth', from: 'test', definition }
     },
-    { fetch: fn2, fetchBinary: noFetchBinary, sleep: noSleep }
+    { fetch: fn2, sleep: noSleep }
   );
   await provider2.search('x', { offset: 0, limit: 50 });
   assert.equal(calls2.length, 1);
@@ -450,20 +443,18 @@ test('resolveMagnet threads the same .Config (settings defaults + overrides) int
       selectors: [{ selector: 'a[href^="{{ .Config.downloadlink }}"]', attribute: 'href' }]
     }
   });
-  const { fn } = fakeFetch({
+  const torrentBytes = Buffer.from('d8:announce...e');
+  const { fn, calls } = fakeFetch({
     'https://synth.example/search?q=x': '<table><tbody><tr class="row"><td><a class="title" href="/t/1">Item</a></td><td class="cat">1</td>' +
       '<td class="size">1 GB</td><td class="seeds">5</td><td class="leech">1</td><td class="date">now</td></tr></tbody></table>',
     'https://synth.example/t/1':
-      '<html><body><a href="magnet:?xt=urn:btih:WRONG">wrong-kind</a><a href="http://itorrents.org/torrent/REAL.torrent">right-kind</a></body></html>'
-  });
-  const torrentBytes = Buffer.from('d8:announce...e');
-  const { fn: fnBinary, calls: binaryCalls } = fakeFetchBinary({
+      '<html><body><a href="magnet:?xt=urn:btih:WRONG">wrong-kind</a><a href="http://itorrents.org/torrent/REAL.torrent">right-kind</a></body></html>',
     'http://itorrents.org/torrent/REAL.torrent': { data: torrentBytes, filename: 'REAL.torrent' }
   });
 
   const provider = createCardigannProvider(
     { key: 'synth', entry: { definition: 'synth' }, resolved: { definitionId: 'synth', from: 'test', definition } },
-    { fetch: fn, fetchBinary: fnBinary, sleep: noSleep }
+    { fetch: fn, sleep: noSleep }
   );
   const { items } = await provider.search('x', { offset: 0, limit: 50 });
   const resolved = await provider.resolveMagnet({ id: null, url: items[0].detailUrl });
@@ -471,12 +462,13 @@ test('resolveMagnet threads the same .Config (settings defaults + overrides) int
   // .Config.downloadlink must have resolved to its real default
   // (http://itorrents.org/), not empty - an empty prefix would have
   // matched the first, wrong-kind (magnet), link instead. The filename
-  // comes from the fetcher's own suggestedFilename() (real
-  // Content-Disposition name), not itemTitle - resolveMagnet's cache-miss
-  // path always passes itemTitle: '' (see adapter.ts), but that no longer
-  // matters here since the fetcher supplies a real name regardless.
+  // comes from the fetcher's own real Content-Disposition name (cfFetch's
+  // own downloadFile()/Content-Disposition parse), not itemTitle -
+  // resolveMagnet's cache-miss path always passes itemTitle: '' (see
+  // adapter.ts), but that no longer matters here since the fetcher
+  // supplies a real name regardless.
   assert.deepEqual(resolved, { kind: 'torrent', data: torrentBytes, filename: 'REAL.torrent' });
-  assert.equal(binaryCalls[0]?.url, 'http://itorrents.org/torrent/REAL.torrent');
+  assert.ok(calls.some((c) => c.url === 'http://itorrents.org/torrent/REAL.torrent'));
 });
 
 test('a definition with no links[] and no link: override throws at provider creation, not on first search', () => {
@@ -485,7 +477,7 @@ test('a definition with no links[] and no link: override throws at provider crea
     () =>
       createCardigannProvider(
         { key: 'synth', entry: { definition: 'synth' }, resolved: { definitionId: 'synth', from: 'test', definition } },
-        { fetch: async () => '', fetchBinary: noFetchBinary, sleep: noSleep }
+        { fetch: async () => ({ text: async () => '', buffer: async () => Buffer.from('') }), sleep: noSleep }
       ),
     /no links\[\] and no config link:/
   );

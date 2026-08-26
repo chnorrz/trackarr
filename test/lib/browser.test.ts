@@ -20,6 +20,12 @@ let activeEvaluates = 0;
 let maxActiveEvaluates = 0;
 let evaluateDelayMs = 0;
 let lastEvaluateInit: unknown;
+// Simulates a real page.evaluate() having already parsed a same-origin
+// Content-Disposition header (tryFetch's own regex, which - like the
+// base64/blob encoding it sits next to - runs inside the real browser
+// context and isn't unit-testable outside one; this only verifies cfFetch
+// threads whatever comes back through to CfResponse.filename).
+let evaluateFilename: string | undefined;
 let gotoUrls: string[] = [];
 let gotoDownloadStartingFor: string | null = null;
 
@@ -32,12 +38,13 @@ type FakeDownload = {
   delete: () => Promise<void>;
 };
 
-// downloadFile() waits for the page's 'download' event before navigating,
-// same order Playwright's own docs use - so a goto() to a url configured
-// here resolves whichever waitForEvent('download') call is currently
-// pending on this page, then throws "Download is starting" itself, exactly
-// mirroring Firefox's real _onDownloadCreated behavior (confirmed live and
-// by reading playwright-core's own source - see NOTES.md).
+// cfFetch's navigateOrDownload() waits for the page's 'download' event
+// before navigating, same order Playwright's own docs use - so a goto() to
+// a url configured here resolves whichever waitForEvent('download') call
+// is currently pending on this page, then throws "Download is starting"
+// itself, exactly mirroring Firefox's real _onDownloadCreated behavior
+// (confirmed live and by reading playwright-core's own source - see
+// NOTES.md).
 let downloadTriggers: Record<string, { data: Buffer; filename: string; failure?: string | null }> = {};
 let downloadDeletes = 0;
 // Real code passes a real 20s timeout to waitForEvent; this fake ignores
@@ -58,7 +65,11 @@ const createFakePage = () => {
       lastEvaluateInit = arg?.init;
       await new Promise((r) => setTimeout(r, evaluateDelayMs));
       activeEvaluates--;
-      return { challenged: false, base64: Buffer.from('<html><body>cleared, not a challenge</body></html>').toString('base64') };
+      return {
+        challenged: false,
+        base64: Buffer.from('<html><body>cleared, not a challenge</body></html>').toString('base64'),
+        filename: evaluateFilename
+      };
     },
     url: () => 'about:blank',
     goto: async (url: string) => {
@@ -147,7 +158,7 @@ mock.module('camoufox-js', {
   }
 });
 
-const { cfFetch, closeBrowser, registerDomainCookies, downloadFile } = await import(path.join(ROOT, 'dist', 'lib', 'browser.js'));
+const { cfFetch, closeBrowser, registerDomainCookies } = await import(path.join(ROOT, 'dist', 'lib', 'browser.js'));
 
 test('concurrent cfFetch calls for the same new hostname only create one page', async () => {
   newPageCalls = 0;
@@ -288,17 +299,20 @@ test('the first navigation for a new page targets the exact url, not just the ba
   assert.deepEqual(gotoUrls, ['https://goto-exact-test.example/deep/path?a=1']);
 });
 
-test('navigation falls back to the bare origin only when the exact url itself throws "Download is starting"', async () => {
+test('a POST\'s own warm-up navigation falls back to the bare origin, never treated as a download, even if the url resolves as one', async () => {
   gotoUrls = [];
-  gotoDownloadStartingFor = 'https://goto-fallback-test.example/file.torrent';
-  // A real, direct-download URL (itorrents.org's own .torrent links do
-  // this) makes Playwright's page.goto() throw "Download is starting"
-  // instead of navigating - hit live. Only fetch()'s own in-page call
-  // (inside tryFetch, never subject to that download interception) may
-  // ever target such a url directly; goto() falls back to warming up the
-  // origin instead.
-  await cfFetch('https://goto-fallback-test.example/file.torrent');
-  assert.deepEqual(gotoUrls, ['https://goto-fallback-test.example/file.torrent', 'https://goto-fallback-test.example/']);
+  lastEvaluateInit = undefined;
+  gotoDownloadStartingFor = 'https://goto-fallback-test.example/submit';
+  // allowDownload is method==='GET' with no body only (see fetchViaSession)
+  // - a POST silently returning a downloaded file's bytes instead of ever
+  // performing the POST would be a real, non-obvious bug, so this url's
+  // "Download is starting" must still fall back to warming the bare
+  // origin, exactly like the pre-download-detection behavior. The actual
+  // POST itself is unaffected - it still goes out via tryFetch's own
+  // in-page fetch() afterwards, method and body intact.
+  await cfFetch('https://goto-fallback-test.example/submit', { method: 'POST', body: 'x=1' });
+  assert.deepEqual(gotoUrls, ['https://goto-fallback-test.example/submit', 'https://goto-fallback-test.example/']);
+  assert.deepEqual(lastEvaluateInit, { method: 'POST', headers: undefined, body: 'x=1' });
   gotoDownloadStartingFor = null;
 });
 
@@ -314,57 +328,88 @@ test('CfResponse.text() and .buffer() decode the same underlying response, calla
   assert.equal(buf.toString('utf-8'), '<html><body>cleared, not a challenge</body></html>');
 });
 
-test('downloadFile() returns the real bytes and the real suggested filename on a successful download', async () => {
+test('cfFetch auto-detects a real download on a plain GET and returns its real bytes and filename via CfResponse', async () => {
   downloadTriggers = {
     'https://download-test.example/one.torrent': { data: Buffer.from('real torrent bytes'), filename: 'ubuntu.torrent' }
   };
 
-  const result = await downloadFile('https://download-test.example/one.torrent');
+  const res = await cfFetch('https://download-test.example/one.torrent');
+  const buf = await res.buffer();
 
-  assert.ok(Buffer.isBuffer(result.data));
-  assert.equal(result.data.toString('utf-8'), 'real torrent bytes');
-  assert.equal(result.filename, 'ubuntu.torrent');
+  assert.ok(Buffer.isBuffer(buf));
+  assert.equal(buf.toString('utf-8'), 'real torrent bytes');
+  assert.equal(res.filename, 'ubuntu.torrent');
 });
 
-test('downloadFile() deletes the browser-side download copy and closes its scratch page even on success', async () => {
+test('CfResponse.filename carries a same-origin Content-Disposition name through, for a file fetched via the fast in-page path rather than a real Download', async () => {
+  evaluateFilename = 'same-origin-name.torrent';
+  const res = await cfFetch('https://filename-test.example/one');
+  assert.equal(res.filename, 'same-origin-name.torrent');
+  evaluateFilename = undefined;
+});
+
+test('CfResponse.filename is undefined for a plain page response with no Content-Disposition', async () => {
+  evaluateFilename = undefined;
+  const res = await cfFetch('https://no-filename-test.example/one');
+  assert.equal(res.filename, undefined);
+});
+
+test('a GET whose armed download waiter never fires still succeeds as a normal page fetch, not a hang or a crash', async () => {
+  // Every plain GET arms a download waiter before its warm-up nav (see
+  // navigateOrDownload) in case the url turns out to be one - here it
+  // doesn't, so this also proves the armed-but-unused waiter's own
+  // eventual timeout rejection is swallowed rather than surfacing as an
+  // unhandled rejection (there is no separate downloadFile() any more with
+  // its own dead end for a non-download url - a GET simply succeeds
+  // normally instead).
+  downloadTriggers = {};
+  const text = await (await cfFetch('https://not-a-download-test.example/page.html')).text();
+  assert.equal(text, '<html><body>cleared, not a challenge</body></html>');
+});
+
+test('cfFetch deletes the browser-side download copy, even though the caller never sees the Download object directly', async () => {
   downloadTriggers = { 'https://download-test.example/cleanup.torrent': { data: Buffer.from('x'), filename: 'x.torrent' } };
   downloadDeletes = 0;
-  const before = pageCloses;
 
-  await downloadFile('https://download-test.example/cleanup.torrent');
+  await cfFetch('https://download-test.example/cleanup.torrent');
 
   assert.equal(downloadDeletes, 1, 'the temporary browser-side download file must be deleted, not leaked to disk');
-  assert.equal(pageCloses, before + 1, 'the scratch page must be closed after use');
 });
 
-test('downloadFile() throws a clear error when the download itself failed', async () => {
+test('cfFetch throws a clear error when the download itself failed', async () => {
   downloadTriggers = {
     'https://download-test.example/broken.torrent': { data: Buffer.from(''), filename: '', failure: 'net::ERR_CONNECTION_RESET' }
   };
 
-  await assert.rejects(downloadFile('https://download-test.example/broken.torrent'), /net::ERR_CONNECTION_RESET/);
+  await assert.rejects(cfFetch('https://download-test.example/broken.torrent'), /net::ERR_CONNECTION_RESET/);
 });
 
-test('downloadFile() throws (rather than hanging) when the url never triggers a real download', async () => {
-  downloadTriggers = {};
+test('cfFetch results from a download are never cached, unlike a normal page response', async () => {
+  downloadTriggers = { 'https://download-test.example/repeat.torrent': { data: Buffer.from('bytes'), filename: 'x.torrent' } };
+  gotoUrls = [];
 
-  await assert.rejects(downloadFile('https://download-test.example/not-a-download.html'), /Timeout.*download/);
+  await cfFetch('https://download-test.example/repeat.torrent');
+  await cfFetch('https://download-test.example/repeat.torrent');
+
+  // A cached result would short-circuit before ever touching the page -
+  // gotoUrls staying at 1 would mean the second call served from cache.
+  assert.deepEqual(gotoUrls, ['https://download-test.example/repeat.torrent', 'https://download-test.example/repeat.torrent']);
 });
 
-test('downloadFile() routes a Cookie header through context.addCookies(), same mechanism as cfFetch', async () => {
+test('cfFetch routes a Cookie header through context.addCookies() the same way whether the url resolves as a page or a download', async () => {
   downloadTriggers = { 'https://download-cookie-test.example/one.torrent': { data: Buffer.from('x'), filename: 'x.torrent' } };
   addCookiesCalls = [];
 
-  await downloadFile('https://download-cookie-test.example/one.torrent', { headers: { Cookie: 'a=1' } });
+  await cfFetch('https://download-cookie-test.example/one.torrent', { headers: { Cookie: 'a=1' } });
 
   assert.equal(addCookiesCalls.length, 1);
   assert.deepEqual(addCookiesCalls[0], [{ name: 'a', value: '1', domain: 'download-cookie-test.example', path: '/' }]);
 });
 
-test('downloadFile() still succeeds when a non-Cookie header is passed, even though a browser download cannot carry it', async () => {
+test('cfFetch still succeeds when a non-Cookie header is passed to a url that turns out to be a download, even though a browser download cannot carry it', async () => {
   downloadTriggers = { 'https://download-test.example/with-header.torrent': { data: Buffer.from('x'), filename: 'x.torrent' } };
 
-  const result = await downloadFile('https://download-test.example/with-header.torrent', { headers: { 'X-Api-Key': 'secret' } });
+  const res = await cfFetch('https://download-test.example/with-header.torrent', { headers: { 'X-Api-Key': 'secret' } });
 
-  assert.equal(result.data.toString('utf-8'), 'x');
+  assert.equal((await res.buffer()).toString('utf-8'), 'x');
 });

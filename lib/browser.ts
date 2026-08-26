@@ -1,6 +1,6 @@
 import crypto from 'crypto';
 import { Camoufox } from 'camoufox-js';
-import type { Browser, BrowserContext, Page } from 'playwright-core';
+import type { Browser, BrowserContext, Download, Page } from 'playwright-core';
 import { TTLCache } from './cache.js';
 import { isBlocked, solveChallenge } from './challenge.js';
 import { Response as PlaywrightResponse } from 'playwright-core';
@@ -207,7 +207,7 @@ function recyclePage(page: Page): void {
 // has no such element-level access, and FileReader's own base64 encoding
 // happens in the browser's native code, not user-visible TypedArray reads,
 // so it isn't subject to the restriction.
-type TryFetchResponse = { challenged: false; base64: string } | { challenged: true } | null;
+type TryFetchResponse = { challenged: false; base64: string; filename?: string } | { challenged: true } | null;
 
 async function tryFetch(page: Page, url: string, init: FetchOptions): Promise<TryFetchResponse> {
   if (page.isClosed()) return null;
@@ -228,7 +228,20 @@ async function tryFetch(page: Page, url: string, init: FetchOptions): Promise<Tr
       // prefix with nothing after the comma, so this doesn't need a
       // separate empty-body special case.
       const base64 = dataUrl.slice(dataUrl.indexOf(',') + 1);
-      return { challenged: false, base64 };
+
+      // A same-origin .torrent (unlike itorrents.org's cross-origin one,
+      // which never reaches this path at all - see navigateOrDownload)
+      // reads fine through plain fetch(): CORS only restricts cross-origin
+      // bodies, and fetch() never triggers page.goto()'s download
+      // interception. Its real filename still lives in the response
+      // header rather than anywhere fetch() surfaces automatically, so
+      // it's parsed out here the same way suggestedFilename() would derive
+      // it from a real Download object.
+      const cd = res.headers.get('content-disposition') || '';
+      const match = cd.match(/filename\*?=(?:UTF-8''|")?([^";]+)/i);
+      const filename = match?.[1] ? decodeURIComponent(match[1].replace(/"/g, '')) : undefined;
+
+      return { challenged: false, base64, filename };
     }, { url, init });
   } catch {
     return null;
@@ -272,25 +285,76 @@ async function applyCookieHeader(page: Page, hostname: string, headers: Record<s
   if (cookies.length) await page.context().addCookies(cookies);
 }
 
+const NAV_TIMEOUT_MS = 15000;
+
+type NavResult = { kind: 'page'; response: PlaywrightResponse | null } | { kind: 'download'; base64: string; filename: string };
+
+// One navigation primitive doing double duty as detection: page.goto()
+// throws "Download is starting" for a direct file response (confirmed live
+// against itorrents.org) exactly when Firefox fires the page's 'download'
+// event (verified by reading playwright-core's own source:
+// _onDownloadCreated calls frameAbortedNavigation with that same message
+// right where it dispatches the event) - so the same one navigation either
+// lands on a normal page, or resolves as a real Download, with no separate
+// probe request needed and no second fetch mechanism to keep in sync.
+// download.createReadStream()'s bytes ARE the response; there's nothing
+// left to fetch afterwards.
+//
+// allowDownload gates whether "Download is starting" is treated as a real
+// download or falls back to warming the bare origin (this function's own
+// prior behavior, kept for that case): a POST's own warm-up navigation
+// must never be treated as a download, since silently returning a
+// downloaded file's bytes instead of performing the POST would be a real
+// (and non-obvious) bug. See fetchViaSession's allowDownload.
+//
 // A challenge (or the block-ban page) is frequently scoped to the specific
 // path being requested, not the whole origin (confirmed live: eztvx.to's
 // bare "/" navigates cleanly while its own "/search/..." independently
 // shows Cloudflare's challenge) - navigating to the bare origin instead of
-// url would miss detecting/solving a challenge scoped that way. So this
-// navigates to the exact url first, and only falls back to the bare origin
-// if THAT specific navigation throws "Download is starting" - Playwright's
-// own signal that url is a direct file response (e.g. itorrents.org's
-// .torrent links), not a navigable page at all, a real error hit live. The
-// actual target is still only ever fetched via tryFetch()'s in-page
-// fetch() below, which doesn't trigger download-interception - this goto
-// is purely to land on the right origin/clear a challenge, whichever URL
-// gets there.
-async function gotoPreferringExactUrl(page: Page, url: string): Promise<PlaywrightResponse | null> {
+// url would miss detecting/solving a challenge scoped that way, so the
+// fallback (when a download isn't allowed here) still tries the exact url
+// first.
+//
+// Confirmed live (not assumed): a download-triggering goto() leaves the
+// page's url, JS context and cookies completely untouched - safe to run on
+// the persistent per-hostname page, no separate scratch page needed.
+async function navigateOrDownload(page: Page, url: string, allowDownload: boolean): Promise<NavResult> {
+  // Armed before goto(), matching Playwright's own documented pattern -
+  // Firefox fires the 'download' event at essentially the same instant as
+  // the nav's own "Download is starting" error, so listening only inside
+  // the catch below would race it. A goto() that turns out NOT to be a
+  // download leaves this waiter armed and unused; it's not manually
+  // cancelable, so it's left to reject on its own timeout - swallowed here
+  // so that never surfaces as an unhandled rejection. In practice this only
+  // ever happens on the (relatively rare) first-nav/session-recovery path,
+  // not per request, so the brief dangling listener is an acceptable trade
+  // against the alternative of a second, reactive-only detection mechanism
+  // that could miss the real event.
+  const downloadPromise = allowDownload ? page.waitForEvent('download', { timeout: NAV_TIMEOUT_MS }) : null;
+  downloadPromise?.catch(() => {});
+
   try {
-    return await page.goto(url, { waitUntil: 'commit', timeout: 15000 });
+    const response = await page.goto(url, { waitUntil: 'commit', timeout: NAV_TIMEOUT_MS });
+    return { kind: 'page', response };
   } catch (err) {
     if (!(err instanceof Error) || !err.message.includes('Download is starting')) throw err;
-    return page.goto(`${new URL(url).origin}/`, { waitUntil: 'commit', timeout: 15000 });
+
+    if (!downloadPromise) {
+      const response = await page.goto(`${new URL(url).origin}/`, { waitUntil: 'commit', timeout: NAV_TIMEOUT_MS });
+      return { kind: 'page', response };
+    }
+
+    const download: Download = await downloadPromise;
+    const failure = await download.failure();
+    if (failure) throw new Error(`cfFetch: download failed for ${url}: ${failure}`, { cause: err });
+
+    const stream = await download.createReadStream();
+    const chunks: Buffer[] = [];
+    for await (const chunk of stream) chunks.push(chunk as Buffer);
+    const filename = download.suggestedFilename();
+    await download.delete().catch(() => {});
+
+    return { kind: 'download', base64: Buffer.concat(chunks).toString('base64'), filename };
   }
 }
 
@@ -301,7 +365,23 @@ async function gotoPreferringExactUrl(page: Page, url: string): Promise<Playwrig
 // genuinely binary content (a torrent file coincidentally containing both
 // "Access denied" and "Cloudflare" as literal substrings is not a real risk)
 // and means there's no separate binary-mode branch to keep in sync.
-async function fetchViaSession(url: string, opts: FetchOptions): Promise<string> {
+// A browser download can't carry arbitrary request headers the way fetch()
+// can - Cookie is routed through the context's own cookie jar
+// (applyCookieHeader) regardless of which path a fetch takes; anything
+// else would silently vanish on the download path specifically (tryFetch's
+// own in-page fetch() carries every header just fine), so it's called out
+// instead. Nothing in the definitions vendored so far ever reaches this
+// (only ext-to.yml sets download.headers, and it always resolves to a
+// magnet), but a future one might.
+function warnDroppedDownloadHeaders(url: string, headers: Record<string, string> | undefined): void {
+  for (const key of Object.keys(headers ?? {})) {
+    if (key.toLowerCase() !== 'cookie') {
+      console.error(`[cf] cfFetch: header "${key}" can't be sent by a browser download, ignored for ${url}.`);
+    }
+  }
+}
+
+async function fetchViaSession(url: string, opts: FetchOptions): Promise<{ base64: string; filename?: string }> {
   const { method = 'GET', headers, body } = opts;
   // Cookie is stripped here (see applyCookieHeader) rather than left for
   // fetch() to silently ignore - one clear mechanism, not two that could
@@ -311,11 +391,17 @@ async function fetchViaSession(url: string, opts: FetchOptions): Promise<string>
   const cacheKey = crypto.createHash('sha256').update(`${method}:${url}:${body ?? ''}`).digest('hex');
 
   const cached = pageCache.get(cacheKey);
-  if (cached !== undefined) return cached;
+  if (cached !== undefined) return { base64: cached };
 
   const hostname = new URL(url).hostname;
   const page = await getOrCreatePersistentPage(hostname);
   await applyCookieHeader(page, hostname, headers);
+
+  // A GET with no body is the only shape safe to treat as a possible
+  // download - a POST's own warm-up navigation (below) must never be, or a
+  // download response landing on that url would silently return a
+  // downloaded file's bytes instead of ever performing the POST.
+  const allowDownload = method === 'GET' && !body;
 
   // Exclusive per hostname: a second call for the same page must wait for
   // this one to finish, not interleave its own goto()/solveChallenge() with it.
@@ -325,8 +411,16 @@ async function fetchViaSession(url: string, opts: FetchOptions): Promise<string>
       let response: PlaywrightResponse | null = null;
 
       if (page.url() === 'about:blank') {
-        response = await serializeNav(() => gotoPreferringExactUrl(page, url));
+        const nav = await serializeNav(() => navigateOrDownload(page, url, allowDownload));
         firstNav = true;
+        // A real download's bytes ARE the response - nothing left to fetch,
+        // and (matching resolveMagnet's own choice for a Cardigann torrent
+        // result) not worth caching for what's normally a one-shot grab.
+        if (nav.kind === 'download') {
+          warnDroppedDownloadHeaders(url, headers);
+          return { base64: nav.base64, filename: nav.filename };
+        }
+        response = nav.response;
       }
 
       if (!isChallenge(response)) {
@@ -336,13 +430,18 @@ async function fetchViaSession(url: string, opts: FetchOptions): Promise<string>
             throw new Error(`cfFetch: fetch failed for ${url} even though the page shows no challenge - probably your IP got blocked.`);
           }
           pageCache.set(cacheKey, fast.base64);
-          return fast.base64;
+          return { base64: fast.base64, filename: fast.filename };
         }
       }
 
       console.error(`[cf] cfFetch: fast path unavailable for ${url}, recovering session.`);
       if (!firstNav) {
-        response = await serializeNav(() => gotoPreferringExactUrl(page, url));
+        const nav = await serializeNav(() => navigateOrDownload(page, url, allowDownload));
+        if (nav.kind === 'download') {
+          warnDroppedDownloadHeaders(url, headers);
+          return { base64: nav.base64, filename: nav.filename };
+        }
+        response = nav.response;
       }
 
       if (isChallenge(response)) {
@@ -367,7 +466,7 @@ async function fetchViaSession(url: string, opts: FetchOptions): Promise<string>
       }
 
       pageCache.set(cacheKey, retried.base64);
-      return retried.base64;
+      return { base64: retried.base64, filename: retried.filename };
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
       console.error(`[cf] recycling page for ${url} after failure: ${message}`);
@@ -384,108 +483,32 @@ async function fetchViaSession(url: string, opts: FetchOptions): Promise<string>
 // round-trip, not a stream), so there's no download left to defer and no
 // real "body already consumed" hazard - text() and buffer() can each be
 // called any number of times, decoding the same already-in-memory base64.
+//
+// filename is only ever populated on the path that actually has one to
+// give: a real Download's suggestedFilename(), or tryFetch()'s own
+// Content-Disposition parse for a same-origin file fetched in-page. A
+// plain HTML/JSON response has neither and leaves it undefined - callers
+// that only ever want text (every hand-written provider, most of
+// Cardigann) never look at it.
 export interface CfResponse {
   text(): Promise<string>;
   buffer(): Promise<Buffer>;
+  filename?: string;
 }
 
+// A single entry point for everything cfFetch's callers need: a normal
+// page's HTML/JSON, or a raw file's bytes (a .torrent, in practice - see
+// download.ts), auto-detected rather than requiring the caller to know
+// which in advance - fetchViaSession()/navigateOrDownload() do the actual
+// detection (one navigation doing double duty, see there for the full
+// rationale and the live evidence behind it).
 export async function cfFetch(url: string, opts: FetchOptions = {}): Promise<CfResponse> {
-  const base64 = await fetchViaSession(url, opts);
+  const { base64, filename } = await fetchViaSession(url, opts);
   return {
     text: async () => Buffer.from(base64, 'base64').toString('utf-8'),
-    buffer: async () => Buffer.from(base64, 'base64')
+    buffer: async () => Buffer.from(base64, 'base64'),
+    filename
   };
-}
-
-export interface DownloadedFile {
-  data: Buffer;
-  filename: string;
-}
-
-const DOWNLOAD_TIMEOUT_MS = 20000;
-
-// A dedicated path for fetching a raw file (a .torrent, in practice - see
-// download.ts) rather than an interactive page, using Playwright's own
-// Download API instead of cfFetch's page.goto()/tryFetch() machinery.
-// page.goto() throws "Download is starting" for a direct file response
-// (confirmed live against itorrents.org) - not a dead end, but the exact
-// same signal Firefox fires the page's 'download' event on (verified by
-// reading playwright-core's own source: _onDownloadCreated calls
-// frameAbortedNavigation(..., "Download is starting") right where the
-// event is dispatched). A plain cross-origin page.evaluate() fetch() can't
-// read a file like this either way (no CORS headers on that chain,
-// confirmed live) - navigating to it is the only way in, and Playwright
-// turns that navigation into a proper Download object instead of an error
-// once you wait for the event.
-//
-// This intentionally does NOT use context.request (Playwright's own
-// Node-side HTTP client, a real but entirely separate network stack from
-// the browser's own Firefox engine): confirmed live via a throwaway PAC
-// that proxies itorrents.org/.net through a dead port - the browser
-// download above is blocked by it (PAC honored), while context.request
-// egresses direct regardless (its own, unrelated proxy resolution,
-// unconnected to DOMAIN_OVER_PROXY's PAC file). Using the real download
-// path here means one network stack for everything, so DOMAIN_OVER_PROXY
-// (and any cf_clearance the browser already holds) just works with no
-// second, parallel proxy mechanism to keep in sync.
-//
-// Runs on its own scratch page (not a persistent per-hostname one from
-// getOrCreatePersistentPage): the anchor-click variant of this navigates
-// nowhere on a genuine download (confirmed live, page.url() unchanged),
-// but a URL that turns out NOT to be a download navigates the page for
-// real - fine to throw away on a scratch page, not fine to have silently
-// clobber a shared page's location.
-export async function downloadFile(url: string, opts: FetchOptions = {}): Promise<DownloadedFile> {
-  const { headers } = opts;
-  const hostname = new URL(url).hostname;
-  const { context } = await getSession();
-
-  let page: Page;
-  try {
-    page = await context.newPage();
-  } catch (err) {
-    await discardSession();
-    throw err;
-  }
-
-  try {
-    await applyCookieHeader(page, hostname, headers);
-    // A browser download can't carry arbitrary request headers the way
-    // fetch() can - Cookie is routed through the context's own cookie jar
-    // above (same mechanism cfFetch uses); anything else would silently
-    // vanish, so it's called out instead. Nothing in the definitions
-    // vendored so far ever reaches this (only ext-to.yml sets
-    // download.headers, and it always resolves to a magnet), but a future
-    // one might.
-    for (const key of Object.keys(headers ?? {})) {
-      if (key.toLowerCase() !== 'cookie') {
-        console.error(`[cf] downloadFile: header "${key}" can't be sent by a browser download, ignored for ${url}.`);
-      }
-    }
-
-    const downloadPromise = page.waitForEvent('download', { timeout: DOWNLOAD_TIMEOUT_MS });
-    await serializeNav(async () => {
-      try {
-        await page.goto(url, { waitUntil: 'commit', timeout: DOWNLOAD_TIMEOUT_MS });
-      } catch (err) {
-        if (!(err instanceof Error) || !err.message.includes('Download is starting')) throw err;
-      }
-    });
-
-    const download = await downloadPromise;
-    const failure = await download.failure();
-    if (failure) throw new Error(`downloadFile: download failed for ${url}: ${failure}`);
-
-    const stream = await download.createReadStream();
-    const chunks: Buffer[] = [];
-    for await (const chunk of stream) chunks.push(chunk as Buffer);
-    const filename = download.suggestedFilename();
-    await download.delete().catch(() => {});
-
-    return { data: Buffer.concat(chunks), filename };
-  } finally {
-    await page.close().catch(() => {});
-  }
 }
 
 export async function closeBrowser(): Promise<void> {

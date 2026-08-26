@@ -1,7 +1,7 @@
 import extTo from './ext-to.js';
 import x1337 from './1337x.js';
 import eztv from './eztv.js';
-import { cfFetch, downloadFile, registerDomainCookies } from '../lib/browser.js';
+import { cfFetch, registerDomainCookies } from '../lib/browser.js';
 import { createCardigannProvider } from '../lib/cardigann/adapter.js';
 import { loadConfig } from '../lib/cardigann/config.js';
 import { resolveIndexerConfig } from '../lib/cardigann/resolve-config.js';
@@ -58,16 +58,11 @@ export async function buildProviderMap(opts: BuildProviderMapOptions = {}): Prom
     console.error(`[cardigann] "${e.key}" not loaded: ${e.reasons.join('; ')}`);
   }
 
-  // lib/cardigann/*'s Fetcher/BinaryFetcher stay plain string/Buffer-
-  // returning functions (dozens of call sites, unaffected by cfFetch's own
-  // Response-shaped API) - adapted from cfFetch's CfResponse at this one
-  // integration point instead.
-  const cardigannProviders = ok.map((indexer) =>
-    createCardigannProvider(indexer, {
-      fetch: (url, opts) => cfFetch(url, opts).then((r) => r.text()),
-      fetchBinary: downloadFile
-    })
-  );
+  // lib/cardigann's Fetcher is structurally identical to cfFetch's own
+  // CfResponse-returning signature - passed straight through, no adapter
+  // needed (cfFetch auto-detects a page vs. a raw file itself; see
+  // lib/browser.ts's navigateOrDownload).
+  const cardigannProviders = ok.map((indexer) => createCardigannProvider(indexer, { fetch: cfFetch }));
   for (const p of cardigannProviders) {
     // Always empty today - login blocks (the only source of cookies in the
     // Cardigann format) are excluded by the capability gate. Kept for when

@@ -1,4 +1,4 @@
-import { buildMagnetFromInfohash, resolveCardigannDownload, type BinaryFetcher, type Fetcher } from './download.js';
+import { buildMagnetFromInfohash, resolveCardigannDownload, type Fetcher } from './download.js';
 import { collectCategoryMappings } from './category-mapping.js';
 import { categoryIdByName, categoryNameById } from '../categories.js';
 import type { IndexerConfigEntry } from './config.js';
@@ -31,7 +31,6 @@ export interface ResolvedIndexerLike {
 
 export interface CreateCardigannProviderOptions {
   fetch: Fetcher;
-  fetchBinary: BinaryFetcher;
   /** Injectable so tests with a nonzero requestDelay don't really wait. */
   sleep?: (ms: number) => Promise<void>;
 }
@@ -87,33 +86,17 @@ async function defaultSleep(ms: number): Promise<void> {
 
 // Every HTTP call this provider instance makes (search paths, download
 // before/selectors sub-fetches, a resolveMagnet cache-miss fallback, a
-// resolved .torrent file's own bytes) goes through one of these two gates,
-// so requestDelay (definition-level, seconds) is honoured consistently
-// rather than only on the initial search request. Both share one clock
-// (lastAt), not two independent ones - a text fetch and a binary fetch for
-// the same indexer still count as one shared request-rate budget.
-function createGatedFetchers(
-  rawFetch: Fetcher,
-  rawFetchBinary: BinaryFetcher,
-  requestDelaySec: number,
-  sleep: (ms: number) => Promise<void>
-): { fetch: Fetcher; fetchBinary: BinaryFetcher } {
-  if (!requestDelaySec) return { fetch: rawFetch, fetchBinary: rawFetchBinary };
+// resolved .torrent file's own bytes - all through the one Fetcher now)
+// goes through this gate, so requestDelay (definition-level, seconds) is
+// honoured consistently rather than only on the initial search request.
+function createGatedFetch(rawFetch: Fetcher, requestDelaySec: number, sleep: (ms: number) => Promise<void>): Fetcher {
+  if (!requestDelaySec) return rawFetch;
   let lastAt = 0;
-  const wait = async () => {
+  return async (url, opts) => {
     const remaining = lastAt + requestDelaySec * 1000 - Date.now();
     if (remaining > 0) await sleep(remaining);
     lastAt = Date.now();
-  };
-  return {
-    fetch: async (url, opts) => {
-      await wait();
-      return rawFetch(url, opts);
-    },
-    fetchBinary: async (url, opts) => {
-      await wait();
-      return rawFetchBinary(url, opts);
-    }
+    return rawFetch(url, opts);
   };
 }
 
@@ -130,12 +113,7 @@ export function createCardigannProvider(indexer: ResolvedIndexerLike, opts: Crea
     })();
 
   const requestDelaySec = Number(definition.requestDelay) || 0;
-  const { fetch: gatedFetch, fetchBinary: gatedFetchBinary } = createGatedFetchers(
-    opts.fetch,
-    opts.fetchBinary,
-    requestDelaySec,
-    opts.sleep ?? defaultSleep
-  );
+  const gatedFetch = createGatedFetch(opts.fetch, requestDelaySec, opts.sleep ?? defaultSleep);
 
   const config: Record<string, string> = { ...settingDefaults(definition) };
   for (const [k, v] of Object.entries(entry.config ?? {})) config[k] = configValueToString(v);
@@ -209,7 +187,7 @@ export function createCardigannProvider(indexer: ResolvedIndexerLike, opts: Crea
     const requests = buildPathRequests(searchBlock, baseUrl, ctx);
     const allItems: CardigannItem[] = [];
     for (const req of requests) {
-      const body = await gatedFetch(req.url, { method: req.method, headers: req.headers, body: req.body });
+      const body = await (await gatedFetch(req.url, { method: req.method, headers: req.headers, body: req.body })).text();
       const items = runSearchAll(definition, body, {
         keywords,
         categories: categoriesForCtx,
@@ -272,8 +250,7 @@ export function createCardigannProvider(indexer: ResolvedIndexerLike, opts: Crea
       downloadUri,
       itemTitle: '',
       config,
-      fetch: gatedFetch,
-      fetchBinary: gatedFetchBinary
+      fetch: gatedFetch
     });
     // Only a magnet is worth remembering here - it's a cheap string that
     // never goes stale. A resolved .torrent file's bytes aren't cached: a

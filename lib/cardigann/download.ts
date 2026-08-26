@@ -52,12 +52,18 @@ export interface DownloadBlockDef {
   headers?: Record<string, string[]>;
 }
 
+// Structurally matches lib/browser.ts's CfResponse (cfFetch's real return
+// type) - so cfFetch itself is directly assignable as a Fetcher, one
+// injected dependency for the whole module instead of a text/binary split.
+// Most call sites below only ever read .text(); the one download.selectors[]
+// site that resolves to a raw file (not magnet:) reads .buffer() and
+// .filename instead - see there.
 export interface Fetcher {
-  (url: string, opts?: { method?: string; headers?: Record<string, string>; body?: string }): Promise<string>;
-}
-
-export interface BinaryFetcher {
-  (url: string, opts?: { method?: string; headers?: Record<string, string>; body?: string }): Promise<{ data: Buffer; filename: string }>;
+  (url: string, opts?: { method?: string; headers?: Record<string, string>; body?: string }): Promise<{
+    text(): Promise<string>;
+    buffer(): Promise<Buffer>;
+    filename?: string;
+  }>;
 }
 
 // HTTP header values (Content-Disposition's filename) and filesystems both
@@ -165,12 +171,6 @@ export interface ResolveOptions {
    * callers/tests that don't need it. */
   config?: Record<string, string>;
   fetch: Fetcher;
-  /** Fetches a resolved non-magnet download link's raw bytes, through the
-   * same session/Cloudflare-bypass a plain Fetcher would use - needed
-   * because a .torrent file isn't valid UTF-8 and fetch()-as-text would
-   * corrupt it. Only called when download.selectors[] actually resolves to
-   * one (magnet-only defs never touch it). */
-  fetchBinary: BinaryFetcher;
 }
 
 export async function resolveCardigannDownload(opts: ResolveOptions): Promise<ResolvedDownload> {
@@ -195,7 +195,7 @@ export async function resolveCardigannDownload(opts: ResolveOptions): Promise<Re
     // No download block declared: the item's own captured link is assumed
     // to be a real page containing a magnet, same fallback our hand-written
     // providers (ext-to/1337x/eztv) all use on their detail pages.
-    const html = await opts.fetch(opts.downloadUri);
+    const html = await (await opts.fetch(opts.downloadUri)).text();
     const magnet = extractFromBody(html, { selector: 'a[href^="magnet:"]', attribute: 'href' }, ctx);
     if (magnet) return { kind: 'magnet', magnet };
     throw new Error(`Cardigann: no download block and no magnet link found on ${opts.downloadUri}`);
@@ -214,7 +214,7 @@ export async function resolveCardigannDownload(opts: ResolveOptions): Promise<Re
     // this same before block's path/inputs templates) - one fetch covers
     // both needs when a definition uses them together.
     if ((!beforePath && download.before.pathselector) || download.before.vars) {
-      const sourceHtml = await opts.fetch(opts.downloadUri, headers ? { headers } : undefined);
+      const sourceHtml = await (await opts.fetch(opts.downloadUri, headers ? { headers } : undefined)).text();
       if (!beforePath && download.before.pathselector) {
         beforePath = extractFromBody(sourceHtml, download.before.pathselector, ctx);
       }
@@ -241,13 +241,15 @@ export async function resolveCardigannDownload(opts: ResolveOptions): Promise<Re
 
     if (method === 'GET') {
       if (qs) beforeUrl.search = beforeUrl.search ? `${beforeUrl.search}&${qs}` : qs;
-      beforeResponseBody = await opts.fetch(beforeUrl.toString(), headers ? { headers } : undefined);
+      beforeResponseBody = await (await opts.fetch(beforeUrl.toString(), headers ? { headers } : undefined)).text();
     } else {
-      beforeResponseBody = await opts.fetch(beforeUrl.toString(), {
-        method,
-        headers: { ...headers, 'Content-Type': 'application/x-www-form-urlencoded' },
-        body: qs
-      });
+      beforeResponseBody = await (
+        await opts.fetch(beforeUrl.toString(), {
+          method,
+          headers: { ...headers, 'Content-Type': 'application/x-www-form-urlencoded' },
+          body: qs
+        })
+      ).text();
     }
   }
 
@@ -257,7 +259,7 @@ export async function resolveCardigannDownload(opts: ResolveOptions): Promise<Re
       if (beforeResponseBody === undefined) throw new Error('Cardigann: usebeforeresponse:true but no download.before block ran');
       return beforeResponseBody;
     }
-    if (defaultResponseBody === undefined) defaultResponseBody = await opts.fetch(opts.downloadUri, headers ? { headers } : undefined);
+    if (defaultResponseBody === undefined) defaultResponseBody = await (await opts.fetch(opts.downloadUri, headers ? { headers } : undefined)).text();
     return defaultResponseBody;
   };
 
@@ -286,7 +288,8 @@ export async function resolveCardigannDownload(opts: ResolveOptions): Promise<Re
     // same as before.path already does elsewhere in this function.
     const absoluteUrl = new URL(resolved, opts.downloadUri).toString();
     try {
-      const { data, filename } = await opts.fetchBinary(absoluteUrl, headers ? { headers } : undefined);
+      const res = await opts.fetch(absoluteUrl, headers ? { headers } : undefined);
+      const data = await res.buffer();
       if (data[0] !== 0x64) {
         // Every valid .torrent file is a bencoded dictionary, which always
         // starts with an ASCII 'd' - catches "actually got an HTML error
@@ -294,10 +297,11 @@ export async function resolveCardigannDownload(opts: ResolveOptions): Promise<Re
         // garbage bytes it'll fail to parse with no explanation.
         throw new Error(`Cardigann: download selector resolved to ${absoluteUrl}, but the fetched content isn't a valid .torrent file.`);
       }
-      // filename is the real Content-Disposition name (BinaryFetcher's own
-      // suggestedFilename()) when the fetcher has one - falls back to the
-      // item's own title only if that's somehow empty.
-      return { kind: 'torrent', data, filename: sanitizeFilename(filename || opts.itemTitle) };
+      // res.filename is the real Content-Disposition name (cfFetch's own
+      // downloadFile()/Content-Disposition parse - see lib/browser.ts) when
+      // the fetcher has one - falls back to the item's own title only if
+      // that's somehow empty.
+      return { kind: 'torrent', data, filename: sanitizeFilename(res.filename || opts.itemTitle) };
     } catch (err) {
       lastFetchError = err instanceof Error ? err : new Error(String(err));
       console.error(`[cardigann] download selector ${absoluteUrl} failed, trying the next one: ${lastFetchError.message}`);
