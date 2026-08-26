@@ -25,33 +25,86 @@ let gotoDownloadStartingFor: string | null = null;
 
 type FakeCfResponse = { text(): Promise<string>; buffer(): Promise<Buffer> };
 
+type FakeDownload = {
+  failure: () => Promise<string | null>;
+  createReadStream: () => Promise<AsyncIterable<Buffer>>;
+  suggestedFilename: () => string;
+  delete: () => Promise<void>;
+};
+
+// downloadFile() waits for the page's 'download' event before navigating,
+// same order Playwright's own docs use - so a goto() to a url configured
+// here resolves whichever waitForEvent('download') call is currently
+// pending on this page, then throws "Download is starting" itself, exactly
+// mirroring Firefox's real _onDownloadCreated behavior (confirmed live and
+// by reading playwright-core's own source - see NOTES.md).
+let downloadTriggers: Record<string, { data: Buffer; filename: string; failure?: string | null }> = {};
+let downloadDeletes = 0;
+// Real code passes a real 20s timeout to waitForEvent; this fake ignores
+// that value and uses its own short one so a "goto succeeded, no download
+// ever fired" test doesn't have to actually wait 20 seconds.
+const FAKE_DOWNLOAD_EVENT_TIMEOUT_MS = 30;
+
 // A factory, not one shared object: recyclePage() evicts by identity, so a
 // reused object would be found under every hostname at once.
-const createFakePage = () => ({
-  isClosed: () => false,
-  evaluate: async (_fn: unknown, arg: { init?: unknown }) => {
-    activeEvaluates++;
-    maxActiveEvaluates = Math.max(maxActiveEvaluates, activeEvaluates);
-    lastEvaluateInit = arg?.init;
-    await new Promise((r) => setTimeout(r, evaluateDelayMs));
-    activeEvaluates--;
-    return { challenged: false, base64: Buffer.from('<html><body>cleared, not a challenge</body></html>').toString('base64') };
-  },
-  url: () => 'about:blank',
-  goto: async (url: string) => {
-    gotoUrls.push(url);
-    if (gotoFails) throw new Error('page.goto: Timeout 15000ms exceeded.');
-    if (url === gotoDownloadStartingFor) throw new Error('page.goto: Download is starting');
-    return { headers: () => ({}), status: () => 200 };
-  },
-  close: async () => {
-    pageCloses++;
-  },
-  // Real Playwright pages expose .context() to get back to the owning
-  // BrowserContext - used by cfFetch to route a Cookie header through
-  // context.addCookies() instead of a (browser-forbidden) fetch() header.
-  context: () => fakeContext
-});
+const createFakePage = () => {
+  const downloadWaiters: Array<(d: FakeDownload) => void> = [];
+
+  return {
+    isClosed: () => false,
+    evaluate: async (_fn: unknown, arg: { init?: unknown }) => {
+      activeEvaluates++;
+      maxActiveEvaluates = Math.max(maxActiveEvaluates, activeEvaluates);
+      lastEvaluateInit = arg?.init;
+      await new Promise((r) => setTimeout(r, evaluateDelayMs));
+      activeEvaluates--;
+      return { challenged: false, base64: Buffer.from('<html><body>cleared, not a challenge</body></html>').toString('base64') };
+    },
+    url: () => 'about:blank',
+    goto: async (url: string) => {
+      gotoUrls.push(url);
+      if (gotoFails) throw new Error('page.goto: Timeout 15000ms exceeded.');
+
+      const trigger = downloadTriggers[url];
+      if (trigger) {
+        const dl: FakeDownload = {
+          failure: async () => trigger.failure ?? null,
+          createReadStream: async () => (async function* () { yield trigger.data; })(),
+          suggestedFilename: () => trigger.filename,
+          delete: async () => { downloadDeletes++; }
+        };
+        const waiter = downloadWaiters.shift();
+        if (waiter) waiter(dl);
+        throw new Error('page.goto: Download is starting');
+      }
+
+      if (url === gotoDownloadStartingFor) throw new Error('page.goto: Download is starting');
+      return { headers: () => ({}), status: () => 200 };
+    },
+    // Fake stand-in for Playwright's real page.waitForEvent('download', ...):
+    // resolves via the goto() trigger above, or rejects on its own short
+    // timeout if goto() never matched a configured download url.
+    waitForEvent: async (event: string, opts?: { timeout?: number }): Promise<FakeDownload> => {
+      if (event !== 'download') throw new Error(`fake page.waitForEvent: unsupported event "${event}"`);
+      return new Promise((resolve, reject) => {
+        downloadWaiters.push(resolve);
+        setTimeout(() => {
+          const idx = downloadWaiters.indexOf(resolve);
+          if (idx === -1) return;
+          downloadWaiters.splice(idx, 1);
+          reject(new Error(`page.waitForEvent: Timeout ${opts?.timeout ?? FAKE_DOWNLOAD_EVENT_TIMEOUT_MS}ms exceeded while waiting for event "download"`));
+        }, FAKE_DOWNLOAD_EVENT_TIMEOUT_MS);
+      });
+    },
+    close: async () => {
+      pageCloses++;
+    },
+    // Real Playwright pages expose .context() to get back to the owning
+    // BrowserContext - used by cfFetch to route a Cookie header through
+    // context.addCookies() instead of a (browser-forbidden) fetch() header.
+    context: () => fakeContext
+  };
+};
 
 let newPageCalls = 0;
 let newContextCalls = 0;
@@ -60,13 +113,6 @@ let camoufoxCalls = 0;
 let newPageFails = false;
 let browserCloses = 0;
 let addCookiesCalls: unknown[] = [];
-let requestFetchCalls: { url: string; opts: unknown }[] = [];
-let requestFetchResult: { ok: boolean; status: number; statusText: string; body: Buffer } = {
-  ok: true,
-  status: 200,
-  statusText: 'OK',
-  body: Buffer.from('fake file bytes')
-};
 
 const fakeContext = {
   newPage: async () => {
@@ -79,16 +125,6 @@ const fakeContext = {
   cookies: async () => [],
   addCookies: async (cookies: unknown) => {
     addCookiesCalls.push(cookies);
-  },
-  // Playwright's APIRequestContext - used by fetchFileDirect() instead of
-  // page.goto()/tryFetch() for raw file fetches (a .torrent, in practice),
-  // since a direct-download response breaks page.goto() outright.
-  request: {
-    fetch: async (url: string, opts: unknown) => {
-      requestFetchCalls.push({ url, opts });
-      const result = requestFetchResult;
-      return { ok: () => result.ok, status: () => result.status, statusText: () => result.statusText, body: async () => result.body };
-    }
   }
 };
 
@@ -111,33 +147,7 @@ mock.module('camoufox-js', {
   }
 });
 
-// fetchFileDirect()'s proxied path uses Playwright's own top-level
-// request.newContext() (a standalone APIRequestContext, distinct from the
-// browser session's context.request) - a real network client if not
-// mocked, so it needs its own fake here, separate from fakeContext.request
-// above (which only ever backs the shared, non-proxied path).
-let proxiedNewContextCalls: unknown[] = [];
-const fakeProxiedRequestContext = {
-  fetch: async (url: string, opts: unknown) => {
-    requestFetchCalls.push({ url, opts });
-    const result = requestFetchResult;
-    return { ok: () => result.ok, status: () => result.status, statusText: () => result.statusText, body: async () => result.body };
-  },
-  dispose: async () => {}
-};
-
-mock.module('playwright-core', {
-  exports: {
-    request: {
-      newContext: async (opts: unknown) => {
-        proxiedNewContextCalls.push(opts);
-        return fakeProxiedRequestContext;
-      }
-    }
-  }
-});
-
-const { cfFetch, closeBrowser, registerDomainCookies, fetchFileDirect } = await import(path.join(ROOT, 'dist', 'lib', 'browser.js'));
+const { cfFetch, closeBrowser, registerDomainCookies, downloadFile } = await import(path.join(ROOT, 'dist', 'lib', 'browser.js'));
 
 test('concurrent cfFetch calls for the same new hostname only create one page', async () => {
   newPageCalls = 0;
@@ -304,40 +314,57 @@ test('CfResponse.text() and .buffer() decode the same underlying response, calla
   assert.equal(buf.toString('utf-8'), '<html><body>cleared, not a challenge</body></html>');
 });
 
-test('fetchFileDirect() returns the real bytes on a 200, via the shared (non-proxied) request context for a normal host', async () => {
-  requestFetchCalls = [];
-  proxiedNewContextCalls = [];
-  requestFetchResult = { ok: true, status: 200, statusText: 'OK', body: Buffer.from('real torrent bytes') };
+test('downloadFile() returns the real bytes and the real suggested filename on a successful download', async () => {
+  downloadTriggers = {
+    'https://download-test.example/one.torrent': { data: Buffer.from('real torrent bytes'), filename: 'ubuntu.torrent' }
+  };
 
-  const buf = await fetchFileDirect('https://file-test.example/one.torrent');
+  const result = await downloadFile('https://download-test.example/one.torrent');
 
-  assert.ok(Buffer.isBuffer(buf));
-  assert.equal(buf.toString('utf-8'), 'real torrent bytes');
-  assert.equal(requestFetchCalls.length, 1);
-  assert.equal(requestFetchCalls[0]?.url, 'https://file-test.example/one.torrent');
-  assert.equal(proxiedNewContextCalls.length, 0, 'a host that is not DOMAIN_OVER_PROXY must never create the proxied request context at all');
+  assert.ok(Buffer.isBuffer(result.data));
+  assert.equal(result.data.toString('utf-8'), 'real torrent bytes');
+  assert.equal(result.filename, 'ubuntu.torrent');
 });
 
-test('fetchFileDirect() throws with the real status and statusText on a non-2xx response', async () => {
-  requestFetchResult = { ok: false, status: 403, statusText: 'Forbidden', body: Buffer.from('<html>blocked</html>') };
+test('downloadFile() deletes the browser-side download copy and closes its scratch page even on success', async () => {
+  downloadTriggers = { 'https://download-test.example/cleanup.torrent': { data: Buffer.from('x'), filename: 'x.torrent' } };
+  downloadDeletes = 0;
+  const before = pageCloses;
 
-  await assert.rejects(fetchFileDirect('https://file-test.example/dead.torrent'), /403 Forbidden/);
+  await downloadFile('https://download-test.example/cleanup.torrent');
+
+  assert.equal(downloadDeletes, 1, 'the temporary browser-side download file must be deleted, not leaked to disk');
+  assert.equal(pageCloses, before + 1, 'the scratch page must be closed after use');
 });
 
-test('fetchFileDirect() routes a DOMAIN_OVER_PROXY host through a dedicated proxied request context, not the shared one', async () => {
-  requestFetchCalls = [];
-  proxiedNewContextCalls = [];
-  requestFetchResult = { ok: true, status: 200, statusText: 'OK', body: Buffer.from('proxied bytes') };
+test('downloadFile() throws a clear error when the download itself failed', async () => {
+  downloadTriggers = {
+    'https://download-test.example/broken.torrent': { data: Buffer.from(''), filename: '', failure: 'net::ERR_CONNECTION_RESET' }
+  };
 
-  const buf = await fetchFileDirect('https://proxy-test.example/one.torrent');
-  assert.equal(buf.toString('utf-8'), 'proxied bytes');
-  assert.equal(proxiedNewContextCalls.length, 1);
-  assert.deepEqual(proxiedNewContextCalls[0], { proxy: { server: 'http://fake-proxy.invalid:8888' } });
+  await assert.rejects(downloadFile('https://download-test.example/broken.torrent'), /net::ERR_CONNECTION_RESET/);
+});
 
-  // A second call, same or different DOMAIN_OVER_PROXY host, reuses the
-  // one already-created proxied context rather than making a new one -
-  // same lazy-singleton pattern the browser session itself uses.
-  await fetchFileDirect('https://sub.proxy-test.example/two.torrent');
-  assert.equal(proxiedNewContextCalls.length, 1, 'the proxied request context is created once and reused, not per call');
-  assert.equal(requestFetchCalls.length, 2);
+test('downloadFile() throws (rather than hanging) when the url never triggers a real download', async () => {
+  downloadTriggers = {};
+
+  await assert.rejects(downloadFile('https://download-test.example/not-a-download.html'), /Timeout.*download/);
+});
+
+test('downloadFile() routes a Cookie header through context.addCookies(), same mechanism as cfFetch', async () => {
+  downloadTriggers = { 'https://download-cookie-test.example/one.torrent': { data: Buffer.from('x'), filename: 'x.torrent' } };
+  addCookiesCalls = [];
+
+  await downloadFile('https://download-cookie-test.example/one.torrent', { headers: { Cookie: 'a=1' } });
+
+  assert.equal(addCookiesCalls.length, 1);
+  assert.deepEqual(addCookiesCalls[0], [{ name: 'a', value: '1', domain: 'download-cookie-test.example', path: '/' }]);
+});
+
+test('downloadFile() still succeeds when a non-Cookie header is passed, even though a browser download cannot carry it', async () => {
+  downloadTriggers = { 'https://download-test.example/with-header.torrent': { data: Buffer.from('x'), filename: 'x.torrent' } };
+
+  const result = await downloadFile('https://download-test.example/with-header.torrent', { headers: { 'X-Api-Key': 'secret' } });
+
+  assert.equal(result.data.toString('utf-8'), 'x');
 });

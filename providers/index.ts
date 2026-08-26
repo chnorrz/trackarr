@@ -1,7 +1,7 @@
 import extTo from './ext-to.js';
 import x1337 from './1337x.js';
 import eztv from './eztv.js';
-import { cfFetch, fetchFileDirect, registerDomainCookies } from '../lib/browser.js';
+import { cfFetch, downloadFile, registerDomainCookies } from '../lib/browser.js';
 import { createCardigannProvider } from '../lib/cardigann/adapter.js';
 import { loadConfig } from '../lib/cardigann/config.js';
 import { resolveIndexerConfig } from '../lib/cardigann/resolve-config.js';
@@ -65,7 +65,7 @@ export async function buildProviderMap(opts: BuildProviderMapOptions = {}): Prom
   const cardigannProviders = ok.map((indexer) =>
     createCardigannProvider(indexer, {
       fetch: (url, opts) => cfFetch(url, opts).then((r) => r.text()),
-      fetchBinary: fetchFileDirect
+      fetchBinary: downloadFile
     })
   );
   for (const p of cardigannProviders) {

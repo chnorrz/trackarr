@@ -1,9 +1,9 @@
 import crypto from 'crypto';
 import { Camoufox } from 'camoufox-js';
-import type { APIRequestContext, Browser, BrowserContext, Page } from 'playwright-core';
+import type { Browser, BrowserContext, Page } from 'playwright-core';
 import { TTLCache } from './cache.js';
 import { isBlocked, solveChallenge } from './challenge.js';
-import { request as playwrightRequest, Response as PlaywrightResponse } from 'playwright-core';
+import { Response as PlaywrightResponse } from 'playwright-core';
 import type { ProviderCookie } from './types.js';
 
 // Must stay within the Xvfb geometry in the Dockerfile's CMD: a window larger
@@ -18,36 +18,6 @@ const DOMAIN_OVER_PROXY = (process.env.DOMAIN_OVER_PROXY || '')
 type BrowserSession = { browser: Browser; context: BrowserContext };
 
 let session: Promise<BrowserSession> | null = null;
-
-// Same host-matching rule as buildPacDataUri()'s own PAC function, kept in
-// sync deliberately (see fetchFileDirect): exact match or a dot-boundary
-// suffix match, never a bare substring (a domain "notevil.com" must not
-// match a DOMAIN_OVER_PROXY entry of "evil.com").
-function hostMatchesProxyDomain(hostname: string): boolean {
-  return DOMAIN_OVER_PROXY.some((d) => hostname === d || hostname.endsWith(`.${d}`));
-}
-
-// context.request (used by both cfFetch, indirectly, and fetchFileDirect)
-// is Node's own HTTP client (playwright-core bundles http/https + an
-// HttpsProxyAgent/SocksProxyAgent - verified by reading its source, not
-// assumed), entirely separate from the browser's own Firefox network stack
-// that DOMAIN_OVER_PROXY's PAC file configures. A plain context.request
-// call therefore always egresses direct, regardless of DOMAIN_OVER_PROXY -
-// fine for a host that doesn't need it, wrong (silently) for one that
-// does. This is a second, standalone APIRequestContext (Playwright's own
-// request.newContext(), not the browser session's context.request),
-// created lazily, once, with its own explicit proxy - used only for a
-// DOMAIN_OVER_PROXY host, so a host that doesn't need the proxy never
-// pays for it or shares a network identity with one that does.
-let proxiedRequestContext: Promise<APIRequestContext> | null = null;
-
-function getProxiedRequestContext(): Promise<APIRequestContext> {
-  if (!proxiedRequestContext) {
-    if (!PROXY_URL) throw new Error('fetchFileDirect: a DOMAIN_OVER_PROXY host was requested but PROXY_URL is not set.');
-    proxiedRequestContext = playwrightRequest.newContext({ proxy: { server: PROXY_URL } });
-  }
-  return proxiedRequestContext;
-}
 
 // Providers register cookies once at startup; applied to every fresh context
 // so a session discard/relaunch (e.g. after a browser crash) doesn't drop them.
@@ -132,12 +102,6 @@ async function discardSession(): Promise<void> {
   const live = await current?.catch(() => null);
   try {
     await live?.browser.close();
-  } catch { /* already gone */ }
-
-  const proxiedCtx = proxiedRequestContext;
-  proxiedRequestContext = null;
-  try {
-    await (await proxiedCtx?.catch(() => null))?.dispose();
   } catch { /* already gone */ }
 }
 
@@ -433,40 +397,95 @@ export async function cfFetch(url: string, opts: FetchOptions = {}): Promise<CfR
   };
 }
 
+export interface DownloadedFile {
+  data: Buffer;
+  filename: string;
+}
+
+const DOWNLOAD_TIMEOUT_MS = 20000;
+
 // A dedicated path for fetching a raw file (a .torrent, in practice - see
-// download.ts) rather than an interactive page. Deliberately does NOT reuse
-// cfFetch's page.goto()/tryFetch() machinery: that's built for pages that
-// may need an actual Cloudflare challenge solved (Camoufox's real Firefox
-// fingerprint, needed to pass one, is the entire reason that machinery
-// exists), and a direct file response breaks page.goto() outright
-// ("Download is starting", both for the file's own URL AND, confirmed
-// live, for its host's bare origin too - itorrents.org's root is itself
-// challenge-gated even though the specific /torrent/<hash>.torrent path it
-// redirects through is not, confirmed live as a clean 3-hop chain
-// (itorrents.org -> itorrents.net -> the actual host serving the bytes)
-// with no challenge anywhere in it). A plain cross-origin page.evaluate()
-// fetch() can't read the body either (no CORS headers on that chain), so
-// this needs its own path regardless of the download-interception issue.
-// A raw file endpoint like this is, in practice, not challenge-gated the
-// way an interactive page is - Playwright's context.request (a real Node
-// HTTP client, not the browser's own network stack - see
-// hostMatchesProxyDomain's comment) shares the browser context's cookie
-// jar (any cf_clearance already obtained) and follows redirects
-// transparently, with no download-interception since it's not a page
-// navigation at all.
-export async function fetchFileDirect(url: string, opts: FetchOptions = {}): Promise<Buffer> {
-  const { method = 'GET', headers, body } = opts;
+// download.ts) rather than an interactive page, using Playwright's own
+// Download API instead of cfFetch's page.goto()/tryFetch() machinery.
+// page.goto() throws "Download is starting" for a direct file response
+// (confirmed live against itorrents.org) - not a dead end, but the exact
+// same signal Firefox fires the page's 'download' event on (verified by
+// reading playwright-core's own source: _onDownloadCreated calls
+// frameAbortedNavigation(..., "Download is starting") right where the
+// event is dispatched). A plain cross-origin page.evaluate() fetch() can't
+// read a file like this either way (no CORS headers on that chain,
+// confirmed live) - navigating to it is the only way in, and Playwright
+// turns that navigation into a proper Download object instead of an error
+// once you wait for the event.
+//
+// This intentionally does NOT use context.request (Playwright's own
+// Node-side HTTP client, a real but entirely separate network stack from
+// the browser's own Firefox engine): confirmed live via a throwaway PAC
+// that proxies itorrents.org/.net through a dead port - the browser
+// download above is blocked by it (PAC honored), while context.request
+// egresses direct regardless (its own, unrelated proxy resolution,
+// unconnected to DOMAIN_OVER_PROXY's PAC file). Using the real download
+// path here means one network stack for everything, so DOMAIN_OVER_PROXY
+// (and any cf_clearance the browser already holds) just works with no
+// second, parallel proxy mechanism to keep in sync.
+//
+// Runs on its own scratch page (not a persistent per-hostname one from
+// getOrCreatePersistentPage): the anchor-click variant of this navigates
+// nowhere on a genuine download (confirmed live, page.url() unchanged),
+// but a URL that turns out NOT to be a download navigates the page for
+// real - fine to throw away on a scratch page, not fine to have silently
+// clobber a shared page's location.
+export async function downloadFile(url: string, opts: FetchOptions = {}): Promise<DownloadedFile> {
+  const { headers } = opts;
   const hostname = new URL(url).hostname;
+  const { context } = await getSession();
 
-  const requestContext = hostMatchesProxyDomain(hostname) ? await getProxiedRequestContext() : (await getSession()).context.request;
-
-  const response = await requestContext.fetch(url, { method, headers, data: body, timeout: 15000 });
-
-  if (!response.ok()) {
-    throw new Error(`fetchFileDirect: ${response.status()} ${response.statusText()} for ${url}`);
+  let page: Page;
+  try {
+    page = await context.newPage();
+  } catch (err) {
+    await discardSession();
+    throw err;
   }
 
-  return response.body();
+  try {
+    await applyCookieHeader(page, hostname, headers);
+    // A browser download can't carry arbitrary request headers the way
+    // fetch() can - Cookie is routed through the context's own cookie jar
+    // above (same mechanism cfFetch uses); anything else would silently
+    // vanish, so it's called out instead. Nothing in the definitions
+    // vendored so far ever reaches this (only ext-to.yml sets
+    // download.headers, and it always resolves to a magnet), but a future
+    // one might.
+    for (const key of Object.keys(headers ?? {})) {
+      if (key.toLowerCase() !== 'cookie') {
+        console.error(`[cf] downloadFile: header "${key}" can't be sent by a browser download, ignored for ${url}.`);
+      }
+    }
+
+    const downloadPromise = page.waitForEvent('download', { timeout: DOWNLOAD_TIMEOUT_MS });
+    await serializeNav(async () => {
+      try {
+        await page.goto(url, { waitUntil: 'commit', timeout: DOWNLOAD_TIMEOUT_MS });
+      } catch (err) {
+        if (!(err instanceof Error) || !err.message.includes('Download is starting')) throw err;
+      }
+    });
+
+    const download = await downloadPromise;
+    const failure = await download.failure();
+    if (failure) throw new Error(`downloadFile: download failed for ${url}: ${failure}`);
+
+    const stream = await download.createReadStream();
+    const chunks: Buffer[] = [];
+    for await (const chunk of stream) chunks.push(chunk as Buffer);
+    const filename = download.suggestedFilename();
+    await download.delete().catch(() => {});
+
+    return { data: Buffer.concat(chunks), filename };
+  } finally {
+    await page.close().catch(() => {});
+  }
 }
 
 export async function closeBrowser(): Promise<void> {

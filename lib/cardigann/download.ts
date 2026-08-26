@@ -57,19 +57,23 @@ export interface Fetcher {
 }
 
 export interface BinaryFetcher {
-  (url: string, opts?: { method?: string; headers?: Record<string, string>; body?: string }): Promise<Buffer>;
+  (url: string, opts?: { method?: string; headers?: Record<string, string>; body?: string }): Promise<{ data: Buffer; filename: string }>;
 }
 
 // HTTP header values (Content-Disposition's filename) and filesystems both
 // reject/mangle quotes, control characters and path separators - the same
 // restriction magnet's own &dn= sidesteps via percent-encoding, but a
-// filename has to actually be a plausible filename.
-function sanitizeFilename(title: string): string {
-  const cleaned = [...title]
+// filename has to actually be a plausible filename. name is typically the
+// real Content-Disposition filename now (BinaryFetcher's own
+// suggestedFilename()), not the item title - already has a sane extension,
+// so this doesn't blindly append .torrent on top of one.
+function sanitizeFilename(name: string): string {
+  const cleaned = [...name]
     .filter((c) => c.charCodeAt(0) > 0x1f && !'"\\/'.includes(c))
     .join('')
     .trim();
-  return `${cleaned || 'download'}.torrent`;
+  const base = cleaned || 'download';
+  return base.toLowerCase().endsWith('.torrent') ? base : `${base}.torrent`;
 }
 
 // The one hardcoded piece of this module: infohash-built magnets need a
@@ -260,11 +264,11 @@ export async function resolveCardigannDownload(opts: ResolveOptions): Promise<Re
   // A real definition's selectors[] is an ordered fallback list by design -
   // 1337x.yml's own info_download setting text says as much ("we suggest
   // using the magnet link as a fallback [to iTorrents]"). A selector that
-  // *matches* but points at a link that's actually dead (confirmed live:
-  // itorrents.org 403s/network-errors entirely as of this writing) must
-  // fall through to the next selector, not abort the whole resolution -
-  // only an empty (non-)match did that before. The last such failure is
-  // kept so a real reason surfaces if every selector in the list fails.
+  // *matches* but points at a link that's actually dead (a stale mirror, a
+  // site that retired a CDN) must fall through to the next selector, not
+  // abort the whole resolution - only an empty (non-)match did that
+  // before. The last such failure is kept so a real reason surfaces if
+  // every selector in the list fails.
   let lastFetchError: Error | undefined;
 
   for (const selector of download.selectors ?? []) {
@@ -282,7 +286,7 @@ export async function resolveCardigannDownload(opts: ResolveOptions): Promise<Re
     // same as before.path already does elsewhere in this function.
     const absoluteUrl = new URL(resolved, opts.downloadUri).toString();
     try {
-      const data = await opts.fetchBinary(absoluteUrl, headers ? { headers } : undefined);
+      const { data, filename } = await opts.fetchBinary(absoluteUrl, headers ? { headers } : undefined);
       if (data[0] !== 0x64) {
         // Every valid .torrent file is a bencoded dictionary, which always
         // starts with an ASCII 'd' - catches "actually got an HTML error
@@ -290,7 +294,10 @@ export async function resolveCardigannDownload(opts: ResolveOptions): Promise<Re
         // garbage bytes it'll fail to parse with no explanation.
         throw new Error(`Cardigann: download selector resolved to ${absoluteUrl}, but the fetched content isn't a valid .torrent file.`);
       }
-      return { kind: 'torrent', data, filename: sanitizeFilename(opts.itemTitle) };
+      // filename is the real Content-Disposition name (BinaryFetcher's own
+      // suggestedFilename()) when the fetcher has one - falls back to the
+      // item's own title only if that's somehow empty.
+      return { kind: 'torrent', data, filename: sanitizeFilename(filename || opts.itemTitle) };
     } catch (err) {
       lastFetchError = err instanceof Error ? err : new Error(String(err));
       console.error(`[cardigann] download selector ${absoluteUrl} failed, trying the next one: ${lastFetchError.message}`);

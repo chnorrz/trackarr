@@ -22,11 +22,14 @@ function fakeFetch(responses: Record<string, string>) {
 // Most tests never resolve to a .torrent link at all - this throws if
 // fetchBinary is somehow reached unexpectedly, rather than silently
 // returning something that would mask a real regression.
-const noFetchBinary = async (): Promise<Buffer> => {
+const noFetchBinary = async (): Promise<{ data: Buffer; filename: string }> => {
   throw new Error('fetchBinary: unexpected call - this test only expects a magnet resolution');
 };
 
-function fakeFetchBinary(responses: Record<string, Buffer>) {
+// BinaryFetcher's real shape (lib/browser.ts's downloadFile()) returns the
+// Content-Disposition-derived filename alongside the bytes - responses
+// keyed by url below carry both.
+function fakeFetchBinary(responses: Record<string, { data: Buffer; filename: string }>) {
   const calls: { url: string; opts?: unknown }[] = [];
   const fn = async (url: string, opts?: unknown) => {
     calls.push({ url, opts });
@@ -123,12 +126,14 @@ test('download.headers is forwarded on before/pathselector fetches too, merged (
   assert.equal(call.opts.headers['Content-Type'], 'application/x-www-form-urlencoded');
 });
 
-test('download.selectors[] resolving to a non-magnet URL fetches its real bytes and returns a torrent result', async () => {
+test('download.selectors[] resolving to a non-magnet URL fetches its real bytes and returns a torrent result, using the fetcher\'s real filename', async () => {
   const torrentBytes = Buffer.from('d8:announce...e');
   const { fn } = fakeFetch({
     'https://example.test/t/4': '<html><body><a href="download.php?id=1" class="dl">dl</a></body></html>'
   });
-  const { fn: fnBinary, calls: binaryCalls } = fakeFetchBinary({ 'https://example.test/t/download.php?id=1': torrentBytes });
+  const { fn: fnBinary, calls: binaryCalls } = fakeFetchBinary({
+    'https://example.test/t/download.php?id=1': { data: torrentBytes, filename: 'real-name.torrent' }
+  });
   const definition = { download: { selectors: [{ selector: 'a.dl', attribute: 'href' }] } };
   const result = await resolveCardigannDownload({
     definition,
@@ -137,8 +142,27 @@ test('download.selectors[] resolving to a non-magnet URL fetches its real bytes 
     fetch: fn,
     fetchBinary: fnBinary
   });
-  assert.deepEqual(result, { kind: 'torrent', data: torrentBytes, filename: 'My Title.torrent' });
+  assert.deepEqual(result, { kind: 'torrent', data: torrentBytes, filename: 'real-name.torrent' });
   assert.equal(binaryCalls[0]?.url, 'https://example.test/t/download.php?id=1');
+});
+
+test('download.selectors[]: falls back to the item title when the fetcher has no filename', async () => {
+  const torrentBytes = Buffer.from('d8:announce...e');
+  const { fn } = fakeFetch({
+    'https://example.test/t/4c': '<html><body><a href="download.php?id=1" class="dl">dl</a></body></html>'
+  });
+  const { fn: fnBinary } = fakeFetchBinary({
+    'https://example.test/t/download.php?id=1': { data: torrentBytes, filename: '' }
+  });
+  const definition = { download: { selectors: [{ selector: 'a.dl', attribute: 'href' }] } };
+  const result = await resolveCardigannDownload({
+    definition,
+    downloadUri: 'https://example.test/t/4c',
+    itemTitle: 'My Title',
+    fetch: fn,
+    fetchBinary: fnBinary
+  });
+  assert.deepEqual(result, { kind: 'torrent', data: torrentBytes, filename: 'My Title.torrent' });
 });
 
 test('download.selectors[] resolving to a non-magnet URL: fetched content that isn\'t bencoded throws a clear error', async () => {
@@ -146,7 +170,7 @@ test('download.selectors[] resolving to a non-magnet URL: fetched content that i
     'https://example.test/t/4b': '<html><body><a href="download.php?id=1" class="dl">dl</a></body></html>'
   });
   const { fn: fnBinary } = fakeFetchBinary({
-    'https://example.test/t/download.php?id=1': Buffer.from('<html>not a torrent, an error page</html>')
+    'https://example.test/t/download.php?id=1': { data: Buffer.from('<html>not a torrent, an error page</html>'), filename: 'error.html' }
   });
   const definition = { download: { selectors: [{ selector: 'a.dl', attribute: 'href' }] } };
   await assert.rejects(

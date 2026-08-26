@@ -25,11 +25,13 @@ const noSleep = async () => {};
 
 // Every test here resolves a magnet, never a .torrent link - this throws if
 // fetchBinary is somehow reached unexpectedly.
-const noFetchBinary = async (): Promise<Buffer> => {
+const noFetchBinary = async (): Promise<{ data: Buffer; filename: string }> => {
   throw new Error('fetchBinary: unexpected call - this test only expects a magnet resolution');
 };
 
-function fakeFetchBinary(responses: Record<string, Buffer>) {
+// BinaryFetcher's real shape (lib/browser.ts's downloadFile()) returns the
+// Content-Disposition-derived filename alongside the bytes.
+function fakeFetchBinary(responses: Record<string, { data: Buffer; filename: string }>) {
   const calls: { url: string; opts?: unknown }[] = [];
   const fn = async (url: string, opts?: unknown) => {
     calls.push({ url, opts });
@@ -455,7 +457,9 @@ test('resolveMagnet threads the same .Config (settings defaults + overrides) int
       '<html><body><a href="magnet:?xt=urn:btih:WRONG">wrong-kind</a><a href="http://itorrents.org/torrent/REAL.torrent">right-kind</a></body></html>'
   });
   const torrentBytes = Buffer.from('d8:announce...e');
-  const { fn: fnBinary, calls: binaryCalls } = fakeFetchBinary({ 'http://itorrents.org/torrent/REAL.torrent': torrentBytes });
+  const { fn: fnBinary, calls: binaryCalls } = fakeFetchBinary({
+    'http://itorrents.org/torrent/REAL.torrent': { data: torrentBytes, filename: 'REAL.torrent' }
+  });
 
   const provider = createCardigannProvider(
     { key: 'synth', entry: { definition: 'synth' }, resolved: { definitionId: 'synth', from: 'test', definition } },
@@ -466,10 +470,12 @@ test('resolveMagnet threads the same .Config (settings defaults + overrides) int
 
   // .Config.downloadlink must have resolved to its real default
   // (http://itorrents.org/), not empty - an empty prefix would have
-  // matched the first, wrong-kind (magnet), link instead. itemTitle is
-  // always '' on this path (resolveMagnet's cache-miss - see adapter.ts),
-  // so the filename falls back to the generic default.
-  assert.deepEqual(resolved, { kind: 'torrent', data: torrentBytes, filename: 'download.torrent' });
+  // matched the first, wrong-kind (magnet), link instead. The filename
+  // comes from the fetcher's own suggestedFilename() (real
+  // Content-Disposition name), not itemTitle - resolveMagnet's cache-miss
+  // path always passes itemTitle: '' (see adapter.ts), but that no longer
+  // matters here since the fetcher supplies a real name regardless.
+  assert.deepEqual(resolved, { kind: 'torrent', data: torrentBytes, filename: 'REAL.torrent' });
   assert.equal(binaryCalls[0]?.url, 'http://itorrents.org/torrent/REAL.torrent');
 });
 
