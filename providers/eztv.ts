@@ -3,7 +3,7 @@ import { cfFetch } from '../lib/browser.js';
 import { CATEGORIES } from '../lib/categories.js';
 import { TTLCache } from '../lib/cache.js';
 import { parseSize } from '../lib/parse.js';
-import type { MagnetRef, Provider, ProviderCookie, SearchItem, SearchOptions, SearchResult } from '../lib/types.js';
+import type { MagnetRef, Provider, ProviderCookie, ResolvedDownload, SearchItem, SearchOptions, SearchResult } from '../lib/types.js';
 
 const BASE = 'https://eztvx.to';
 const DEPTH_CAP = 200;
@@ -97,7 +97,7 @@ async function searchByKeyword(q: string): Promise<SearchItem[]> {
 
   // The COOKIES jar (registered on the browser context) reveals magnets
   // inline, so one GET is enough - no priming request or reveal POST needed.
-  const html = await cfFetch(searchUrl);
+  const html = await (await cfFetch(searchUrl)).text();
   const items = parseSearchRows(html);
 
   if (items.length) keywordSearchCache.set(q, items);
@@ -184,17 +184,17 @@ async function search(q: string, opts: SearchOptions): Promise<SearchResult> {
   return { items: items.slice(opts.offset, opts.offset + opts.limit), total: items.length };
 }
 
-async function resolveMagnet({ url }: MagnetRef): Promise<string> {
+async function resolveMagnet({ url }: MagnetRef): Promise<ResolvedDownload> {
   if (!url) throw new Error('eztv: resolveMagnet requires a url.');
 
   const cached = magnetCache.get(url);
-  if (cached) return cached;
+  if (cached) return { kind: 'magnet', magnet: cached };
 
-  const html = await cfFetch(url);
+  const html = await (await cfFetch(url)).text();
   const $ = cheerio.load(html);
   const magnet = $('a[href^="magnet:"]').first().attr('href');
   if (!magnet) throw new Error('Could not find a magnet link on the episode page.');
-  return magnet;
+  return { kind: 'magnet', magnet };
 }
 
 export default {

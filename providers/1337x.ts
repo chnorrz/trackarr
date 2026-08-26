@@ -3,7 +3,7 @@ import { cfFetch } from '../lib/browser.js';
 import { CATEGORIES, matchCategory, type CategoryRule } from '../lib/categories.js';
 import { fetchMergedBrowse, fetchPagedWindow } from '../lib/paging.js';
 import { parseSize } from '../lib/parse.js';
-import type { MagnetRef, Provider, SearchItem, SearchOptions, SearchResult } from '../lib/types.js';
+import type { MagnetRef, Provider, ResolvedDownload, SearchItem, SearchOptions, SearchResult } from '../lib/types.js';
 
 const BASE = 'https://1337x.to';
 
@@ -171,7 +171,7 @@ function parseListing(html: string, knownCategory?: number): ListingPage {
 
 async function fetchListingPage(url: string, knownCategory?: number): Promise<ListingPage> {
   // 1337x.to bans our IPv4 but not IPv6; routing is via DOMAIN_OVER_PROXY.
-  const html = await cfFetch(url);
+  const html = await (await cfFetch(url)).text();
   return parseListing(html, knownCategory);
 }
 
@@ -210,14 +210,14 @@ async function search(q: string, opts: SearchOptions): Promise<SearchResult> {
   );
 }
 
-async function resolveMagnet({ url }: MagnetRef): Promise<string> {
+async function resolveMagnet({ url }: MagnetRef): Promise<ResolvedDownload> {
   if (!url) throw new Error('1337x: resolveMagnet requires a url.');
 
-  const html = await cfFetch(url);
+  const html = await (await cfFetch(url)).text();
   const $ = cheerio.load(html);
   const magnet = $('a[href^="magnet:"]').first().attr('href');
   if (!magnet) throw new Error('Could not find a magnet link on the torrent page.');
-  return magnet;
+  return { kind: 'magnet', magnet };
 }
 
 export default {

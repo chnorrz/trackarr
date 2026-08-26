@@ -10,14 +10,19 @@ const ROOT = path.resolve(__dirname, '..', '..');
 const SEARCH_HTML = fs.readFileSync(path.join(ROOT, 'test', 'fixtures', 'ext-to-search.html'), 'utf8');
 const MAGNET_JSON = fs.readFileSync(path.join(ROOT, 'test', 'fixtures', 'ext-to-magnet.json'), 'utf8');
 
-const cfFetch = mock.fn<(url: string, opts?: FetchOptions) => Promise<string>>(async () => '');
+type CfResponse = { text(): Promise<string>; buffer(): Promise<Buffer> };
+function toRes(text: string): CfResponse {
+  return { text: async () => text, buffer: async () => Buffer.from(text) };
+}
+
+const cfFetch = mock.fn<(url: string, opts?: FetchOptions) => Promise<CfResponse>>(async () => toRes(''));
 mock.module(path.join(ROOT, 'dist', 'lib', 'browser.js'), {
   exports: { cfFetch }
 });
 const { default: provider } = await import(path.join(ROOT, 'dist', 'providers', 'ext-to.js'));
 
 test('ext.to search() parses real row markup into SearchItem[]', async () => {
-  cfFetch.mock.mockImplementation(async () => SEARCH_HTML);
+  cfFetch.mock.mockImplementation(async () => toRes(SEARCH_HTML));
 
   const { items } = await provider.search('anything', { offset: 0, limit: 50 });
 
@@ -38,7 +43,7 @@ test('ext.to search() parses real row markup into SearchItem[]', async () => {
 });
 
 test('ext.to search() filters the uploader link out of the category breadcrumb', async () => {
-  cfFetch.mock.mockImplementation(async () => SEARCH_HTML);
+  cfFetch.mock.mockImplementation(async () => toRes(SEARCH_HTML));
   const { items } = await provider.search('anything', { offset: 0, limit: 50 });
   assert.equal(items[0]?.category, 2000);
 });
@@ -67,7 +72,7 @@ function categoryRowHtml(id: number, topHref: string, topText: string, subHref?:
 
 test('ext.to search() classifies audiobooks from the subcategory href, not the link text', async () => {
   cfFetch.mock.mockImplementation(async () =>
-    categoryRowHtml(10000005, '/books/', 'Books', '/books/audio-books/', 'Audio books')
+    toRes(categoryRowHtml(10000005, '/books/', 'Books', '/books/audio-books/', 'Audio books'))
   );
   const { items } = await provider.search('anything', { offset: 0, limit: 50 });
   assert.equal(items[0]?.category, 3030);
@@ -75,7 +80,7 @@ test('ext.to search() classifies audiobooks from the subcategory href, not the l
 
 test('ext.to search() classifies ebooks from the subcategory href, not just top-level "Books"', async () => {
   cfFetch.mock.mockImplementation(async () =>
-    categoryRowHtml(10000006, '/books/', 'Books', '/books/ebooks/', 'Ebooks')
+    toRes(categoryRowHtml(10000006, '/books/', 'Books', '/books/ebooks/', 'Ebooks'))
   );
   const { items } = await provider.search('anything', { offset: 0, limit: 50 });
   assert.equal(items[0]?.category, 7020);
@@ -83,13 +88,13 @@ test('ext.to search() classifies ebooks from the subcategory href, not just top-
 
 test('ext.to search() classifies PC games and "other games" from the subcategory href', async () => {
   cfFetch.mock.mockImplementation(async () =>
-    categoryRowHtml(10000007, '/games/', 'Games', '/games/pc-games/', 'PC Games')
+    toRes(categoryRowHtml(10000007, '/games/', 'Games', '/games/pc-games/', 'PC Games'))
   );
   const pcGames = await provider.search('anything', { offset: 0, limit: 50 });
   assert.equal(pcGames.items[0]?.category, 4050);
 
   cfFetch.mock.mockImplementation(async () =>
-    categoryRowHtml(10000008, '/games/', 'Games', '/games/other-games/', 'Other Games')
+    toRes(categoryRowHtml(10000008, '/games/', 'Games', '/games/other-games/', 'Other Games'))
   );
   const otherGames = await provider.search('anything', { offset: 0, limit: 50 });
   assert.equal(otherGames.items[0]?.category, 1090);
@@ -97,20 +102,20 @@ test('ext.to search() classifies PC games and "other games" from the subcategory
 
 test('ext.to search() classifies Mac and Android apps from the subcategory href', async () => {
   cfFetch.mock.mockImplementation(async () =>
-    categoryRowHtml(10000009, '/applications/', 'Applications', '/applications/mac/', 'Mac')
+    toRes(categoryRowHtml(10000009, '/applications/', 'Applications', '/applications/mac/', 'Mac'))
   );
   const mac = await provider.search('anything', { offset: 0, limit: 50 });
   assert.equal(mac.items[0]?.category, 4030);
 
   cfFetch.mock.mockImplementation(async () =>
-    categoryRowHtml(10000010, '/applications/', 'Applications', '/applications/android/', 'Android')
+    toRes(categoryRowHtml(10000010, '/applications/', 'Applications', '/applications/android/', 'Android'))
   );
   const android = await provider.search('anything', { offset: 0, limit: 50 });
   assert.equal(android.items[0]?.category, 4070);
 });
 
 test('ext.to search() filters real keyword-search results by requested categories', async () => {
-  cfFetch.mock.mockImplementation(async () => SEARCH_HTML);
+  cfFetch.mock.mockImplementation(async () => toRes(SEARCH_HTML));
 
   const { items, total } = await provider.search('anything', { categories: [2000], offset: 0, limit: 50 });
   assert.equal(items.length, 1);
@@ -119,7 +124,7 @@ test('ext.to search() filters real keyword-search results by requested categorie
 });
 
 test('ext.to blank query with no categories uses the general (no cat param) browse listing', async () => {
-  cfFetch.mock.mockImplementation(async () => SEARCH_HTML);
+  cfFetch.mock.mockImplementation(async () => toRes(SEARCH_HTML));
 
   const { items } = await provider.search('', { offset: 0, limit: 50 });
   assert.equal(items.length, 4);
@@ -134,7 +139,7 @@ test('ext.to blank query with an unsupported category (e.g. XXX) returns empty',
 });
 
 test('ext.to blank query with several categories merges their browse listings', async () => {
-  cfFetch.mock.mockImplementation(async () => SEARCH_HTML);
+  cfFetch.mock.mockImplementation(async () => toRes(SEARCH_HTML));
 
   const { items } = await provider.search('', { categories: [2000, 5000], offset: 0, limit: 50 });
   assert.equal(items.length, 8);
@@ -142,11 +147,12 @@ test('ext.to blank query with several categories merges their browse listings', 
 
 test('ext.to resolveMagnet() computes the HMAC and parses a real magnet response', async () => {
   cfFetch.mock.mockImplementation(async (_url, opts) =>
-    opts?.method === 'POST' ? MAGNET_JSON : SEARCH_HTML
+    toRes(opts?.method === 'POST' ? MAGNET_JSON : SEARCH_HTML)
   );
 
-  const magnet = await provider.resolveMagnet({ id: 10000001, url: null });
-  assert.ok(magnet.startsWith('magnet:?xt=urn:btih:0000000000000000000000000000000000ccc1'));
+  const resolved = await provider.resolveMagnet({ id: 10000001, url: null });
+  assert.equal(resolved.kind, 'magnet');
+  assert.ok(resolved.magnet.startsWith('magnet:?xt=urn:btih:0000000000000000000000000000000000ccc1'));
 });
 
 test('ext.to resolveMagnet() throws without an id', async () => {
@@ -154,20 +160,20 @@ test('ext.to resolveMagnet() throws without an id', async () => {
 });
 
 test('ext.to resolveMagnet() throws when the page has no searchPageToken', async () => {
-  cfFetch.mock.mockImplementation(async () => '<html><head></head><body></body></html>');
+  cfFetch.mock.mockImplementation(async () => toRes('<html><head></head><body></body></html>'));
   await assert.rejects(() => provider.resolveMagnet({ id: 1, url: null }), /searchPageToken/);
 });
 
 test('ext.to resolveMagnet() throws on a non-JSON response', async () => {
   cfFetch.mock.mockImplementation(async (_url, opts) =>
-    opts?.method === 'POST' ? 'not json' : SEARCH_HTML
+    toRes(opts?.method === 'POST' ? 'not json' : SEARCH_HTML)
   );
   await assert.rejects(() => provider.resolveMagnet({ id: 10000001, url: null }), /Non-JSON response/);
 });
 
 test('ext.to resolveMagnet() throws when the API reports failure', async () => {
   cfFetch.mock.mockImplementation(async (_url, opts) =>
-    opts?.method === 'POST' ? JSON.stringify({ success: false }) : SEARCH_HTML
+    toRes(opts?.method === 'POST' ? JSON.stringify({ success: false }) : SEARCH_HTML)
   );
   await assert.rejects(() => provider.resolveMagnet({ id: 10000001, url: null }), /No magnet in response/);
 });

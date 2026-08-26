@@ -57,6 +57,18 @@ test('re_replace: regex replace with $1 backreferences, applied globally', () =>
   assert.equal(applyFilter('re_replace', ['(\\d{2})x(\\d{2})', 'S$1E$2'], '12x45'), 'S12E45');
 });
 
+// Go's RE2 supports a leading "(?i)" (etc) inline-flag group - real
+// upstream definitions use this a lot (1337x.yml, 8 times in one filter
+// chain). JS's RegExp has no equivalent syntax; passed through literally
+// it's parsed as an invalid capturing group and throws.
+test('regexp: a leading "(?i)" Go inline-flag group is honored as JS case-insensitivity, not passed through literally', () => {
+  assert.equal(applyFilter('regexp', '(?i)hello (\\w+)', 'HELLO World'), 'World');
+});
+
+test('re_replace: a leading "(?i)" Go inline-flag group is honored, replacement still applies globally', () => {
+  assert.equal(applyFilter('re_replace', ['(?i)\\sEP\\s(\\d{1,2})\\s(E?\\s?\\d{1,2})\\s', ' E$1-$2 '], 'Show EP 3 4 More'), 'Show E3-4 More');
+});
+
 test('validate: keeps only whitelisted words, comma-joined, lowercased, underscores restored to spaces', () => {
   const input = 'crime, x264, 1080p, (music), pack, comedy, Science_Fiction, dd5.1, Hip/Hop';
   const whitelist = 'Action, Adventure, Crime, Comedy, Science_Fiction, War';

@@ -2879,3 +2879,274 @@ provider or switch `server.ts` to the Cardigann definition (phase 4 item 9)
 is still open - this session proved the definition works correctly and
 does one fewer network request per grab, but switching the live `ext-to`
 route is a separate decision from proving the definition correct.
+
+## 25. 1337x.yml and eztv.yml, live - eight engine gaps, a policy decision, and .torrent support
+
+Vendored both real Prowlarr/Indexers definitions (pin `dca9847`,
+`definitions/v11/{1337x,eztv}.yml`) to see whether trackarr's engine, not
+just ext.to's own hand-authored one, could run real upstream content. It
+mostly couldn't, yet - eight real gaps, all closed this session, all in
+`lib/`, none in the vendored files.
+
+### The policy: vendored definitions are never edited, ever
+
+Early in this session a genuine upstream typo in `1337x.yml` (below) and a
+genuinely dead upstream domain (`http://itorrents.org/`, also below) were
+both first "fixed" by editing the vendored file directly. The user rejected
+both edits explicitly: *"don't change t[h]e cardigann, make it work the way
+it comes from prowlarr repo because I want to be able to just drop those
+into my folder and use it out of the box."* Every fix below is therefore in
+`lib/cardigann/*.ts` or `lib/browser.ts` - `definitions/1337x.yml` is
+verified byte-identical to the upstream pin (`diff` against a fresh
+re-fetch, clean) and stays that way. This is now the standing policy for
+any future vendored definition too, not a one-off.
+
+### Six gaps found before anything could run at all
+
+1. **`search.rows.selector` was never template-rendered.** 1337x.yml's own
+   selector is conditional: `tr:has(...){{ if .Config.uploader }}:has(...){{
+   end }}`. `engine.ts`'s `runSearchAll` now renders it against `topCtx`
+   before handing it to `selectDomRows` (JSON's `selectJsonRows` untouched -
+   nothing needs it there yet, not added speculatively).
+
+2. **`caps.settings[].default` never seeded `.Config`.** 1337x.yml leans on
+   this heavily (`disablesort`, `sort`, `type`, `downloadlink`,
+   `downloadlink2` all have real defaults referenced throughout `search`/
+   `download`) - previously `.Config` only ever held an operator's own
+   `entry.config` overrides plus `sitelink`, so every referenced default
+   silently resolved to `''`. `adapter.ts`'s new `settingDefaults()` seeds
+   `.Config` from `definition.settings[].default` before the operator's own
+   overrides are applied on top.
+
+3. **Boolean config values didn't match the `.True`/`.False` convention.**
+   `String(false)` is `"false"` - non-empty, therefore *truthy* - which
+   silently broke `eq .Config.disablesort .False` (a false default would
+   have compared as *not equal* to `.False`, doing the opposite of what the
+   definition asks). New `configValueToString()`: `false` -> `''`, `true`
+   -> `'True'` (matching `.True`'s own literal), applied uniformly to both
+   settings defaults and `entry.config` overrides - the latter was a
+   pre-existing latent bug, not a new one, just never exercised until a
+   definition with a real boolean setting showed up.
+
+4. **`resolveCardigannDownload`'s `.Config` was hardcoded `{}`.** 1337x.yml's
+   `download.selectors[]` reference `.Config.downloadlink`/`downloadlink2` -
+   needed the same `.Config` a `search()` call for that indexer would use.
+   `ResolveOptions` gained an optional `config`, threaded from
+   `adapter.ts`'s `resolveMagnet` (the same object built at provider-creation
+   time, not rebuilt).
+
+5. **`download.ts`'s `extractFromBody` never rendered `spec.selector` as a
+   template**, only ever used it as a literal CSS string - broke the same
+   `.Config.downloadlink` selectors from (4). Now renders first (via the
+   `ctx` each call site already threads through, itself carrying (4)'s real
+   `.Config`).
+
+6. **Go's `(?i)` inline regex flag isn't valid JS.** `1337x.yml`'s title
+   cleanup chain uses it eight times (`(?i)\sEP\s...`, `(?i)WEB\sDL`, etc.) -
+   Go's RE2 supports a leading `(?flags)` group; JS's `RegExp` parses `(?i`
+   as an invalid capturing group and throws `Invalid group`. New
+   `compileGoRegex()` in `filters.ts`, used by both `regexp` and
+   `re_replace`: strips a recognized leading `(?[imsu]+)` and maps `i`/`m`/
+   `s` to JS's own flags of the same letter (others, e.g. Go's `U`
+   ungreedy, have no JS equivalent and are silently dropped rather than
+   failing the whole pattern over one flag that can't be honored).
+
+### The parser: a real upstream typo, tolerated rather than "fixed"
+
+`1337x.yml`'s TV path (`search.paths[1]`) has a stray extra `)` before `}}`
+in `(eq .Config.disablesort .False))` that the other three otherwise-
+identical paths don't repeat - confirmed a genuine upstream typo (Prowlarr/
+Indexers, unrelated to trackarr) by diffing the four paths against each
+other. `template.ts`'s `parseTokens()` used to throw `unexpected token at
+position 9` on this exact string. Per the policy above, the fix lives in
+the parser: a stray, unmatched `rparen` token inside a call's argument list
+is now a no-op, not a parse error - one added `if` arm in the same
+tokens-loop that already handles word/string/lparen.
+
+### `.torrent` support - the point of the whole exercise
+
+1337x.yml's `download.selectors[]` can resolve to a real `.torrent` file
+URL (iTorrents.org), not just a `magnet:` URI - previously `download.ts`
+threw outright (`.torrent file downloading is not supported`). Now it
+fetches the file's real bytes and hands them back for the server to stream
+directly, rather than redirecting a client to a Cloudflare-protected URL it
+has no way to reach itself - the whole reason this project exists.
+
+**`lib/types.ts`**: `ResolvedDownload = {kind:'magnet'; magnet:string} |
+{kind:'torrent'; data:Buffer; filename:string}`. `Provider.resolveMagnet`
+now returns this instead of a bare string - a real interface change,
+touching all three hand-written providers (wrap their magnet string as
+`{kind:'magnet', magnet:...}`, nothing else changes), `adapter.ts`,
+`download.ts`, and `server.ts`.
+
+**`lib/browser.ts` - rewritten fetch layer.** `cfFetch` now returns a
+`CfResponse` (`{text(): Promise<string>; buffer(): Promise<Buffer>}`) -
+mirroring `fetch()`'s own shape for familiarity, deliberately not its
+single-read restriction: the whole body is already fully read and
+base64-encoded by the time `cfFetch` resolves (one `page.evaluate()`
+round-trip, not a real stream), so `text()`/`buffer()` can each be called
+any number of times, decoding the same in-memory base64. Two real bugs
+found live getting there, neither hypothetical:
+
+- **Firefox's Xray wrappers forbid reading `TypedArray` elements across the
+  `page.evaluate()` privilege boundary** ("Accessing TypedArray data over
+  Xrays is slow, and forbidden") - `res.arrayBuffer()` plus manual byte
+  indexing throws. Fixed by reading the body as a `Blob` and encoding via
+  `FileReader.readAsDataURL()` instead - no element-level access, the
+  browser's own native code does the base64 encoding, sidestepping the
+  restriction entirely.
+- **`page.goto()` throws `"Download is starting"`** when the target URL is
+  itself a direct file-download response (confirmed live against
+  `itorrents.org/torrent/<hash>.torrent`, and - surprisingly at first -
+  against `itorrents.org`'s bare `/` root too, see below) - navigating to
+  it isn't possible at all via `page.goto()`. `gotoPreferringExactUrl()`
+  (`cfFetch`'s own navigation helper, used for interactive *pages*): try
+  the exact URL first (a challenge or block is often scoped to the
+  specific path, not the whole origin - confirmed live: `eztvx.to`'s bare
+  `/` navigates cleanly while `/search/...` independently shows
+  Cloudflare's own challenge, so falling back to the origin unconditionally
+  would miss a path-specific challenge on every other URL), and only fall
+  back to the bare origin if *that specific* navigation throws "Download is
+  starting".
+
+**`itorrents.org` was never actually dead - the first fix above was wrong,
+caught by the user, not by testing.** A stray thought this session
+concluded, from `gotoPreferringExactUrl()`'s origin fallback *also* failing
+with "Download is starting", that the whole domain was broken and (briefly,
+reverted) tried changing the vendored definition to a different host - which
+directly violated the standing policy above and was rejected. Re-derived
+properly: `curl -L http://itorrents.org/torrent/<hash>.torrent` returns a
+clean `200` with real bencoded bytes, following a real 3-hop redirect chain
+(`itorrents.org` -> `itorrents.net` -> the actual host serving the file) -
+**no challenge anywhere in that specific chain**. Only the bare root
+(`http://itorrents.org/`) is itself challenge-gated (`cf-mitigated:
+challenge`, confirmed via `curl`) - an entirely separate fact from whether
+the file path works, and irrelevant to it. The real problem was purely
+mechanical: `page.goto()` can't reach a direct-download response at all
+(neither the exact file URL nor, in this case, even the unrelated
+challenge-gated root - Playwright's browser-navigation download-interception
+fires before Cloudflare's own challenge would even be reached), and a
+cross-origin `page.evaluate()` `fetch()` can't read the response body either
+(no CORS headers anywhere in that chain). Neither is "the site is dead."
+
+**`lib/browser.ts`'s `fetchFileDirect()`** - a second, deliberately separate
+fetch path used only for raw files (`.torrent`s), not pages. Uses
+Playwright's `context.request` (its own top-level `request.newContext()`,
+or the browser session's `context.request` - see below) instead of
+`page.goto()`/`tryFetch()`: not a page navigation at all, so
+download-interception never applies, and it follows redirects
+transparently like any ordinary HTTP client, exactly the missing piece.
+Confirmed live: `2B8A2BE521DB175999AE3664B3378288BEA3352B`'s real `.torrent`
+file, 44526 bytes, straight off `downloadlink`'s first (`iTorrents.org`)
+selector - no fallback to `downloadlink2` (`magnet:`) needed after all.
+
+This needed two follow-up questions the user asked, both correcting a gap
+in the first version of this fix:
+
+1. *"could I always use `context.request.fetch()` instead of
+   `page.evaluate(fetch())`?"* No - verified by reading `playwright-core`'s
+   actual bundled source, not assumed: `context.request` is backed by
+   Node's own `http`/`https` modules (`coreBundle.js`, confirmed by
+   `require("http")`/`require("https")` right where its request logic
+   lives), a real HTTP client, entirely separate from the actual browser
+   engine `page.evaluate()` runs inside. It shares the browser context's
+   cookie jar (so an already-obtained `cf_clearance` travels with it), but
+   carries none of Camoufox's fingerprint spoofing - useless for a page
+   that's actually interactively challenge-protected (a JS challenge needs
+   a JS engine to solve; `context.request` has none), fine for a raw file
+   endpoint that, empirically, isn't.
+2. *"then it should use the proxy too, right?"* - a real bug the first
+   version had: `context.request`'s proxy resolution (also read from
+   source, `coreBundle.js`) is Playwright's own `newContext({proxy})`
+   option or the `HTTP_PROXY`/`HTTPS_PROXY` env vars - neither of which
+   this project sets (`DOMAIN_OVER_PROXY`/`PROXY_URL` configure a *Firefox*
+   preference, a PAC file, consulted only by the real browser's own
+   navigations). A plain `context.request` call would have silently
+   egressed direct for every host, breaking exactly the IPv4-banned case
+   the proxy exists for, the moment any site's download link happened to
+   live on a proxied domain (none did yet, by luck, not by correctness).
+   Fixed with `hostMatchesProxyDomain()` (the same origin-matching rule the
+   PAC's own `FindProxyForURL` uses) gating a second, lazily-created,
+   explicitly-proxied `APIRequestContext` (`request.newContext({proxy:
+   {server: PROXY_URL}})`) - used only for a `DOMAIN_OVER_PROXY` host, so a
+   host that doesn't need the proxy never shares a network identity with
+   one that does.
+
+**`lib/cardigann/download.ts`**: new `BinaryFetcher` type, `sanitizeFilename()`
+(strips control characters, appends `.torrent`, falls back to `'download'`
+if nothing's left). `download.selectors[]`, on a resolved value that isn't
+`magnet:`, resolves it to an absolute URL (selector values can be relative,
+same as any other extracted attribute), fetches it via the new
+`fetchBinary`, and validates the first byte is ASCII `'d'` - every valid
+`.torrent` file is a top-level bencoded dictionary, so this catches "the
+selector matched but the link actually serves an HTML error page" with a
+clear message instead of handing a client unparseable bytes.
+
+**The `selectors[]` loop is a fallback chain, and now behaves like one -
+kept even though `iTorrents.org` turned out fine.** `1337x.yml`'s own
+`info_download` setting text says the quiet part out loud: *"we suggest
+using the magnet link as a fallback [to iTorrents]"* - a documented,
+intentional fallback chain, not a single required link, and the loop used
+to treat any *match*, dead or not, as final regardless. Genuinely useful
+independently of the `itorrents.org` misdiagnosis above: a real dead link
+on selector 1 (a stale mirror, a site that actually did retire a CDN) must
+still fall through to selector 2 rather than aborting the whole
+resolution. The loop now catches a fetch/validation failure per selector
+and tries the next one, only throwing the last real error if every
+selector in the list fails - covered by two unit tests
+(`test/lib/cardigann/download.test.ts`) using a synthetic dead link, since
+nothing in this session's real live-testing ever exercised the fallback
+for real (both selectors now succeed against the actual site).
+
+**`server.ts`**: `/​:provider/download` now branches on `resolved.kind` -
+`magnet` redirects (302, unchanged); `torrent` sets `Content-Type:
+application/x-bittorrent` and `Content-Disposition: attachment;
+filename="..."` and streams `resolved.data` directly, no redirect (a
+client can't reach a Cloudflare-protected/dead-adjacent download URL
+itself - the whole point of doing this server-side). `magnetCache`'s value
+type changed to `ResolvedDownload`; a resolved `.torrent` result is
+deliberately never cached (cheap to re-fetch, not worth it for what's
+normally a one-shot grab).
+
+### Live-test results (`definitions/{1337x,eztv}.yml`, both files exactly as
+### fetched from the pin, `ext-to-cd` re-verified alongside as a regression
+### check)
+
+Same harness as section 21/24: `config/trackarr.yml` (gitignored, local
+only) under distinct keys (`1337x-cd`, `eztv-cd`, `ext-to-cd`) so the
+Cardigann versions run side by side with the hand-written providers rather
+than replacing them, `definitions/`+`config/` volume-mounted per section
+21's precedent, `1337x.to` routed through `tinyproxy` per section 3/4's
+existing IPv4-ban workaround (confirmed still needed: direct IPv4 gives
+`error code: 1006` in 17 bytes; IPv6 gives a real, solvable challenge page).
+
+- **`1337x-cd`**: `q=ubuntu` -> 50 items, 0 zero-size, 50 seeded. Grab (after
+  `fetchFileDirect()`, above): `downloadlink` (iTorrents) succeeds on the
+  first selector, no fallback to `downloadlink2` needed - `200`,
+  `content-type: application/x-bittorrent`, 44526 real bencoded bytes.
+- **`eztv-cd`**: needed one more fix mid-session, not listed above since it
+  isn't 1337x-specific - `search.headers.cookie` (`layout=def_wlinks`,
+  needed to reveal magnet links/real seed counts inline) was being sent as
+  a `fetch()` header, silently dropped: `Cookie` is a forbidden header name
+  per the Fetch spec in every browser, Camoufox included. Fixed the same
+  way the hand-written `providers/eztv.ts` already had to
+  (`registerDomainCookies`/`context.addCookies()`) - `cfFetch` now detects
+  a `Cookie` key (case-insensitive) in `opts.headers`, routes it through
+  `page.context().addCookies()` instead, and strips it before the
+  in-page `fetch()` call. `q=batman` -> 50 items, 0 zero-size, 50 seeded,
+  real magnet captured directly at listing time (instant, cached grab -
+  `search.fields.download`'s selector correctly finds `a.magnet` once the
+  cookie actually takes effect). `q=matrix` separately showed only 2/48
+  seeded - not a regression, EZTV's own dead-torrent rate for that
+  specific query; re-confirmed with `q=batman` both before and after this
+  session's later fixes, consistently 50/50.
+- **`ext-to-cd`**: unaffected by anything in this section, re-verified
+  anyway as a regression check (same item as section 24's live test,
+  same infohash `E0593A3DAB881080EFECB54BA6551D4B2D329BF1`).
+
+331 tests passing (up from 314 at the end of section 24), lint/typecheck
+clean. `providers/{ext-to,1337x,eztv}.ts` are still the live `server.ts`
+routes - nothing has been switched over. Whether to retire them now that
+all three Cardigann equivalents are proven correct end-to-end (search,
+category mapping, magnet resolution, and now `.torrent` fallback) is a
+decision for the user to make, not one made here.

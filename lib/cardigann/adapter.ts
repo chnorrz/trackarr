@@ -1,4 +1,4 @@
-import { buildMagnetFromInfohash, resolveCardigannDownload, type Fetcher } from './download.js';
+import { buildMagnetFromInfohash, resolveCardigannDownload, type BinaryFetcher, type Fetcher } from './download.js';
 import { collectCategoryMappings } from './category-mapping.js';
 import { categoryIdByName, categoryNameById } from '../categories.js';
 import type { IndexerConfigEntry } from './config.js';
@@ -7,7 +7,7 @@ import { applyFilters, type FilterSpec } from './filters.js';
 import { buildPathRequests, type SearchBlockForPaths } from './paths.js';
 import type { ResolvedDefinition } from './resolve.js';
 import type { TemplateContext } from './template.js';
-import type { MagnetRef, Provider, SearchItem, SearchOptions, SearchResult } from '../types.js';
+import type { MagnetRef, Provider, ResolvedDownload, SearchItem, SearchOptions, SearchResult } from '../types.js';
 
 // Ties every lib/cardigann module together into a real Provider: fetches
 // aren't made here directly, they go through an injected Fetcher (real
@@ -31,6 +31,7 @@ export interface ResolvedIndexerLike {
 
 export interface CreateCardigannProviderOptions {
   fetch: Fetcher;
+  fetchBinary: BinaryFetcher;
   /** Injectable so tests with a nonzero requestDelay don't really wait. */
   sleep?: (ms: number) => Promise<void>;
 }
@@ -48,6 +49,31 @@ function resolveUrl(raw: string, base: string): string {
   }
 }
 
+// Matches template.ts's own .True/.False convention (a boolean false is the
+// empty string, matching Go template's "empty" truthiness for the zero
+// value; true is 'True', the same literal .True itself resolves to) - not
+// generic String(v), which would render false as the non-empty, therefore
+// truthy, string "false". Definitions comparing a boolean setting via
+// `eq .Config.x .False` (1337x.yml's disablesort) depend on this.
+function configValueToString(v: string | number | boolean): string {
+  if (typeof v === 'boolean') return v ? 'True' : '';
+  return String(v);
+}
+
+// caps.settings[].default seeds .Config before the indexer's own config:
+// overrides are applied, so a definition can reference .Config.<setting>
+// and get the documented default even when the operator never set it.
+function settingDefaults(definition: Record<string, unknown>): Record<string, string> {
+  const settings = Array.isArray(definition.settings) ? (definition.settings as Record<string, unknown>[]) : [];
+  const defaults: Record<string, string> = {};
+  for (const s of settings) {
+    if (typeof s.name !== 'string' || s.default === undefined) continue;
+    if (typeof s.default !== 'string' && typeof s.default !== 'number' && typeof s.default !== 'boolean') continue;
+    defaults[s.name] = configValueToString(s.default);
+  }
+  return defaults;
+}
+
 function directMagnet(item: CardigannItem): string | undefined {
   if (item.magnet?.startsWith('magnet:')) return item.magnet;
   if (item.download?.startsWith('magnet:')) return item.download;
@@ -60,17 +86,34 @@ async function defaultSleep(ms: number): Promise<void> {
 }
 
 // Every HTTP call this provider instance makes (search paths, download
-// before/selectors sub-fetches, a resolveMagnet cache-miss fallback) goes
-// through this one gate, so requestDelay (definition-level, seconds) is
-// honoured consistently rather than only on the initial search request.
-function createGatedFetch(rawFetch: Fetcher, requestDelaySec: number, sleep: (ms: number) => Promise<void>): Fetcher {
-  if (!requestDelaySec) return rawFetch;
+// before/selectors sub-fetches, a resolveMagnet cache-miss fallback, a
+// resolved .torrent file's own bytes) goes through one of these two gates,
+// so requestDelay (definition-level, seconds) is honoured consistently
+// rather than only on the initial search request. Both share one clock
+// (lastAt), not two independent ones - a text fetch and a binary fetch for
+// the same indexer still count as one shared request-rate budget.
+function createGatedFetchers(
+  rawFetch: Fetcher,
+  rawFetchBinary: BinaryFetcher,
+  requestDelaySec: number,
+  sleep: (ms: number) => Promise<void>
+): { fetch: Fetcher; fetchBinary: BinaryFetcher } {
+  if (!requestDelaySec) return { fetch: rawFetch, fetchBinary: rawFetchBinary };
   let lastAt = 0;
-  return async (url, opts) => {
-    const wait = lastAt + requestDelaySec * 1000 - Date.now();
-    if (wait > 0) await sleep(wait);
+  const wait = async () => {
+    const remaining = lastAt + requestDelaySec * 1000 - Date.now();
+    if (remaining > 0) await sleep(remaining);
     lastAt = Date.now();
-    return rawFetch(url, opts);
+  };
+  return {
+    fetch: async (url, opts) => {
+      await wait();
+      return rawFetch(url, opts);
+    },
+    fetchBinary: async (url, opts) => {
+      await wait();
+      return rawFetchBinary(url, opts);
+    }
   };
 }
 
@@ -87,13 +130,19 @@ export function createCardigannProvider(indexer: ResolvedIndexerLike, opts: Crea
     })();
 
   const requestDelaySec = Number(definition.requestDelay) || 0;
-  const gatedFetch = createGatedFetch(opts.fetch, requestDelaySec, opts.sleep ?? defaultSleep);
+  const { fetch: gatedFetch, fetchBinary: gatedFetchBinary } = createGatedFetchers(
+    opts.fetch,
+    opts.fetchBinary,
+    requestDelaySec,
+    opts.sleep ?? defaultSleep
+  );
 
-  const config: Record<string, string> = {};
-  for (const [k, v] of Object.entries(entry.config ?? {})) config[k] = String(v);
+  const config: Record<string, string> = { ...settingDefaults(definition) };
+  for (const [k, v] of Object.entries(entry.config ?? {})) config[k] = configValueToString(v);
   // Cardigann's ".Config.sitelink" is a wiki-documented built-in, always the
   // resolved base URL - not something a user sets via indexer config, so
-  // this is applied after (and can't be overridden by) the loop above.
+  // this is applied after (and can't be overridden by) the defaults/loop
+  // above.
   config.sitelink = baseUrl;
 
   const mappings = collectCategoryMappings(definition);
@@ -206,11 +255,11 @@ export function createCardigannProvider(indexer: ResolvedIndexerLike, opts: Crea
     return { items: searchItems, total: filtered.length };
   }
 
-  async function resolveMagnet({ url }: MagnetRef): Promise<string> {
+  async function resolveMagnet({ url }: MagnetRef): Promise<ResolvedDownload> {
     if (!url) throw new Error(`${key}: resolveMagnet requires a url.`);
 
     const cached = magnetCache.get(url);
-    if (cached) return cached;
+    if (cached) return { kind: 'magnet', magnet: cached };
 
     // Cache miss: the original item's title is gone by now (MagnetRef only
     // carries id/url) - fall back to re-deriving a magnet from whichever
@@ -218,9 +267,21 @@ export function createCardigannProvider(indexer: ResolvedIndexerLike, opts: Crea
     // a distinct one, else the detail page itself), same trade-off our
     // hand-written providers make on their own cache-miss path.
     const downloadUri = downloadUrlCache.get(url) ?? url;
-    const magnet = await resolveCardigannDownload({ definition, downloadUri, itemTitle: '', fetch: gatedFetch });
-    rememberMagnet(url, magnet);
-    return magnet;
+    const resolved = await resolveCardigannDownload({
+      definition,
+      downloadUri,
+      itemTitle: '',
+      config,
+      fetch: gatedFetch,
+      fetchBinary: gatedFetchBinary
+    });
+    // Only a magnet is worth remembering here - it's a cheap string that
+    // never goes stale. A resolved .torrent file's bytes aren't cached: a
+    // repeat grab re-fetching them fresh is an acceptable trade for not
+    // growing this cache's type/memory footprint for what's normally a
+    // one-shot download anyway.
+    if (resolved.kind === 'magnet') rememberMagnet(url, resolved.magnet);
+    return resolved;
   }
 
   return {

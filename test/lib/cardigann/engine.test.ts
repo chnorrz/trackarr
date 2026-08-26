@@ -363,3 +363,17 @@ test('runSearchAll returns every item unsliced; runSearch slices to offset/limit
   assert.equal(sliced.length, 1);
   assert.equal(sliced[0].title, all[0].title);
 });
+
+test('runSearch (HTML): search.rows.selector is itself a template, rendered against topCtx before matching', () => {
+  // Real precedent: 1337x.yml's rows.selector appends an optional
+  // :has(...) uploader filter driven off .Config.uploader.
+  const def = minimalHtmlDefinition({
+    rows: { selector: 'tr.row{{ if .Config.strict }}:has(.magnet[href*="ABCDEF1234567890"]){{ end }}' }
+  });
+  const withoutConfig = runSearch(def, HTML_BODY, baseSearchCtx());
+  assert.equal(withoutConfig.length, 2, 'empty .Config.strict renders the plain, unfiltered selector');
+
+  const withConfig = runSearch(def, HTML_BODY, baseSearchCtx({ config: { strict: 'True' } }));
+  assert.equal(withConfig.length, 1, 'non-empty .Config.strict renders the :has(...) clause, filtering rows');
+  assert.equal(withConfig[0].title, 'Ubuntu 24.04 Desktop');
+});

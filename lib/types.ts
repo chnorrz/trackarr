@@ -14,6 +14,12 @@ export interface MagnetRef {
   url: string | null;
 }
 
+// What a grab resolves to: either a magnet: URI (server.ts redirects the
+// client to it directly), or a real .torrent file's raw bytes (server.ts
+// fetched it itself - through the same Cloudflare-bypassed session a
+// downstream client couldn't manage on its own - and streams them back).
+export type ResolvedDownload = { kind: 'magnet'; magnet: string } | { kind: 'torrent'; data: Buffer; filename: string };
+
 export interface KeepAliveTarget {
   url: string;
 }
@@ -43,5 +49,5 @@ export interface Provider {
   cookies?: ProviderCookie[];
   categories: number[];
   search(q: string, opts: SearchOptions): Promise<SearchResult>;
-  resolveMagnet(ref: MagnetRef): Promise<string>;
+  resolveMagnet(ref: MagnetRef): Promise<ResolvedDownload>;
 }

@@ -6,7 +6,7 @@ import { categoriesXml } from './lib/categories.js';
 import { TTLCache } from './lib/cache.js';
 import { ProviderStatusTracker, renderStatusPage } from './lib/status.js';
 import { buildProviderMap } from './providers/index.js';
-import type { MagnetRef, Provider, SearchItem } from './lib/types.js';
+import type { MagnetRef, Provider, ResolvedDownload, SearchItem } from './lib/types.js';
 
 const PORT = process.env.PORT || 9117;
 const API_KEY = process.env.API_KEY || 'changeme';
@@ -68,7 +68,7 @@ export interface AppOptions {
 
 export function createApp(providers: Record<string, Provider>, opts: AppOptions = {}): Application {
   const apiKey = opts.apiKey ?? API_KEY;
-  const magnetCache = new TTLCache<string>(opts.magnetCacheTtlMs ?? MAGNET_CACHE_TTL_MS);
+  const magnetCache = new TTLCache<ResolvedDownload>(opts.magnetCacheTtlMs ?? MAGNET_CACHE_TTL_MS);
   const statusTracker = opts.statusTracker ?? new ProviderStatusTracker();
 
   function checkKey(req: Request, res: Response): boolean {
@@ -79,17 +79,21 @@ export function createApp(providers: Record<string, Provider>, opts: AppOptions 
     return true;
   }
 
-  async function resolveMagnet(provider: Provider, ref: MagnetRef): Promise<{ magnet: string; cached: boolean }> {
+  async function resolveMagnet(provider: Provider, ref: MagnetRef): Promise<{ resolved: ResolvedDownload; cached: boolean }> {
     const cacheKey = `${provider.id}:${ref.id ?? ref.url}`;
-    const cachedMagnet = magnetCache.get(cacheKey);
-    if (cachedMagnet) {
+    const cachedResolved = magnetCache.get(cacheKey);
+    if (cachedResolved) {
       console.error(`[cache] magnet hit for ${provider.id} ${JSON.stringify(ref)}`);
-      return { magnet: cachedMagnet, cached: true };
+      return { resolved: cachedResolved, cached: true };
     }
 
-    const magnet = await provider.resolveMagnet(ref);
-    magnetCache.set(cacheKey, magnet);
-    return { magnet, cached: false };
+    const resolved = await provider.resolveMagnet(ref);
+    // Only cache a magnet: a .torrent file's bytes are fetched fresh and
+    // streamed straight through below, not cached here - same reasoning as
+    // adapter.ts's own magnetCache (a one-shot download, not worth the
+    // memory to hold onto).
+    if (resolved.kind === 'magnet') magnetCache.set(cacheKey, resolved);
+    return { resolved, cached: false };
   }
 
   function buildRss(req: Request, provider: Provider, items: SearchItem[], total: number): string {
@@ -226,9 +230,19 @@ ${rows}
     }
 
     try {
-      const { magnet, cached } = await resolveMagnet(provider, { id, url });
+      const { resolved, cached } = await resolveMagnet(provider, { id, url });
       statusTracker.recordRequest(provider.id, true, { cached });
-      res.redirect(302, magnet);
+      if (resolved.kind === 'magnet') {
+        res.redirect(302, resolved.magnet);
+      } else {
+        // A real .torrent file: already fetched server-side (through the
+        // same Cloudflare-bypassed session a downstream client couldn't
+        // manage on its own), so the bytes are sent directly - not a
+        // redirect, which would just hand the client a URL it can't reach.
+        res.type('application/x-bittorrent');
+        res.set('Content-Disposition', `attachment; filename="${resolved.filename.replace(/"/g, '')}"`);
+        res.send(resolved.data);
+      }
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
       statusTracker.recordRequest(provider.id, false, { error: message });

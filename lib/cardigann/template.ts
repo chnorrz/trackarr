@@ -153,6 +153,17 @@ function parseTokens(tokens: Token[]): Expr {
       i = j;
       continue;
     }
+    // A stray, unmatched ")" - real upstream Cardigann YAML has these (e.g.
+    // Prowlarr/Indexers pin dca9847's 1337x.yml, search.paths[1]: an extra
+    // ")" before "}}" in `(eq .Config.disablesort .False))`, present in only
+    // one of that file's four otherwise-identical path templates). Treated
+    // as a no-op rather than a parse error - trackarr's own policy is to
+    // work with whatever real Cardigann definitions ship unmodified, not to
+    // require them edited to satisfy this parser.
+    if (t.type === 'rparen') {
+      i++;
+      continue;
+    }
     throw new Error(`template: unexpected token at position ${i}`);
   }
 

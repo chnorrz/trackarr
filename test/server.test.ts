@@ -31,7 +31,7 @@ function fakeProvider(overrides: Record<string, unknown> = {}) {
     name: 'Fake Provider',
     categories: [2000, 5000],
     search: async () => ({ items: [fakeItem()], total: 1 }),
-    resolveMagnet: async () => 'magnet:?xt=urn:btih:fake',
+    resolveMagnet: async () => ({ kind: 'magnet', magnet: 'magnet:?xt=urn:btih:fake' }),
     ...overrides
   };
 }
@@ -258,11 +258,26 @@ test('cat rejects non-numeric or malformed values with a torznab <error code="20
 });
 
 test('download redirects to the resolved magnet (302)', async () => {
-  const provider = fakeProvider({ resolveMagnet: async () => 'magnet:?xt=urn:btih:deadbeef' });
+  const provider = fakeProvider({ resolveMagnet: async () => ({ kind: 'magnet', magnet: 'magnet:?xt=urn:btih:deadbeef' }) });
   await withServer({ fake: provider }, async (base) => {
     const res = await fetch(`${base}/fake/download?apikey=${API_KEY}&id=42`, { redirect: 'manual' });
     assert.equal(res.status, 302);
     assert.equal(res.headers.get('location'), 'magnet:?xt=urn:btih:deadbeef');
+  });
+});
+
+test('download streams a real .torrent file\'s bytes directly, not a redirect', async () => {
+  const torrentBytes = Buffer.from('d8:announce...e');
+  const provider = fakeProvider({
+    resolveMagnet: async () => ({ kind: 'torrent', data: torrentBytes, filename: 'Example.torrent' })
+  });
+  await withServer({ fake: provider }, async (base) => {
+    const res = await fetch(`${base}/fake/download?apikey=${API_KEY}&id=42`, { redirect: 'manual' });
+    assert.equal(res.status, 200, 'a real file, not a redirect the client can\'t reach on its own');
+    assert.equal(res.headers.get('content-type'), 'application/x-bittorrent');
+    assert.match(res.headers.get('content-disposition') ?? '', /attachment; filename="Example\.torrent"/);
+    const body = Buffer.from(await res.arrayBuffer());
+    assert.ok(body.equals(torrentBytes));
   });
 });
 
@@ -279,7 +294,7 @@ test('magnets are cached - a second identical download does not call resolveMagn
   const provider = fakeProvider({
     resolveMagnet: async () => {
       calls++;
-      return 'magnet:?xt=urn:btih:cached';
+      return { kind: 'magnet', magnet: 'magnet:?xt=urn:btih:cached' };
     }
   });
   await withServer({ fake: provider }, async (base) => {

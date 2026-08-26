@@ -1,9 +1,9 @@
 import crypto from 'crypto';
 import { Camoufox } from 'camoufox-js';
-import type { Browser, BrowserContext, Page } from 'playwright-core';
+import type { APIRequestContext, Browser, BrowserContext, Page } from 'playwright-core';
 import { TTLCache } from './cache.js';
 import { isBlocked, solveChallenge } from './challenge.js';
-import { Response as PlaywrightResponse } from 'playwright-core';
+import { request as playwrightRequest, Response as PlaywrightResponse } from 'playwright-core';
 import type { ProviderCookie } from './types.js';
 
 // Must stay within the Xvfb geometry in the Dockerfile's CMD: a window larger
@@ -18,6 +18,36 @@ const DOMAIN_OVER_PROXY = (process.env.DOMAIN_OVER_PROXY || '')
 type BrowserSession = { browser: Browser; context: BrowserContext };
 
 let session: Promise<BrowserSession> | null = null;
+
+// Same host-matching rule as buildPacDataUri()'s own PAC function, kept in
+// sync deliberately (see fetchFileDirect): exact match or a dot-boundary
+// suffix match, never a bare substring (a domain "notevil.com" must not
+// match a DOMAIN_OVER_PROXY entry of "evil.com").
+function hostMatchesProxyDomain(hostname: string): boolean {
+  return DOMAIN_OVER_PROXY.some((d) => hostname === d || hostname.endsWith(`.${d}`));
+}
+
+// context.request (used by both cfFetch, indirectly, and fetchFileDirect)
+// is Node's own HTTP client (playwright-core bundles http/https + an
+// HttpsProxyAgent/SocksProxyAgent - verified by reading its source, not
+// assumed), entirely separate from the browser's own Firefox network stack
+// that DOMAIN_OVER_PROXY's PAC file configures. A plain context.request
+// call therefore always egresses direct, regardless of DOMAIN_OVER_PROXY -
+// fine for a host that doesn't need it, wrong (silently) for one that
+// does. This is a second, standalone APIRequestContext (Playwright's own
+// request.newContext(), not the browser session's context.request),
+// created lazily, once, with its own explicit proxy - used only for a
+// DOMAIN_OVER_PROXY host, so a host that doesn't need the proxy never
+// pays for it or shares a network identity with one that does.
+let proxiedRequestContext: Promise<APIRequestContext> | null = null;
+
+function getProxiedRequestContext(): Promise<APIRequestContext> {
+  if (!proxiedRequestContext) {
+    if (!PROXY_URL) throw new Error('fetchFileDirect: a DOMAIN_OVER_PROXY host was requested but PROXY_URL is not set.');
+    proxiedRequestContext = playwrightRequest.newContext({ proxy: { server: PROXY_URL } });
+  }
+  return proxiedRequestContext;
+}
 
 // Providers register cookies once at startup; applied to every fresh context
 // so a session discard/relaunch (e.g. after a browser crash) doesn't drop them.
@@ -102,6 +132,12 @@ async function discardSession(): Promise<void> {
   const live = await current?.catch(() => null);
   try {
     await live?.browser.close();
+  } catch { /* already gone */ }
+
+  const proxiedCtx = proxiedRequestContext;
+  proxiedRequestContext = null;
+  try {
+    await (await proxiedCtx?.catch(() => null))?.dispose();
   } catch { /* already gone */ }
 }
 
@@ -190,16 +226,45 @@ function recyclePage(page: Page): void {
   void page.close().catch(() => {});
 }
 
-type TryFetchResponse = { challenged: false, content: string} | { challenged: true } | null;
+// Always reads the body as bytes, base64-encoded to cross the browser/Node
+// boundary as a plain string - one fetch path for everything, text
+// included: res.text() would work for HTML/JSON, but would also be a
+// second code path that could silently drift from this one, for a response
+// small enough (a torrent file is a few KB) that base64's overhead is free
+// either way. cfFetch's own CfResponse decodes this however the caller
+// needs it, below.
+//
+// The encoding goes through res.blob() + FileReader.readAsDataURL(), not
+// res.arrayBuffer() + manual byte indexing: Firefox's Xray wrappers (the
+// security boundary page.evaluate()'s injected code runs under, relative to
+// the page's own realm) forbid directly reading TypedArray elements across
+// that boundary ("Accessing TypedArray data over Xrays is slow, and
+// forbidden" - a real error hit live, Camoufox is Firefox-based). A Blob
+// has no such element-level access, and FileReader's own base64 encoding
+// happens in the browser's native code, not user-visible TypedArray reads,
+// so it isn't subject to the restriction.
+type TryFetchResponse = { challenged: false; base64: string } | { challenged: true } | null;
 
 async function tryFetch(page: Page, url: string, init: FetchOptions): Promise<TryFetchResponse> {
   if (page.isClosed()) return null;
   try {
     return await page.evaluate<TryFetchResponse, { url: string; init: FetchOptions }>(async ({ url, init }) => {
       const res = await fetch(url, init);
-      return res.headers.get('cf-mitigated') === 'challenge'
-        ? { challenged: true }
-        : { challenged: false, content: await res.text() };
+      if (res.headers.get('cf-mitigated') === 'challenge') return { challenged: true };
+
+      const blob = await res.blob();
+      const dataUrl: string = await new Promise((resolve, reject) => {
+        const reader = new FileReader();
+        reader.onload = () => resolve(reader.result as string);
+        reader.onerror = () => reject(reader.error);
+        reader.readAsDataURL(blob);
+      });
+      // "data:<mime>;base64,<payload>" - only the payload is wanted; a
+      // response with an empty body still yields a valid "data:...;base64,"
+      // prefix with nothing after the comma, so this doesn't need a
+      // separate empty-body special case.
+      const base64 = dataUrl.slice(dataUrl.indexOf(',') + 1);
+      return { challenged: false, base64 };
     }, { url, init });
   } catch {
     return null;
@@ -215,9 +280,70 @@ export function isChallenge(response: TryFetchResponse | PlaywrightResponse | nu
   return response.headers()['cf-mitigated'] === 'challenge';
 }
 
-export async function cfFetch(url: string, opts: FetchOptions = {}): Promise<string> {
+// A `Cookie` header can't be set from page-context JS: it's a forbidden
+// header name per the Fetch spec, silently dropped by every browser
+// (Chrome, Firefox/Camoufox included) rather than erroring, which makes it
+// look like it worked. A Cardigann definition's search.headers.cookie
+// (e.g. eztv.yml's layout=def_wlinks) needs Playwright's own cookie jar
+// instead - which has the added benefit of applying to every request from
+// this context, not just the one page.evaluate(fetch()) call: a full
+// page.goto() navigation (the "slow path" below, after a challenge) never
+// carries opts.headers at all, but does send whatever's in the cookie jar.
+async function applyCookieHeader(page: Page, hostname: string, headers: Record<string, string> | undefined): Promise<void> {
+  if (!headers) return;
+  const key = Object.keys(headers).find((k) => k.toLowerCase() === 'cookie');
+  if (!key || !headers[key]) return;
+
+  const cookies = headers[key]
+    .split(';')
+    .map((pair) => pair.trim())
+    .filter(Boolean)
+    .map((pair) => {
+      const eq = pair.indexOf('=');
+      const name = eq === -1 ? pair : pair.slice(0, eq);
+      const value = eq === -1 ? '' : pair.slice(eq + 1);
+      return { name, value, domain: hostname, path: '/' };
+    });
+
+  if (cookies.length) await page.context().addCookies(cookies);
+}
+
+// A challenge (or the block-ban page) is frequently scoped to the specific
+// path being requested, not the whole origin (confirmed live: eztvx.to's
+// bare "/" navigates cleanly while its own "/search/..." independently
+// shows Cloudflare's challenge) - navigating to the bare origin instead of
+// url would miss detecting/solving a challenge scoped that way. So this
+// navigates to the exact url first, and only falls back to the bare origin
+// if THAT specific navigation throws "Download is starting" - Playwright's
+// own signal that url is a direct file response (e.g. itorrents.org's
+// .torrent links), not a navigable page at all, a real error hit live. The
+// actual target is still only ever fetched via tryFetch()'s in-page
+// fetch() below, which doesn't trigger download-interception - this goto
+// is purely to land on the right origin/clear a challenge, whichever URL
+// gets there.
+async function gotoPreferringExactUrl(page: Page, url: string): Promise<PlaywrightResponse | null> {
+  try {
+    return await page.goto(url, { waitUntil: 'commit', timeout: 15000 });
+  } catch (err) {
+    if (!(err instanceof Error) || !err.message.includes('Download is starting')) throw err;
+    return page.goto(`${new URL(url).origin}/`, { waitUntil: 'commit', timeout: 15000 });
+  }
+}
+
+// The one fetch path (see tryFetch), returning the response body as base64
+// for cfFetch's CfResponse to decode however its caller needs.
+// isBlocked() (a substring pattern match for the ban page's own text)
+// runs against the UTF-8 decoding of whatever came back - harmless even for
+// genuinely binary content (a torrent file coincidentally containing both
+// "Access denied" and "Cloudflare" as literal substrings is not a real risk)
+// and means there's no separate binary-mode branch to keep in sync.
+async function fetchViaSession(url: string, opts: FetchOptions): Promise<string> {
   const { method = 'GET', headers, body } = opts;
-  const init: FetchOptions = { method, headers, body };
+  // Cookie is stripped here (see applyCookieHeader) rather than left for
+  // fetch() to silently ignore - one clear mechanism, not two that could
+  // disagree.
+  const remainingHeaders = headers ? Object.fromEntries(Object.entries(headers).filter(([k]) => k.toLowerCase() !== 'cookie')) : headers;
+  const init: FetchOptions = { method, headers: remainingHeaders, body };
   const cacheKey = crypto.createHash('sha256').update(`${method}:${url}:${body ?? ''}`).digest('hex');
 
   const cached = pageCache.get(cacheKey);
@@ -225,35 +351,34 @@ export async function cfFetch(url: string, opts: FetchOptions = {}): Promise<str
 
   const hostname = new URL(url).hostname;
   const page = await getOrCreatePersistentPage(hostname);
+  await applyCookieHeader(page, hostname, headers);
 
   // Exclusive per hostname: a second call for the same page must wait for
   // this one to finish, not interleave its own goto()/solveChallenge() with it.
   return serializeHost(hostname)(async () => {
     try {
-      // A new page sits on about:blank, where fetch()'s same-origin rules make
-      // tryFetch() fail regardless of cookies - not a challenge signal.
       let firstNav = false;
       let response: PlaywrightResponse | null = null;
 
       if (page.url() === 'about:blank') {
-        response = await serializeNav(() => page.goto(url, { waitUntil: 'commit', timeout: 15000 }));
+        response = await serializeNav(() => gotoPreferringExactUrl(page, url));
         firstNav = true;
       }
 
       if (!isChallenge(response)) {
         const fast = await tryFetch(page, url, init);
         if (fast !== null && !isChallenge(fast)) {
-          if (isBlocked(fast.content)) {
+          if (isBlocked(Buffer.from(fast.base64, 'base64').toString('utf-8'))) {
             throw new Error(`cfFetch: fetch failed for ${url} even though the page shows no challenge - probably your IP got blocked.`);
           }
-          pageCache.set(cacheKey, fast.content);
-          return fast.content;
+          pageCache.set(cacheKey, fast.base64);
+          return fast.base64;
         }
       }
 
       console.error(`[cf] cfFetch: fast path unavailable for ${url}, recovering session.`);
       if (!firstNav) {
-        response = await serializeNav(() => page.goto(url, { waitUntil: 'commit', timeout: 15000 }));
+        response = await serializeNav(() => gotoPreferringExactUrl(page, url));
       }
 
       if (isChallenge(response)) {
@@ -273,12 +398,12 @@ export async function cfFetch(url: string, opts: FetchOptions = {}): Promise<str
 
       const retried = await tryFetch(page, url, init);
 
-      if (retried === null || isChallenge(retried) || isBlocked(retried.content)) {
+      if (retried === null || isChallenge(retried) || isBlocked(Buffer.from(retried.base64, 'base64').toString('utf-8'))) {
         throw new Error(`cfFetch: fetch failed for ${url} even after session recovery.`);
       }
 
-      pageCache.set(cacheKey, retried.content);
-      return retried.content;
+      pageCache.set(cacheKey, retried.base64);
+      return retried.base64;
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
       console.error(`[cf] recycling page for ${url} after failure: ${message}`);
@@ -286,6 +411,62 @@ export async function cfFetch(url: string, opts: FetchOptions = {}): Promise<str
       throw err;
     }
   });
+}
+
+// Mirrors fetch()'s own Response shape (text()/arrayBuffer()-like) for
+// familiarity, but not its laziness or single-read restriction: by the time
+// fetchViaSession() resolves, the whole body has already been read and
+// base64-encoded inside the page context (page.evaluate() is one
+// round-trip, not a stream), so there's no download left to defer and no
+// real "body already consumed" hazard - text() and buffer() can each be
+// called any number of times, decoding the same already-in-memory base64.
+export interface CfResponse {
+  text(): Promise<string>;
+  buffer(): Promise<Buffer>;
+}
+
+export async function cfFetch(url: string, opts: FetchOptions = {}): Promise<CfResponse> {
+  const base64 = await fetchViaSession(url, opts);
+  return {
+    text: async () => Buffer.from(base64, 'base64').toString('utf-8'),
+    buffer: async () => Buffer.from(base64, 'base64')
+  };
+}
+
+// A dedicated path for fetching a raw file (a .torrent, in practice - see
+// download.ts) rather than an interactive page. Deliberately does NOT reuse
+// cfFetch's page.goto()/tryFetch() machinery: that's built for pages that
+// may need an actual Cloudflare challenge solved (Camoufox's real Firefox
+// fingerprint, needed to pass one, is the entire reason that machinery
+// exists), and a direct file response breaks page.goto() outright
+// ("Download is starting", both for the file's own URL AND, confirmed
+// live, for its host's bare origin too - itorrents.org's root is itself
+// challenge-gated even though the specific /torrent/<hash>.torrent path it
+// redirects through is not, confirmed live as a clean 3-hop chain
+// (itorrents.org -> itorrents.net -> the actual host serving the bytes)
+// with no challenge anywhere in it). A plain cross-origin page.evaluate()
+// fetch() can't read the body either (no CORS headers on that chain), so
+// this needs its own path regardless of the download-interception issue.
+// A raw file endpoint like this is, in practice, not challenge-gated the
+// way an interactive page is - Playwright's context.request (a real Node
+// HTTP client, not the browser's own network stack - see
+// hostMatchesProxyDomain's comment) shares the browser context's cookie
+// jar (any cf_clearance already obtained) and follows redirects
+// transparently, with no download-interception since it's not a page
+// navigation at all.
+export async function fetchFileDirect(url: string, opts: FetchOptions = {}): Promise<Buffer> {
+  const { method = 'GET', headers, body } = opts;
+  const hostname = new URL(url).hostname;
+
+  const requestContext = hostMatchesProxyDomain(hostname) ? await getProxiedRequestContext() : (await getSession()).context.request;
+
+  const response = await requestContext.fetch(url, { method, headers, data: body, timeout: 15000 });
+
+  if (!response.ok()) {
+    throw new Error(`fetchFileDirect: ${response.status()} ${response.statusText()} for ${url}`);
+  }
+
+  return response.body();
 }
 
 export async function closeBrowser(): Promise<void> {

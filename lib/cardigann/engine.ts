@@ -1,7 +1,7 @@
 import { collectCategoryMappings } from './category-mapping.js';
 import { applyFilter, andMatch, type FilterSpec } from './filters.js';
 import { extractField, renderFilterArgs, type FieldSpec, type FieldsBlock } from './extract.js';
-import type { TemplateContext } from './template.js';
+import { renderTemplate, type TemplateContext } from './template.js';
 import { selectDomRows, selectDocumentRow, selectJsonRows } from './select.js';
 
 // No network I/O anywhere in this file, deliberately - everything here is a
@@ -141,10 +141,16 @@ export function runSearchAll(definition: Record<string, unknown>, body: string, 
     body
   );
 
+  // A definition can template its own rows.selector (e.g. 1337x.yml's
+  // optional :has(...) clause driven off .Config.uploader) - rendered
+  // against topCtx, same context every other pre-row-loop value uses.
   const rowsResult =
     responseType === 'json'
       ? selectJsonRows(preprocessed, search.rows)
-      : { rows: selectDomRows(preprocessed, search.rows.selector, responseType === 'xml'), explicitNoResults: false };
+      : {
+          rows: selectDomRows(preprocessed, renderTemplate(search.rows.selector, topCtx), responseType === 'xml'),
+          explicitNoResults: false
+        };
 
   if (rowsResult.explicitNoResults) return [];
 

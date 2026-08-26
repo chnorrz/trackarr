@@ -144,3 +144,13 @@ test('unmatched {{ end }} and unclosed {{ if }} both throw at parse time', () =>
   assert.throws(() => renderTemplate('{{ end }}', baseCtx()), /unmatched/);
   assert.throws(() => renderTemplate('{{ if .Keywords }}x', baseCtx()), /unclosed/);
 });
+
+// Real upstream YAML has these - Prowlarr/Indexers pin dca9847's 1337x.yml,
+// search.paths[1] (the TV path), has a stray extra ")" before "}}" that the
+// other three otherwise-identical paths don't. trackarr vendors definitions
+// unmodified, so the parser has to tolerate this rather than the file being
+// hand-edited to "fix" it.
+test('a stray, unmatched ")" inside an {{ if and (...) (...) }} clause is a no-op, not a parse error (real upstream typo)', () => {
+  const tpl = '{{ if and (.Keywords) (eq .Config.disablesort .False)) }}yes{{ else }}no{{ end }}';
+  assert.equal(renderTemplate(tpl, baseCtx({ Keywords: 'ubuntu', Config: { disablesort: '' } })), 'yes');
+});

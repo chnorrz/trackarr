@@ -4,7 +4,7 @@ import { cfFetch } from '../lib/browser.js';
 import { CATEGORIES, matchCategory, type CategoryRule } from '../lib/categories.js';
 import { fetchMergedBrowse, fetchPagedWindow } from '../lib/paging.js';
 import { parseSize } from '../lib/parse.js';
-import type { MagnetRef, Provider, SearchItem, SearchOptions, SearchResult } from '../lib/types.js';
+import type { MagnetRef, Provider, ResolvedDownload, SearchItem, SearchOptions, SearchResult } from '../lib/types.js';
 
 const BASE = 'https://ext.to';
 const MAGNET_ENDPOINT = `${BASE}/ajax/getSearchMagnet.php`;
@@ -115,7 +115,7 @@ function parseListing(html: string, knownCategory?: number): ListingPage {
 }
 
 async function fetchListingPage(url: string, knownCategory?: number): Promise<ListingPage> {
-  const html = await cfFetch(url);
+  const html = await (await cfFetch(url)).text();
   return parseListing(html, knownCategory);
 }
 
@@ -172,12 +172,12 @@ async function search(q: string, opts: SearchOptions): Promise<SearchResult> {
   );
 }
 
-async function resolveMagnet({ id }: MagnetRef): Promise<string> {
+async function resolveMagnet({ id }: MagnetRef): Promise<ResolvedDownload> {
   if (!id) throw new Error('ext-to: resolveMagnet requires an id.');
 
   // Needs a real results listing - bare /browse/ renders no searchPageToken,
   // and a very short query trips a stricter WAF rule.
-  const html = await cfFetch(`${BASE}/browse/?q=yify`);
+  const html = await (await cfFetch(`${BASE}/browse/?q=yify`)).text();
 
   const pageTokenMatch = html.match(/searchPageToken\s*=\s*['"]([^'"]+)['"]/);
   if (!pageTokenMatch || !pageTokenMatch[1]) throw new Error('Could not find window.searchPageToken on page.');
@@ -190,18 +190,20 @@ async function resolveMagnet({ id }: MagnetRef): Promise<string> {
   const timestamp = Math.floor(Date.now() / 1000);
   const hmac = computeHMAC(id, timestamp, pageToken);
 
-  const responseText = await cfFetch(MAGNET_ENDPOINT, {
-    method: 'POST',
-    headers: { 'X-Requested-With': 'XMLHttpRequest', 'Content-Type': 'application/x-www-form-urlencoded' },
-    body: new URLSearchParams({
-      torrent_id: String(id),
-      hash: '',
-      name: '',
-      timestamp: String(timestamp),
-      hmac,
-      sessid
-    }).toString()
-  });
+  const responseText = await (
+    await cfFetch(MAGNET_ENDPOINT, {
+      method: 'POST',
+      headers: { 'X-Requested-With': 'XMLHttpRequest', 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: new URLSearchParams({
+        torrent_id: String(id),
+        hash: '',
+        name: '',
+        timestamp: String(timestamp),
+        hmac,
+        sessid
+      }).toString()
+    })
+  ).text();
 
   let json: { success?: boolean; url?: string };
   try {
@@ -214,7 +216,7 @@ async function resolveMagnet({ id }: MagnetRef): Promise<string> {
     throw new Error(`No magnet in response: ${JSON.stringify(json)}`);
   }
 
-  return json.url;
+  return { kind: 'magnet', magnet: json.url };
 }
 
 export default {

@@ -4,15 +4,14 @@ import { applyFilters, type FilterSpec } from './filters.js';
 import { buildQueryString, type InputsBlock } from './inputs.js';
 import { resolveJsonPath, selectDocumentRow } from './select.js';
 import { renderTemplate, type DownloadUri, type TemplateContext } from './template.js';
+import type { ResolvedDownload } from '../types.js';
 
 // Resolves the wiki's "Download" section: when a listing doesn't already
 // carry a usable magnet/download link, this walks the documented
-// before -> selectors -> infohash chain to find one.
-//
-// UNTESTED against any real live site: none of this repo's checked-in
-// definitions (kickasstorrents-to.yml) exercise a download block at all -
-// its own `download:` field selects a magnet URI directly from the listing,
-// so this file's logic never runs for it. See NOTES.md section 20.
+// before -> selectors -> infohash chain to find one - a magnet: URI, or a
+// real .torrent file's bytes (fetched here, not just handed back as a URL -
+// see NOTES.md). Live-tested against ext.to, 1337x and EZTV's real
+// definitions (NOTES.md).
 
 export interface SimpleSelectorSpec {
   selector?: string;
@@ -57,6 +56,22 @@ export interface Fetcher {
   (url: string, opts?: { method?: string; headers?: Record<string, string>; body?: string }): Promise<string>;
 }
 
+export interface BinaryFetcher {
+  (url: string, opts?: { method?: string; headers?: Record<string, string>; body?: string }): Promise<Buffer>;
+}
+
+// HTTP header values (Content-Disposition's filename) and filesystems both
+// reject/mangle quotes, control characters and path separators - the same
+// restriction magnet's own &dn= sidesteps via percent-encoding, but a
+// filename has to actually be a plausible filename.
+function sanitizeFilename(title: string): string {
+  const cleaned = [...title]
+    .filter((c) => c.charCodeAt(0) > 0x1f && !'"\\/'.includes(c))
+    .join('')
+    .trim();
+  return `${cleaned || 'download'}.torrent`;
+}
+
 // The one hardcoded piece of this module: infohash-built magnets need a
 // tracker list and none is specified anywhere in the format. Sourced from a
 // magnet URI actually captured live this session (a real EZTV row, not
@@ -97,20 +112,25 @@ function flattenHeaders(headers: Record<string, string[]> | undefined): Record<s
 // A "$"-prefixed selector means the download response is JSON, same
 // convention search.fields uses (select.ts's resolveJsonPath) - the download
 // block has no separate response.type declaration, so this is detected from
-// the selector itself rather than any surrounding config.
-function extractFromBody(body: string, spec: SimpleSelectorSpec): string {
+// the selector itself rather than any surrounding config. The selector
+// itself is template-rendered first (1337x.yml's download.selectors
+// reference .Config.downloadlink) - selectors elsewhere in this file are
+// scraped content, never templates, so this is the one place that matters.
+function extractFromBody(body: string, spec: SimpleSelectorSpec, ctx: TemplateContext): string {
   if (!spec.selector) return '';
+  const selector = renderTemplate(spec.selector, ctx);
+  if (!selector) return '';
 
-  if (spec.selector.startsWith('$')) {
+  if (selector.startsWith('$')) {
     const root: unknown = JSON.parse(body);
-    const value = resolveJsonPath(root, spec.selector);
+    const value = resolveJsonPath(root, selector);
     if (value === undefined) return '';
     const raw = typeof value === 'string' ? value : JSON.stringify(value);
     return applyFilters(spec.filters, raw);
   }
 
   const $ = cheerio.load(body);
-  const found = $(spec.selector).first();
+  const found = $(selector).first();
   if (found.length === 0) return '';
   const raw = spec.attribute !== undefined ? (found.attr(spec.attribute) ?? '') : found.text().trim();
   return applyFilters(spec.filters, raw);
@@ -134,11 +154,23 @@ export interface ResolveOptions {
   /** The item's own title, for .Result.title inside before.inputs templates
    * and as the infohash magnet's &dn= fallback if infohash.title has no match. */
   itemTitle: string;
+  /** The same .Config a search() call for this indexer would use (settings
+   * defaults + the operator's own config: overrides + sitelink) - a
+   * definition's download block can reference it too (1337x.yml's
+   * download.selectors use .Config.downloadlink). Defaults to {} for
+   * callers/tests that don't need it. */
+  config?: Record<string, string>;
   fetch: Fetcher;
+  /** Fetches a resolved non-magnet download link's raw bytes, through the
+   * same session/Cloudflare-bypass a plain Fetcher would use - needed
+   * because a .torrent file isn't valid UTF-8 and fetch()-as-text would
+   * corrupt it. Only called when download.selectors[] actually resolves to
+   * one (magnet-only defs never touch it). */
+  fetchBinary: BinaryFetcher;
 }
 
-export async function resolveCardigannDownload(opts: ResolveOptions): Promise<string> {
-  if (opts.downloadUri.startsWith('magnet:')) return opts.downloadUri;
+export async function resolveCardigannDownload(opts: ResolveOptions): Promise<ResolvedDownload> {
+  if (opts.downloadUri.startsWith('magnet:')) return { kind: 'magnet', magnet: opts.downloadUri };
 
   const download = (opts.definition.download as DownloadBlockDef | undefined) ?? undefined;
   const downloadUriCtx = buildDownloadUri(opts.downloadUri);
@@ -149,7 +181,7 @@ export async function resolveCardigannDownload(opts: ResolveOptions): Promise<st
     Keywords: '',
     Query: {},
     Categories: [],
-    Config: {},
+    Config: opts.config ?? {},
     Result: { title: opts.itemTitle },
     DownloadUri: downloadUriCtx,
     Now: now
@@ -160,8 +192,8 @@ export async function resolveCardigannDownload(opts: ResolveOptions): Promise<st
     // to be a real page containing a magnet, same fallback our hand-written
     // providers (ext-to/1337x/eztv) all use on their detail pages.
     const html = await opts.fetch(opts.downloadUri);
-    const magnet = extractFromBody(html, { selector: 'a[href^="magnet:"]', attribute: 'href' });
-    if (magnet) return magnet;
+    const magnet = extractFromBody(html, { selector: 'a[href^="magnet:"]', attribute: 'href' }, ctx);
+    if (magnet) return { kind: 'magnet', magnet };
     throw new Error(`Cardigann: no download block and no magnet link found on ${opts.downloadUri}`);
   }
 
@@ -180,7 +212,7 @@ export async function resolveCardigannDownload(opts: ResolveOptions): Promise<st
     if ((!beforePath && download.before.pathselector) || download.before.vars) {
       const sourceHtml = await opts.fetch(opts.downloadUri, headers ? { headers } : undefined);
       if (!beforePath && download.before.pathselector) {
-        beforePath = extractFromBody(sourceHtml, download.before.pathselector);
+        beforePath = extractFromBody(sourceHtml, download.before.pathselector, ctx);
       }
       if (download.before.vars) {
         const docRow = selectDocumentRow(sourceHtml, undefined);
@@ -225,22 +257,54 @@ export async function resolveCardigannDownload(opts: ResolveOptions): Promise<st
     return defaultResponseBody;
   };
 
+  // A real definition's selectors[] is an ordered fallback list by design -
+  // 1337x.yml's own info_download setting text says as much ("we suggest
+  // using the magnet link as a fallback [to iTorrents]"). A selector that
+  // *matches* but points at a link that's actually dead (confirmed live:
+  // itorrents.org 403s/network-errors entirely as of this writing) must
+  // fall through to the next selector, not abort the whole resolution -
+  // only an empty (non-)match did that before. The last such failure is
+  // kept so a real reason surfaces if every selector in the list fails.
+  let lastFetchError: Error | undefined;
+
   for (const selector of download.selectors ?? []) {
     const html = await bodyFor(selector.usebeforeresponse);
-    const resolved = extractFromBody(html, selector);
+    const resolved = extractFromBody(html, selector, ctx);
     if (!resolved) continue;
-    if (resolved.startsWith('magnet:')) return resolved;
-    throw new Error(
-      `Cardigann: download selector resolved to a non-magnet URL (${resolved}) - .torrent file downloading is not supported, only magnet: URIs.`
-    );
+    if (resolved.startsWith('magnet:')) return { kind: 'magnet', magnet: resolved };
+
+    // Not a magnet: the wiki documents download.selectors[] as resolving to
+    // either one - fetch the .torrent file's actual bytes through the same
+    // session (headers included, e.g. auth cookies the link needs) rather
+    // than handing the client a URL they can't themselves get past
+    // Cloudflare with. resolved can be relative (a bare selector attribute,
+    // same as any other extracted href) - resolved against downloadUri,
+    // same as before.path already does elsewhere in this function.
+    const absoluteUrl = new URL(resolved, opts.downloadUri).toString();
+    try {
+      const data = await opts.fetchBinary(absoluteUrl, headers ? { headers } : undefined);
+      if (data[0] !== 0x64) {
+        // Every valid .torrent file is a bencoded dictionary, which always
+        // starts with an ASCII 'd' - catches "actually got an HTML error
+        // page" here, with a clear reason, instead of handing a client
+        // garbage bytes it'll fail to parse with no explanation.
+        throw new Error(`Cardigann: download selector resolved to ${absoluteUrl}, but the fetched content isn't a valid .torrent file.`);
+      }
+      return { kind: 'torrent', data, filename: sanitizeFilename(opts.itemTitle) };
+    } catch (err) {
+      lastFetchError = err instanceof Error ? err : new Error(String(err));
+      console.error(`[cardigann] download selector ${absoluteUrl} failed, trying the next one: ${lastFetchError.message}`);
+    }
   }
+
+  if (lastFetchError) throw lastFetchError;
 
   if (download.infohash) {
     const html = await bodyFor(download.infohash.usebeforeresponse);
-    const hash = extractFromBody(html, download.infohash.hash);
+    const hash = extractFromBody(html, download.infohash.hash, ctx);
     if (!hash) throw new Error(`Cardigann: download.infohash.hash did not match on ${opts.downloadUri}`);
-    const title = extractFromBody(html, download.infohash.title) || opts.itemTitle;
-    return buildMagnetFromInfohash(hash, title);
+    const title = extractFromBody(html, download.infohash.title, ctx) || opts.itemTitle;
+    return { kind: 'magnet', magnet: buildMagnetFromInfohash(hash, title) };
   }
 
   throw new Error(`Cardigann: download block exhausted with no magnet resolved for ${opts.downloadUri}`);

@@ -39,9 +39,27 @@ function trim(value: string, args: FilterArgs): string {
   return value.replace(new RegExp(`^[${chars}]+|[${chars}]+$`, 'g'), '');
 }
 
+// Go's RE2 (what real Cardigann definitions are authored against) supports
+// a leading "(?flags)" group to set inline flags - `(?i)` for
+// case-insensitive is the overwhelmingly common case in the wild (1337x.yml
+// alone uses it 8 times in one filter chain). JS's RegExp has no equivalent
+// inline syntax - the pattern string itself must not contain it, and the
+// flag has to be passed as RegExp's second constructor argument instead, or
+// "(?i)" is parsed as an (invalid) capturing group and throws. `m`/`s` map
+// directly to JS's own flags of the same letter; anything else Go supports
+// (e.g. `U` for ungreedy) has no JS equivalent and is silently dropped
+// rather than failing the whole pattern over a flag we can't honor.
+function compileGoRegex(pattern: string, extraFlags: string): RegExp {
+  const m = /^\(\?([a-zA-Z]+)\)/.exec(pattern);
+  if (!m) return new RegExp(pattern, extraFlags);
+  const goFlags = m[1] as string;
+  const jsFlags = [...new Set([...extraFlags, ...[...goFlags].filter((f) => f === 'i' || f === 'm' || f === 's')])].join('');
+  return new RegExp(pattern.slice(m[0].length), jsFlags);
+}
+
 function regexp(value: string, args: FilterArgs): string {
   const pattern = toStringArg(args);
-  const m = new RegExp(pattern).exec(value);
+  const m = compileGoRegex(pattern, '').exec(value);
   if (!m) return '';
   return m[1] ?? m[0];
 }
@@ -53,7 +71,7 @@ function replaceFilter(value: string, args: FilterArgs): string {
 
 function reReplace(value: string, args: FilterArgs): string {
   const [pattern, replacement] = toArgsArray(args);
-  return value.replace(new RegExp(pattern ?? '', 'g'), replacement ?? '');
+  return value.replace(compileGoRegex(pattern ?? '', 'g'), replacement ?? '');
 }
 
 function split(value: string, args: FilterArgs): string {
