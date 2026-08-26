@@ -3175,6 +3175,53 @@ type changed to `ResolvedDownload`; a resolved `.torrent` result is
 deliberately never cached (cheap to re-fetch, not worth it for what's
 normally a one-shot grab).
 
+### A fourth combination the unification missed: challenge-gated AND a
+### cross-origin-redirecting download
+
+Walking through the four sequencing combinations `cfFetch` can hit -
+(1) a normal page, (2) a page needing a challenge, (3) a download with no
+challenge (the iTorrents case, live-tested above), (4) a download that's
+*also* challenge-gated - surfaced a real gap in (4), asked about directly
+rather than found by testing.
+
+Before the fix: the FIRST navigation for a challenge-gated url returns the
+challenge HTML itself, not a download (Cloudflare serves its own page,
+`page.goto()` never even sees the real target) - `navigateOrDownload`
+correctly reports `{kind:'page'}` for it, `solveChallenge` runs, clearance
+is obtained, and then only `tryFetch`'s in-page `fetch()` was ever retried
+afterward. If the real download turns out to redirect cross-origin once
+past the challenge (iTorrents' own actual shape: `.org` -> `.net` -> the
+serving host, no ACAO header anywhere in that chain), `tryFetch` fails the
+exact same way it always would for a cross-origin file - and the whole
+call throws `cfFetch: fetch failed ... even after session recovery`,
+even though a plain re-navigation (now that clearance is held) would have
+resolved it as a real download, same as case (3).
+
+Fixed in `fetchViaSession`: immediately before the existing final
+"exhausted, throw" check, if `tryFetch`'s retry failed or came back
+challenged AND `allowDownload`, one more `navigateOrDownload(page, url,
+true)` runs. Deliberately placed only on that failure path, not
+immediately after every solve - the overwhelming majority of challenges
+resolve to an ordinary page, and this must cost that case nothing.
+Verified via a dedicated unit test asserting `gotoUrls` shows exactly one
+navigation for that case (`test/lib/browser.test.ts`).
+
+**This one is reasoned and unit-tested only, not live-verified** - no
+challenge-gated direct-download URL was available to confirm it against
+for real; the live-tested iTorrents case (case 3) has never actually shown
+its own challenge, only the *origin* is challenge-gated when it is at all,
+which case (3) already covers correctly. Building the fake-page harness
+for this also surfaced a real bug in the harness itself, not the
+production code: the fake's `waitForEvent('download')` was a strict FIFO
+hand-off (`downloadWaiters.shift()`), correct as long as at most one waiter
+was ever pending per page - which broke the moment a challenge-then-download
+sequence left an earlier, never-consumed waiter (from the first navigation,
+which returned the challenge page normally rather than throwing) still
+sitting in the queue when a second navigation armed its own. A real
+Playwright `'download'` event broadcasts to every currently-registered
+listener, not a queue - fixed by resolving *all* pending waiters on a
+trigger match, not just the oldest one.
+
 ### Live-test results (`definitions/{1337x,eztv}.yml`, both files exactly as
 ### fetched from the pin, `ext-to-cd` re-verified alongside as a regression
 ### check)
@@ -3215,7 +3262,7 @@ existing IPv4-ban workaround (confirmed still needed: direct IPv4 gives
   anyway as a regression check (same item as section 24's live test,
   same infohash `E0593A3DAB881080EFECB54BA6551D4B2D329BF1`).
 
-338 tests passing (up from 314 at the end of section 24), lint/typecheck
+340 tests passing (up from 314 at the end of section 24), lint/typecheck
 clean. `providers/{ext-to,1337x,eztv}.ts` are still the live `server.ts`
 routes - nothing has been switched over. Whether to retire them now that
 all three Cardigann equivalents are proven correct end-to-end (search,

@@ -29,6 +29,19 @@ let evaluateFilename: string | undefined;
 let gotoUrls: string[] = [];
 let gotoDownloadStartingFor: string | null = null;
 
+// Simulates a url that's challenge-gated on its FIRST goto() only (real
+// shape: the challenge sits in front of the actual response, cleared once
+// solveChallenge() obtains cf_clearance) - every later goto() to the same
+// url proceeds past it, to whatever downloadTriggers/gotoDownloadStartingFor
+// configure instead. Reset between tests via challengedUrls.clear().
+let challengeOnFirstGotoFor: string | null = null;
+const challengedUrls = new Set<string>();
+let solveChallengeCalls = 0;
+
+// See evaluate()'s own comment below - simulates tryFetch's in-page fetch()
+// throwing on a cross-origin CORS failure for this specific url.
+let evaluateThrowsFor: string | null = null;
+
 type FakeCfResponse = { text(): Promise<string>; buffer(): Promise<Buffer> };
 
 type FakeDownload = {
@@ -59,12 +72,17 @@ const createFakePage = () => {
 
   return {
     isClosed: () => false,
-    evaluate: async (_fn: unknown, arg: { init?: unknown }) => {
+    evaluate: async (_fn: unknown, arg: { url?: string; init?: unknown }) => {
       activeEvaluates++;
       maxActiveEvaluates = Math.max(maxActiveEvaluates, activeEvaluates);
       lastEvaluateInit = arg?.init;
       await new Promise((r) => setTimeout(r, evaluateDelayMs));
       activeEvaluates--;
+      // Simulates a real cross-origin fetch() throwing inside page context
+      // (a CORS failure - no ACAO header, exactly iTorrents' own redirect
+      // chain) - tryFetch's own try/catch turns this into a null return,
+      // same as it would for a genuinely unreachable url.
+      if (arg?.url === evaluateThrowsFor) throw new Error('TypeError: NetworkError when attempting to fetch resource.');
       return {
         challenged: false,
         base64: Buffer.from('<html><body>cleared, not a challenge</body></html>').toString('base64'),
@@ -76,6 +94,11 @@ const createFakePage = () => {
       gotoUrls.push(url);
       if (gotoFails) throw new Error('page.goto: Timeout 15000ms exceeded.');
 
+      if (url === challengeOnFirstGotoFor && !challengedUrls.has(url)) {
+        challengedUrls.add(url);
+        return { headers: () => ({ 'cf-mitigated': 'challenge' }), status: () => 200 };
+      }
+
       const trigger = downloadTriggers[url];
       if (trigger) {
         const dl: FakeDownload = {
@@ -84,8 +107,14 @@ const createFakePage = () => {
           suggestedFilename: () => trigger.filename,
           delete: async () => { downloadDeletes++; }
         };
-        const waiter = downloadWaiters.shift();
-        if (waiter) waiter(dl);
+        // Broadcast, not a FIFO handoff: a real 'download' event fires to
+        // every listener currently registered on the page, not just the
+        // oldest one - matters once a page can have more than one armed
+        // waiter at a time (a challenge-then-download nav leaves an earlier
+        // call's own never-consumed waiter still pending alongside a later
+        // call's fresh one).
+        const waiters = downloadWaiters.splice(0, downloadWaiters.length);
+        for (const waiter of waiters) waiter(dl);
         throw new Error('page.goto: Download is starting');
       }
 
@@ -110,6 +139,9 @@ const createFakePage = () => {
     close: async () => {
       pageCloses++;
     },
+    // Called before solveChallenge() to let a slow challenge page settle -
+    // a no-op here, nothing in this fake ever actually loads anything.
+    waitForLoadState: async () => {},
     // Real Playwright pages expose .context() to get back to the owning
     // BrowserContext - used by cfFetch to route a Cookie header through
     // context.addCookies() instead of a (browser-forbidden) fetch() header.
@@ -154,6 +186,22 @@ mock.module('camoufox-js', {
     Camoufox: async () => {
       camoufoxCalls++;
       return fakeBrowser;
+    }
+  }
+});
+
+// browser.ts imports isBlocked/solveChallenge from ./challenge.js - a real
+// solveChallenge would try to click a real Turnstile widget, meaningless
+// against a fake page, so it's stubbed out; isBlocked is trivial and pure
+// (a substring match on the ban page's own text - lib/challenge.ts) so
+// it's copied verbatim rather than faked, to keep the rest of this file's
+// unrelated tests behaving exactly as they would against the real one.
+mock.module(path.join(ROOT, 'dist', 'lib', 'challenge.js'), {
+  exports: {
+    isBlocked: (html: string) => html.includes('Access denied') && html.includes('Cloudflare'),
+    solveChallenge: async () => {
+      solveChallengeCalls++;
+      return 'fake-clearance-token';
     }
   }
 });
@@ -412,4 +460,54 @@ test('cfFetch still succeeds when a non-Cookie header is passed to a url that tu
   const res = await cfFetch('https://download-test.example/with-header.torrent', { headers: { 'X-Api-Key': 'secret' } });
 
   assert.equal((await res.buffer()).toString('utf-8'), 'x');
+});
+
+// A challenge-gated file url that redirects cross-origin once past the
+// challenge (iTorrents' own real shape: .org -> .net -> the actual host)
+// can't be read by tryFetch's in-page fetch() even after solving - no CORS
+// headers, the same reason navigateOrDownload exists at all. The FIRST
+// navigation only ever saw the challenge page itself, never a download, so
+// detection never got a chance before clearance was obtained. Reasoned and
+// unit-tested only, not live-verified: no real challenge-gated
+// direct-download url was available to confirm this against (see NOTES.md).
+test('a url that is challenge-gated AND resolves as a cross-origin-redirecting download is rescued by re-navigating once the challenge is solved', async () => {
+  const url = 'https://challenge-download-test.example/file.torrent';
+  challengeOnFirstGotoFor = url;
+  challengedUrls.clear();
+  evaluateThrowsFor = url;
+  downloadTriggers = { [url]: { data: Buffer.from('real bytes past the challenge'), filename: 'real.torrent' } };
+  solveChallengeCalls = 0;
+  gotoUrls = [];
+
+  const res = await cfFetch(url);
+  const buf = await res.buffer();
+
+  assert.equal(buf.toString('utf-8'), 'real bytes past the challenge');
+  assert.equal(res.filename, 'real.torrent');
+  assert.equal(solveChallengeCalls, 1, 'the challenge must have been solved exactly once');
+  assert.deepEqual(gotoUrls, [url, url], 'one nav that hit the challenge, one re-nav after solving that resolved as the real download');
+
+  challengeOnFirstGotoFor = null;
+  evaluateThrowsFor = null;
+});
+
+// The mirror case: proves the rescue path above has zero cost on the
+// overwhelming majority - a challenge that resolves to an ordinary page
+// once solved, same as scenario 2 in practice.
+test('a challenge that resolves to a normal page after solving costs no extra navigation - the download-rescue path is never entered', async () => {
+  const url = 'https://challenge-page-test.example/page.html';
+  challengeOnFirstGotoFor = url;
+  challengedUrls.clear();
+  evaluateThrowsFor = null;
+  downloadTriggers = {};
+  solveChallengeCalls = 0;
+  gotoUrls = [];
+
+  const text = await (await cfFetch(url)).text();
+
+  assert.equal(text, '<html><body>cleared, not a challenge</body></html>');
+  assert.equal(solveChallengeCalls, 1);
+  assert.deepEqual(gotoUrls, [url], 'must not re-navigate once tryFetch already succeeded after the challenge was solved');
+
+  challengeOnFirstGotoFor = null;
 });

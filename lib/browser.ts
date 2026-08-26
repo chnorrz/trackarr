@@ -461,6 +461,23 @@ async function fetchViaSession(url: string, opts: FetchOptions): Promise<{ base6
 
       const retried = await tryFetch(page, url, init);
 
+      // A challenge-gated url that's actually a file download can't be read
+      // by tryFetch's in-page fetch() once it's cross-origin or redirects
+      // cross-origin (no CORS headers - the same reason navigateOrDownload
+      // exists at all): the FIRST navigation above returned the challenge
+      // page itself, not a download, so detection never got a chance before
+      // now. With clearance obtained, one more navigation gives it that
+      // chance - deliberately only reached here, on tryFetch's own failure,
+      // so the ordinary "challenge solved, page fetched fine" case (the
+      // overwhelming majority) never pays for an extra navigation.
+      if ((retried === null || isChallenge(retried)) && allowDownload) {
+        const nav = await serializeNav(() => navigateOrDownload(page, url, true));
+        if (nav.kind === 'download') {
+          warnDroppedDownloadHeaders(url, headers);
+          return { base64: nav.base64, filename: nav.filename };
+        }
+      }
+
       if (retried === null || isChallenge(retried) || isBlocked(Buffer.from(retried.base64, 'base64').toString('utf-8'))) {
         throw new Error(`cfFetch: fetch failed for ${url} even after session recovery.`);
       }
