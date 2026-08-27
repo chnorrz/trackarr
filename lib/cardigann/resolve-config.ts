@@ -20,8 +20,7 @@ export interface ConfigResolutionResult {
 // can report everything wrong in one pass instead of a fix-one-restart loop.
 export async function resolveIndexerConfig(
   config: TrackarrConfig,
-  opts: ResolveOptions,
-  reservedIds: ReadonlySet<string>
+  opts: ResolveOptions
 ): Promise<ConfigResolutionResult> {
   const ok: ResolvedIndexer[] = [];
   const errors: { key: string; reasons: string[] }[] = [];
@@ -29,7 +28,7 @@ export async function resolveIndexerConfig(
   for (const [key, entry] of Object.entries(config.indexers)) {
     try {
       const resolved = await resolveDefinition(entry.definition, entry.source, opts);
-      const reasons = [...checkCapability(resolved.definition), ...validateIndexerConfig(key, entry, resolved, reservedIds)];
+      const reasons = [...checkCapability(resolved.definition), ...validateIndexerConfig(key, entry, resolved)];
 
       if (reasons.length > 0) errors.push({ key, reasons });
       else ok.push({ key, entry, resolved });

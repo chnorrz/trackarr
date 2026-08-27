@@ -26,36 +26,30 @@ function resolved(definitionOverrides: Record<string, unknown> = {}) {
 
 test('validateIndexerConfig: a clean entry produces no reasons', () => {
   const entry = { definition: 'thepiratebay', config: { apiurl: 'apibay.org', top100: '100' } };
-  assert.deepEqual(validateIndexerConfig('tpb', entry, resolved(), new Set(['ext-to'])), []);
-});
-
-test('validateIndexerConfig: an entry key colliding with a built-in provider id is rejected', () => {
-  const entry = { definition: 'thepiratebay' };
-  const reasons = validateIndexerConfig('1337x', entry, resolved(), new Set(['ext-to', '1337x', 'eztv']));
-  assert.match(reasons[0], /collides with a built-in provider/);
+  assert.deepEqual(validateIndexerConfig('tpb', entry, resolved()), []);
 });
 
 test('validateIndexerConfig: link must be one of the definition\'s own links[]', () => {
   const entry = { definition: 'thepiratebay', link: 'https://not-a-real-mirror.example/' };
-  const reasons = validateIndexerConfig('tpb', entry, resolved(), new Set());
+  const reasons = validateIndexerConfig('tpb', entry, resolved());
   assert.match(reasons[0], /not in thepiratebay's links/);
 });
 
 test('validateIndexerConfig: link that IS in links[] passes', () => {
   const entry = { definition: 'thepiratebay', link: 'https://tpb.re/' };
-  assert.deepEqual(validateIndexerConfig('tpb', entry, resolved(), new Set()), []);
+  assert.deepEqual(validateIndexerConfig('tpb', entry, resolved()), []);
 });
 
 test('validateIndexerConfig: a config key not in the definition\'s settings is rejected, listing the real ones', () => {
   const entry = { definition: 'thepiratebay', config: { nonexistent: 'x' } };
-  const reasons = validateIndexerConfig('tpb', entry, resolved(), new Set());
+  const reasons = validateIndexerConfig('tpb', entry, resolved());
   assert.match(reasons[0], /config\.nonexistent: not a known setting/);
   assert.match(reasons[0], /apiurl, top100, uploader/);
 });
 
 test('validateIndexerConfig: a select value outside the declared options is rejected, listing valid ones', () => {
   const entry = { definition: 'thepiratebay', config: { top100: 'not-a-real-option' } };
-  const reasons = validateIndexerConfig('tpb', entry, resolved(), new Set());
+  const reasons = validateIndexerConfig('tpb', entry, resolved());
   assert.match(reasons[0], /config\.top100: "not-a-real-option" is not one of/);
   // Integer-like object keys ("100") always iterate before non-numeric ones
   // in JS, regardless of insertion order - not a bug, just what Object.keys()
@@ -67,27 +61,27 @@ test('validateIndexerConfig: a select value outside the declared options is reje
 
 test('validateIndexerConfig: a select value that IS one of the options passes', () => {
   const entry = { definition: 'thepiratebay', config: { top100: 'recent' } };
-  assert.deepEqual(validateIndexerConfig('tpb', entry, resolved(), new Set()), []);
+  assert.deepEqual(validateIndexerConfig('tpb', entry, resolved()), []);
 });
 
 test('validateIndexerConfig: a non-select setting accepts any value - only select is options-checked', () => {
   const entry = { definition: 'thepiratebay', config: { apiurl: 'literally.anything' } };
-  assert.deepEqual(validateIndexerConfig('tpb', entry, resolved(), new Set()), []);
+  assert.deepEqual(validateIndexerConfig('tpb', entry, resolved()), []);
 });
 
 test('validateIndexerConfig: a definition with no settings[] at all rejects any config key', () => {
   const entry = { definition: 'foo', config: { x: 'y' } };
-  const reasons = validateIndexerConfig('foo-inst', entry, resolved({ settings: undefined }), new Set());
+  const reasons = validateIndexerConfig('foo-inst', entry, resolved({ settings: undefined }));
   assert.match(reasons[0], /this definition has no settings/);
 });
 
 test('validateIndexerConfig: no link and no config at all is fine - both are optional', () => {
   const entry = { definition: 'thepiratebay' };
-  assert.deepEqual(validateIndexerConfig('tpb', entry, resolved(), new Set()), []);
+  assert.deepEqual(validateIndexerConfig('tpb', entry, resolved()), []);
 });
 
 test('validateIndexerConfig: multiple reasons accumulate rather than stopping at the first', () => {
   const entry = { definition: 'thepiratebay', link: 'https://bad.example/', config: { nonexistent: 'x' } };
-  const reasons = validateIndexerConfig('tpb', entry, resolved(), new Set());
+  const reasons = validateIndexerConfig('tpb', entry, resolved());
   assert.equal(reasons.length, 2);
 });

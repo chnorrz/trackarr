@@ -57,6 +57,26 @@ function buildFetchUrl(source: string, definitionId: string): string {
   return pins[source] ? `${base}/${definitionId}.yml` : base;
 }
 
+// schema.json always lives alongside the .yml at that same source - a pin's
+// own base is already a directory (append schema.json directly); a raw URL
+// source points at one specific .yml file, so schema.json replaces just its
+// filename, one path segment up.
+function buildSchemaUrl(source: string): string {
+  const pin = pins[source];
+  if (pin) return `${resolveSourceUrl(source)}/schema.json`;
+  const url = new URL(resolveSourceUrl(source));
+  url.pathname = url.pathname.replace(/\/[^/]*$/, '/schema.json');
+  return url.toString();
+}
+
+// Cache filenames can't safely be the raw source string (colons, slashes),
+// but a human debugging the cache dir benefits more from a recognizable
+// name than an opaque hash - collisions across genuinely different sources
+// are as unlikely here as the existing definitionId-keyed cache files.
+function sanitizeForFilename(s: string): string {
+  return s.replace(/[^a-zA-Z0-9_.-]/g, '_');
+}
+
 async function fetchWithFallback(
   definitionId: string,
   source: string,
@@ -88,6 +108,39 @@ async function fetchWithFallback(
   }
 }
 
+// Fetched once per source string, not per definitionId - several indexers
+// commonly share one source: (e.g. two thepiratebay instances), and each
+// would otherwise redundantly refetch/recache an identical schema.json.
+// Same offline-restart fallback as fetchWithFallback above; a failed fetch
+// with no prior cache is fatal for whichever definition needed it, same as
+// the .yml's own fetch - no silent fallback to the (possibly incompatible)
+// bundled schema, which would defeat the point of matching it exactly.
+async function fetchSchemaWithFallback(source: string, cacheDir: string, fetchImpl: typeof fetch): Promise<string> {
+  const url = buildSchemaUrl(source);
+  const key = sanitizeForFilename(source);
+  const cacheFile = path.join(cacheDir, `schema-${key}.json`);
+  const metaFile = path.join(cacheDir, `schema-${key}.meta.json`);
+
+  try {
+    const res = await fetchImpl(url);
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const raw = await res.text();
+
+    fs.mkdirSync(cacheDir, { recursive: true });
+    fs.writeFileSync(cacheFile, raw, 'utf8');
+    fs.writeFileSync(metaFile, JSON.stringify({ source, url, fetchedAt: new Date().toISOString() }, null, 2), 'utf8');
+
+    return cacheFile;
+  } catch (err) {
+    if (fs.existsSync(cacheFile)) {
+      const message = err instanceof Error ? err.message : String(err);
+      console.error(`[cardigann] schema.json fetch failed for source "${source}" (${message}), using cached copy at ${cacheFile}`);
+      return cacheFile;
+    }
+    throw err;
+  }
+}
+
 export async function resolveDefinition(
   definitionId: string,
   source: string | undefined,
@@ -101,9 +154,9 @@ export async function resolveDefinition(
   // its own schema.json (no network fetch fallback - a missing schema
   // fails this definition, loudly, rather than silently falling back to
   // the bundled schema and risking a false pass/fail against the wrong
-  // upstream version). Definitions from source: or the bundled repo dir
-  // always validate against the bundled definitions/schema.json.
+  // upstream version).
   let fromVolume = false;
+  let fromSource = false;
 
   if (opts.volumeDefinitionsDir) {
     found = readLocal(opts.volumeDefinitionsDir, definitionId);
@@ -112,6 +165,7 @@ export async function resolveDefinition(
 
   if (!found && source) {
     found = await fetchWithFallback(definitionId, source, opts.cacheDir, opts.fetchImpl ?? fetch);
+    fromSource = true;
   }
 
   if (!found) {
@@ -123,7 +177,18 @@ export async function resolveDefinition(
     throw new Error(`definition "${definitionId}" not found (tried: ${tried.join(', ')})`);
   }
 
-  const schemaPath = fromVolume ? path.join(opts.volumeDefinitionsDir as string, 'schema.json') : undefined;
+  // A source:-fetched definition validates against that exact same source's
+  // schema.json (same directory, same commit/ref) rather than the bundled
+  // one - a pin can then never silently drift out of sync with its own
+  // schema version. Only the bundled repo dir falls back to the bundled one
+  // (validateDefinitionYaml's own default).
+  let schemaPath: string | undefined;
+  if (fromVolume) {
+    schemaPath = path.join(opts.volumeDefinitionsDir as string, 'schema.json');
+  } else if (fromSource && source) {
+    schemaPath = await fetchSchemaWithFallback(source, opts.cacheDir, opts.fetchImpl ?? fetch);
+  }
+
   const result = schemaPath ? validateDefinitionYaml(found.raw, schemaPath) : validateDefinitionYaml(found.raw);
   if (!result.ok) {
     throw new Error(`${found.from}: ${result.errors.join('; ')}`);

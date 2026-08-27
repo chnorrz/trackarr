@@ -35,14 +35,15 @@ function fakeFetch(responses: Record<string, FakeBody>) {
 
 const noSleep = async () => {};
 
-// ---- real definitions/kickasstorrents-to.yml, both its real pages ----------
+// ---- faketracker.yml (test fixture, not a real site), both its two paths --
 
-// kickasstorrents-to.yml's size/seeders/leechers are POSITIONAL
-// (td:nth-child(2)/(5)/(6)), while category/title/date/download are found
-// by class or attribute anywhere in the row (cheerio .find(), position
-// doesn't matter for those) - the column layout below is built specifically
-// to satisfy the positional ones; the others could live anywhere.
-function kickassRow(id: number, title: string, sizeMb: number, seeds: number, leechers: number, catLabel: string, timeago: string): string {
+const FAKE_TRACKER_YAML = path.join(ROOT, 'test', 'fixtures', 'cardigann', 'faketracker.yml');
+
+// faketracker.yml's size/seeders/leechers are POSITIONAL (td:nth-child(2)/
+// (5)/(6)), while category/title/date/download are found by class or
+// attribute anywhere in the row - the column layout below satisfies the
+// positional ones; the others could live anywhere.
+function fakeTrackerRow(id: number, title: string, sizeMb: number, seeds: number, leechers: number, catLabel: string, timeago: string): string {
   return `
     <tr>
       <td><span><strong>${catLabel}</strong></span> <a class="cellMainLink" href="/torrent/${id}">${title}</a></td>
@@ -55,53 +56,53 @@ function kickassRow(id: number, title: string, sizeMb: number, seeds: number, le
     </tr>`;
 }
 
-function kickassPage(rows: string[]): string {
+function fakeTrackerPage(rows: string[]): string {
   return `<table class="data"><tbody>${rows.join('\n')}</tbody></table>`;
 }
 
-test('kickasstorrents-to.yml: search fetches both its real paths and concatenates results', async () => {
-  const result = validateDefinitionYaml(fs.readFileSync(path.join(ROOT, 'definitions', 'kickasstorrents-to.yml'), 'utf8'));
+test('faketracker.yml: search fetches both its real paths and concatenates results', async () => {
+  const result = validateDefinitionYaml(fs.readFileSync(FAKE_TRACKER_YAML, 'utf8'));
   assert.ok(result.ok, 'fixture definition must be schema-valid');
   if (!result.ok) return;
 
-  const page1Url = 'https://kickass.torrentbay.st/search/?q=ubuntu';
-  const page2Url = 'https://kickass.torrentbay.st/search/?page=2&q=ubuntu';
+  const page1Url = 'https://faketracker.example/search/?q=ubuntu';
+  const page2Url = 'https://faketracker.example/search/?page=2&q=ubuntu';
   const { fn, calls } = fakeFetch({
-    [page1Url]: kickassPage([kickassRow(1, 'Ubuntu 24.04 Desktop', 1500, 50, 5, '>Movies', 'now')]),
-    [page2Url]: kickassPage([kickassRow(2, 'Ubuntu 24.04 Server', 900, 20, 2, '>Movies', '1 hour')])
+    [page1Url]: fakeTrackerPage([fakeTrackerRow(1, 'Ubuntu 24.04 Desktop', 1500, 50, 5, '>Movies', 'now')]),
+    [page2Url]: fakeTrackerPage([fakeTrackerRow(2, 'Ubuntu 24.04 Server', 900, 20, 2, '>Movies', '1 hour')])
   });
 
   const provider = createCardigannProvider(
-    { key: 'kickass', entry: { definition: 'kickasstorrents-to' }, resolved: { definitionId: 'kickasstorrents-to', from: 'test', definition: result.definition } },
+    { key: 'faketracker', entry: { definition: 'faketracker' }, resolved: { definitionId: 'faketracker', from: 'test', definition: result.definition } },
     { fetch: fn, sleep: noSleep }
   );
 
-  assert.equal(provider.id, 'kickass');
-  assert.equal(provider.name, 'kickasstorrents.to');
-  assert.equal(provider.keepAlive?.url, 'https://kickass.torrentbay.st/');
+  assert.equal(provider.id, 'faketracker');
+  assert.equal(provider.name, 'Fake Tracker (test fixture)');
+  assert.equal(provider.keepAlive?.url, 'https://faketracker.example/');
 
   const { items, total } = await provider.search('ubuntu', { offset: 0, limit: 50 });
   assert.equal(calls.length, 2, 'both unconditional paths must be fetched');
   assert.equal(total, 2);
   assert.equal(items.length, 2);
   assert.equal(items[0].title, 'Ubuntu 24.04 Desktop');
-  assert.equal(items[0].category, 2000, 'kickass\' "Movies" category name maps to the standard id 2000');
+  assert.equal(items[0].category, 2000, 'fixture\'s "Movies" category name maps to the standard id 2000');
   assert.equal(items[0].size, Math.round(1500 * 1024 ** 2));
   assert.equal(items[0].seeds, 50);
   assert.equal(items[1].title, 'Ubuntu 24.04 Server');
 });
 
-test('kickasstorrents-to.yml: a magnet already present in the listing is cached, so resolveMagnet needs no extra fetch', async () => {
-  const result = validateDefinitionYaml(fs.readFileSync(path.join(ROOT, 'definitions', 'kickasstorrents-to.yml'), 'utf8'));
+test('faketracker.yml: a magnet already present in the listing is cached, so resolveMagnet needs no extra fetch', async () => {
+  const result = validateDefinitionYaml(fs.readFileSync(FAKE_TRACKER_YAML, 'utf8'));
   if (!result.ok) return assert.fail('fixture must be valid');
 
   const { fn, calls } = fakeFetch({
-    'https://kickass.torrentbay.st/search/?q=x': kickassPage([kickassRow(9, 'Some Movie', 700, 10, 1, '>Movies', 'now')]),
-    'https://kickass.torrentbay.st/search/?page=2&q=x': kickassPage([])
+    'https://faketracker.example/search/?q=x': fakeTrackerPage([fakeTrackerRow(9, 'Some Movie', 700, 10, 1, '>Movies', 'now')]),
+    'https://faketracker.example/search/?page=2&q=x': fakeTrackerPage([])
   });
 
   const provider = createCardigannProvider(
-    { key: 'kickass', entry: { definition: 'kickasstorrents-to' }, resolved: { definitionId: 'kickasstorrents-to', from: 'test', definition: result.definition } },
+    { key: 'faketracker', entry: { definition: 'faketracker' }, resolved: { definitionId: 'faketracker', from: 'test', definition: result.definition } },
     { fetch: fn, sleep: noSleep }
   );
 

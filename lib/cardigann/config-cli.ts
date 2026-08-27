@@ -11,12 +11,6 @@ import path from 'node:path';
 import { loadConfig } from './config.js';
 import { resolveIndexerConfig } from './resolve-config.js';
 
-// Hardcoded rather than imported from providers/index.js: that module pulls
-// in lib/browser.ts (camoufox-js, playwright-core, ...), which this
-// validator has no reason to load. Phase 3's real boot sequence will use the
-// actual providerMap keys instead of this list.
-const BUILTIN_PROVIDER_IDS = new Set(['ext-to', '1337x', 'eztv']);
-
 const configPath = path.resolve(process.argv[2] || process.env.CONFIG_FILE || 'config/trackarr.yml');
 
 const config = loadConfig(configPath);
@@ -34,7 +28,7 @@ const { ok, errors } = await resolveIndexerConfig(config, {
   repoDefinitionsDir: path.resolve('definitions'),
   volumeDefinitionsDir: process.env.DEFINITIONS_DIR,
   cacheDir: process.env.CARDIGANN_CACHE_DIR || path.resolve('.cardigann-cache')
-}, BUILTIN_PROVIDER_IDS);
+});
 
 console.log(`  Resolved and runnable: ${ok.length}`);
 console.log(`  Failed: ${errors.length}`);

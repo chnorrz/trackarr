@@ -1,0 +1,60 @@
+---
+# Synthetic Cardigann definition, not a real tracker - used only by the test
+# suite to exercise "real definition on disk" mechanics (positional field
+# selectors, two-path concatenation, nested-selector category, timeago
+# parsing) without depending on a vendored copy of an upstream site.
+id: faketracker
+name: Fake Tracker (test fixture)
+description: "Synthetic tracker used only by the test suite"
+language: en-US
+type: public
+encoding: UTF-8
+requestDelay: 2
+links:
+  - https://faketracker.example/
+
+caps:
+  categorymappings:
+    - {id: Movies, cat: Movies, desc: "Movies"}
+    - {id: TV, cat: TV, desc: "TV"}
+  modes:
+    search: [q]
+    tv-search: [q, season, ep]
+    movie-search: [q]
+
+search:
+  paths:
+    - path: "{{ if .Keywords }}search/?q={{ .Keywords }}{{ else }}browse/{{ end }}"
+    - path: "{{ if .Keywords }}search/?page=2&q={{ .Keywords }}{{ else }}browse/?page=2{{ end }}"
+
+  rows:
+    selector: table.data > tbody > tr:has(a[href^="magnet:?xt="])
+
+  fields:
+    category:
+      selector: span > strong
+      filters:
+        - name: re_replace
+          args: ["[>| ]+", ""]
+    title:
+      selector: a.cellMainLink
+    details:
+      selector: a.cellMainLink
+      attribute: href
+    download:
+      selector: a[href^="magnet:?xt="]
+      attribute: href
+    size:
+      selector: td:nth-child(2)
+    date:
+      selector: td.timeago
+      filters:
+        - name: timeago
+    seeders:
+      selector: td:nth-child(5)
+    leechers:
+      selector: td:nth-child(6)
+    downloadvolumefactor:
+      text: 0
+    uploadvolumefactor:
+      text: 1

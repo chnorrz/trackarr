@@ -72,14 +72,17 @@ class DomRow implements Row {
     // HTML/XML case: each key (other than the "*" wildcard) IS a selector,
     // tested against this row; first match in declaration order wins. Object
     // key order is insertion order for string keys in JS, matching the
-    // wiki's "processing ends after the first case selector matches".
+    // wiki's "processing ends after the first case selector matches". A
+    // case value is schema-permitted to be a bare number (e.g. `case: {a:
+    // 0}`) - String() here, not a type assertion, since the runtime value
+    // is genuinely a JS number in that case, not a mistyped string.
     for (const [selector, value] of Object.entries(caseMap)) {
       if (selector === '*') continue;
       if (this.$(this.el).is(selector) || this.$(this.el).find(selector).length > 0) {
-        return { raw: value, matched: true };
+        return { raw: String(value), matched: true };
       }
     }
-    return '*' in caseMap ? { raw: caseMap['*'] as string, matched: true } : { raw: '', matched: false };
+    return '*' in caseMap ? { raw: String(caseMap['*']), matched: true } : { raw: '', matched: false };
   }
 }
 
@@ -253,8 +256,9 @@ class JsonRow implements Row {
       // `downloadvolumefactor: { selector: freeleech, case: {0: 1, 1: 0} }`),
       // not treated as selectors themselves.
       const key = plain ?? '';
-      if (key in spec.case) return { raw: spec.case[key] as string, matched: true };
-      return '*' in spec.case ? { raw: spec.case['*'] as string, matched: true } : { raw: '', matched: false };
+      // See extractCase's own note: a case value may be a bare YAML number.
+      if (key in spec.case) return { raw: String(spec.case[key]), matched: true };
+      return '*' in spec.case ? { raw: String(spec.case['*']), matched: true } : { raw: '', matched: false };
     }
 
     if (plain === undefined) return { raw: '', matched: false };

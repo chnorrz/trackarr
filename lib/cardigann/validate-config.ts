@@ -10,22 +10,16 @@ interface SettingsField {
 // Everything here is a thing the two JSON Schemas (config-schema.json,
 // schema.json) can't express on their own, because it depends on *both*
 // documents at once: a config key that isn't one of the definition's own
-// settings, a select value outside that setting's declared options, a link
-// not actually in the definition's links[], or an indexer name colliding
-// with a built-in provider. All fatal - refuse to boot, same as a schema
-// failure, since these are exactly the mistakes a schema can't catch but a
-// human typo produces just as easily.
+// settings, a select value outside that setting's declared options, or a
+// link not actually in the definition's links[]. All fatal - refuse to
+// boot, same as a schema failure, since these are exactly the mistakes a
+// schema can't catch but a human typo produces just as easily.
 export function validateIndexerConfig(
   entryKey: string,
   entry: IndexerConfigEntry,
-  resolved: ResolvedDefinition,
-  reservedIds: ReadonlySet<string>
+  resolved: ResolvedDefinition
 ): string[] {
   const reasons: string[] = [];
-
-  if (reservedIds.has(entryKey)) {
-    reasons.push(`indexers.${entryKey}: id collides with a built-in provider - rename this indexer`);
-  }
 
   const links = Array.isArray(resolved.definition.links) ? (resolved.definition.links as unknown[]) : [];
   if (entry.link !== undefined && !links.includes(entry.link)) {

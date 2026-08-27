@@ -20,7 +20,7 @@ test('a single search.path (no paths[]) builds exactly one GET request', () => {
   assert.equal(reqs[0].method, 'GET');
 });
 
-test('kickasstorrents-to.yml\'s own two unconditional paths both fire, neither restricted by category', () => {
+test('two unconditional paths (real precedent: Prowlarr\'s kickasstorrents-to.yml) both fire, neither restricted by category', () => {
   const search = {
     paths: [
       { path: '{{ if .Keywords }}search/?q={{ .Keywords }}{{ else }}17/All/{{ end }}' },

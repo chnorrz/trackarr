@@ -3,12 +3,14 @@
 # leaving IPv6 clean (see NOTES.md section 4 - currently 1337x).
 #
 # Usage:
-#   1. Update the "media_default" network name below (both the trackarr
+#   1. cp config/trackarr.yml.example config/trackarr.yml (and edit it - no
+#      config file means zero indexers, nothing is built in any more).
+#   2. Update the "media_default" network name below (both the trackarr
 #      service and the networks: block) if Prowlarr isn't on a network with
 #      that name:
 #      docker inspect -f '{{range $k,$v := .NetworkSettings.Networks}}{{$k}} {{end}}' prowlarr
-#   2. docker compose up -d
-#   3. In Prowlarr, add each provider as a generic Torznab indexer. Example:
+#   3. docker compose up -d
+#   4. In Prowlarr, add each provider as a generic Torznab indexer. Example:
 #        URL: http://trackarr:9117/ext-to
 #        API Key: whatever you set below
 #
@@ -23,6 +25,8 @@ services:
     image: ghcr.io/chnorrz/trackarr:latest
     container_name: trackarr
     restart: unless-stopped
+    volumes:
+      - ./config/trackarr.yml:/app/config/trackarr.yml:ro
     environment:
       # CHANGE THIS - generate your own, e.g. `openssl rand -hex 24`, and use
       # the same value when adding trackarr as an indexer in Prowlarr.

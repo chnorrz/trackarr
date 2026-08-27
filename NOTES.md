@@ -10,10 +10,16 @@ evidence.
 ## 1. What this is
 
 A Torznab server making scraper-hostile torrent trackers usable as "Torznab
-(Custom)" indexers in Prowlarr. One indexer per provider, one process
-(shared browser + cache). TypeScript strict; `npm run build` ->
+(Custom)" indexers in Prowlarr. One indexer per configured tracker, one
+process (shared browser + cache). TypeScript strict; `npm run build` ->
 `dist/*.js`; the Docker image only runs compiled output, no `ts-node` at
 runtime.
+
+Every indexer is Cardigann-driven and declared in `config/trackarr.yml` -
+there are no hardcoded/built-in providers any more (there were, through a
+`providers/*.ts` hand-written array, until this was fully migrated to
+Cardigann - see section 17's closing note). No config file, or an empty
+`indexers:` block, means **zero routes**, not a fallback set.
 
 | File | Role |
 |---|---|
@@ -22,16 +28,15 @@ runtime.
 | `lib/challenge.ts` | Cloudflare detection + XTEST auto-solver |
 | `lib/cache.ts` | TTL cache (search 5 min, magnets 1 h) |
 | `lib/categories.ts` | Torznab category ids (71-entry vocabulary) + `categoriesXml()` |
-| `lib/paging.ts` | `fetchPagedWindow()`/`fetchMergedBrowse()` - depth-capped pagination |
 | `lib/types.ts` | `Provider`/`SearchItem`/`MagnetRef`/`ResolvedDownload` |
-| `providers/*.ts` | Hand-written per-tracker, `export default {...} satisfies Provider` |
+| `providers/index.ts` | `buildProviderMap()` - the whole provider set, entirely from `config/trackarr.yml` |
 | `lib/cardigann/` | Prowlarr Cardigann v11 YAML loader + engine - section 17 |
 | `definitions/*.yml` | Shipped Cardigann definitions - **never edited**, section 17 |
 | `tools/tinyproxy.conf` | Proxy config, runs on the **host** (section 4) |
 
-New hand-written tracker: `providers/<id>.ts` + register in
-`providers/index.ts`. New Cardigann one: drop a `.yml` in `definitions/` or
-name it in `config/trackarr.yml` - no code.
+New tracker: name it in `config/trackarr.yml` with a `source:` pin/URL, or
+drop a `.yml` in `definitions/` and reference it with no `source:` - no
+code, ever.
 
 ---
 
@@ -48,8 +53,11 @@ date (text is relative).
 (`.related-posted a[href^="/"]:not([href^="/user/"])` - that selector also
 contains an uploader link in 3 different shapes). Text drifts
 (`/books/audio-books/` renders "Audio books"); some categories only exist
-at subcategory level. `CATEGORY_RULES` in `providers/ext-to.ts` is keyed on
-full delimited href segments, most-specific-first. No XXX category exists.
+at subcategory level. `definitions/ext-to.yml`'s `caps.categorymappings` is
+keyed on full delimited href segments, most-specific-first, with a single
+`category` field regexp filter doing the collapse (section 17's own
+comment on that field explains the schema's `oneOf` constraint behind the
+design). No XXX category exists.
 
 **Magnets**: `/ajax/getSearchMagnet.php`,
 `hmac = sha256(torrentId|timestamp|token)`, token from
@@ -64,20 +72,13 @@ through the browser, not curl.
 
 ## 3. 1337x
 
-Lighter protection, no cookie. Search: `https://1337x.to/search/<query>/1/`.
-Rows: `table.table-list tbody > tr`. Title: `td.coll-1.name
-a[href^="/torrent/"]`. Size `td.coll-4.size` has a nested duplicate span -
-strip children or get `"2.2 GB28818"`. Magnet on the detail page, no HMAC.
-No exact dates.
-
-**Category: use the row icon's `/sub/<id>/` href, never the CSS class** -
-the class (`flaticon-hd` etc) drifted and now collapses TV into Movies.
-`providers/1337x.ts` trims to `/sub/<id>/` and matches 1:1 (no substring
-collision - `/sub/19/` can't match `/sub/190/`). No class fallback exists;
-unrecognized ids land on `CATEGORIES.OTHER`.
+Cardigann-driven (`source: prowlarr:v11`, Prowlarr's own upstream
+`1337x.yml` - never edited here, section 17). Lighter Cloudflare protection
+than ext.to, no cookie needed.
 
 **IPv4-banned, IPv6 clean but challenge-gated** - needs the host proxy
-(section 4) via `DOMAIN_OVER_PROXY=1337x.to`.
+(section 4) via `DOMAIN_OVER_PROXY=1337x.to`. Site-level fact, independent
+of the definition - still the first thing to check on a live-test failure.
 
 ---
 
@@ -350,32 +351,30 @@ on the shared persistent page.
 
 ---
 
-## 11. Pagination, blank-query browsing, per-provider categories
+## 11. Pagination, blank-query browsing, categories (Cardigann adapter)
 
-Blank `q` (Prowlarr Test/Save, Sonarr/Radarr "search all") passes straight
-to `provider.search('', opts)` - no `testQuery` substitution. Every
-provider implements a real "browse latest for category X" path.
+Blank `q` (Prowlarr Test/Save, Sonarr/Radarr "search all") isn't special-
+cased anywhere in code - `lib/cardigann/adapter.ts`'s `search()` passes it
+straight through as `.Keywords`, and a definition's own path template
+decides what that renders to (`ext-to.yml`: `{{ if .Keywords }}q=...{{
+else }}sort=age&order=desc&age=4{{ end }}`, a real "latest" browse).
 
-`SearchOptions.categories?: number[]` (OR semantics). Blank `q`: each id
-resolved through a provider's `CATEGORY_BROWSE` table; zero resolved ->
-empty, 2+ -> `fetchMergedBrowse`. No `cat` at all -> each provider's own
-general browse - ext.to/EZTV have a real "all categories, newest" listing;
-1337x doesn't, so it mirrors Prowlarr's own reference Cardigann definition
-instead of inventing behavior (a fixed 4-category page-1-only snapshot).
-Real keyword search: `categories` becomes a result-level filter instead,
-since none of these trackers filter server-side.
+`search.paths[]` fires every **unconditional** path on every call, in
+full, every time - no incremental/depth-capped scanning. A definition
+itself decides how many pages that is (`ext-to.yml`: exactly 2, page 1 +
+page 2). `paths[].categories` (`paths.ts`) can additionally restrict which
+paths fire for a given category request (the wiki's own porn-exclusion
+pattern). Category filtering (`SearchOptions.categories?: number[]`, OR
+semantics) happens *after* every path's results are concatenated
+(`categoryIdByName(it.category)` against the request) - none of these
+trackers filter server-side either. `offset`/`limit` are sliced **once**
+across the whole concatenated, filtered list, never per-path, or an item
+could be missed across a page boundary.
 
-`fetchPagedWindow()` fetches only as many site pages as needed for
-`[offset, offset+limit)` and caps `total` at `depthCap` (200) - Prowlarr's
-client paginates indefinitely otherwise (`opensearch:totalResults` isn't
-actually parsed by Prowlarr; the cap is what really bounds it). With a
-category filter it sequentially scans from page 1 instead (match density
-per page is unknown). `fetchMergedBrowse()` runs it per category source,
-merges by `pubDate` descending, slices once.
-
-`Provider.categories: number[]` declares exactly which ids a provider can
-produce; `categoriesXml()` renders only those - previously every provider
-advertised one shared global list regardless of what it could produce.
+`Provider.categories: number[]` (`lib/types.ts`) declares exactly which
+standard ids a provider can produce; `categoriesXml()` renders only those.
+For a Cardigann provider it's derived once from `categorymappings`/
+`categories`, deduped (`adapter.ts`'s `advertisedCategories`).
 
 ---
 
@@ -396,13 +395,16 @@ param, `201` bad param, `203` unknown `t=`, `900` internal error.
 ## 13. Testing
 
 `npm test` builds then runs `node --experimental-test-module-mocks --test
-"test/**/*.test.ts"` (340 tests). `npm run typecheck` checks source+tests.
+"test/**/*.test.ts"` (312 tests). `npm run typecheck` checks source+tests.
 CI gates both; the release build depends on the `test` job. **No
 browser/Docker/network needed** - the mock boundary is `cfFetch()`.
 
-- **Providers**: mock `cfFetch` via `mock.module()`, assert against
-  hand-built `test/fixtures/` (fake titles/hashes, real selector
-  structure - never raw captured HTML).
+- **Cardigann definitions**: `createCardigannProvider()` takes an injected
+  `Fetcher`, so a real definition (`definitions/ext-to.yml`,
+  `test/fixtures/cardigann/faketracker.yml`) can be driven against
+  hand-built `test/fixtures/` (fake titles/hashes, real selector structure
+  - never raw captured HTML) with zero mocking machinery -
+  `test/lib/cardigann/ext-to-definition.test.ts` is the reference pattern.
 - **`lib/challenge.ts`**: no mocking - covers markers + the paths that bail
   before touching a page; the click loop is only exercised live.
 - **Server**: `createApp(providers, opts?)` is a pure factory - tests hit
@@ -427,10 +429,6 @@ discover correctly.
 
 - Solver depends on the widget DOM shape and a `+22px` offset - Cloudflare
   can invalidate either any time; check a screenshot first.
-- ext.to's `totalHint` regex is unverified live - low risk, only feeds
-  non-load-bearing `opensearch:totalResults`.
-- EZTV's blank-query browse bypasses the browser/Cloudflare entirely -
-  breaks if that endpoint ever gets protected.
 - `xdo()` swallows errors - a silent no-op click has no visible signal;
   verify via `xdotool getmouselocation`.
 - Section 10's challenge-gated-download rescue path is reasoned/unit-tested
@@ -467,37 +465,23 @@ harmless only because `WINDOW_SIZE` is pinned).
 
 ## 16. EZTV
 
-Two response layouts depending on a site preference: **links revealed** (6
-`<td>`s) vs **hidden** (5 `<td>`s, magnet cell *omitted* not emptied -
-shifts every later column, so positional selectors read the wrong cell).
-Size comes from `a.epinfo`'s `title` attr, layout-independent; seeds from
-`td.forum_thread_post_end` (class, not position). **No leechers column in
-either layout** - always `0`, so `peers === seeds`.
-
-Links revealed via a single cookie on an ordinary GET
-(`layout=def_wlinks`, matching Cardigann's own definition), applied via
-`registerDomainCookies()` -> `context.addCookies()` at session launch (not
-just boot, so a relaunch after recycling doesn't drop it). Rows with no
-magnet at all are skipped even with the cookie set -
-`parseSearchRows()` throws if rows were present but all got skipped
-(a silently non-applying cookie would otherwise look identical to "no
-matches").
-
-Title cleanup deviates from Cardigann's own greedy
-`re_replace: ["\(.*\)$", ""]` (destroys everything from the *first* paren
-onward on a title with an earlier one, e.g. a year) - uses an anchored
-`/\s*\([^()]*\)\s*$/` instead. Blank-query browse (`browseLatest()`) hits
-`/api/get-torrents` with a plain `fetch()` - not Cloudflare-protected, not
-touched by any of the above.
+Cardigann-driven now (`source: prowlarr:v11`, Prowlarr's own upstream
+`eztv.yml` - never edited here, same policy as `1337x.yml`, section 17).
+**No leechers column on the site at all** - always `0`, so `peers ===
+seeds`, live-verified against the real definition. Links revealed via a
+cookie on an ordinary GET (`layout=def_wlinks`), set through the
+definition's own `search.headers.cookie` -> `applyCookieHeader()`
+(`lib/browser.ts`) - no separate cookie registration needed.
 
 ---
 
 ## 17. Cardigann support (`lib/cardigann/`)
 
-Lets a tracker be added by dropping a Prowlarr Cardigann v11 YAML into
-`definitions/` (or naming a `source:` pin/URL in `config/trackarr.yml`)
-instead of hand-writing a provider. Fully wired into `server.ts`'s boot -
-a configured indexer is a real `/<id>/api` Torznab endpoint.
+The only way a tracker gets added, full stop - no hand-written provider path
+exists any more (section 1). Drop a Prowlarr Cardigann v11 YAML into
+`definitions/`, or name a `source:` pin/URL, in `config/trackarr.yml`.
+Fully wired into `server.ts`'s boot - a configured indexer is a real
+`/<id>/api` Torznab endpoint.
 
 **Hard policy: vendored `.yml` definitions are never edited**, ever -
 byte-identical to upstream forever (diff against a fresh re-fetch if in
@@ -523,19 +507,37 @@ again, it drifts with upstream. `yaml`, not `js-yaml`, is the parser: the
 latter's default schema turns ISO-date-looking scalars into `Date` objects,
 failing `type: string`.
 
-**Config (`config/trackarr.yml`)**: keyed by instance name (also the
-route). Two instances can share one `definition:` (different `config:`
-overrides) - each gets its own in-memory cache, never shared. Resolution
-order: `DEFINITIONS_DIR` volume (wins even over an explicit `source:`) ->
-`source:` pin/URL (fetched, disk-cached under `CARDIGANN_CACHE_DIR`, falls
-back to the cache on fetch failure) -> bundled `definitions/`. `source:`
-pins resolve to a **commit SHA**, never a branch - reproducibility. A
-schema-invalid config, or any of four cross-checks needing both documents
-at once (instance id collides with a built-in provider; `link:` isn't in
-the definition's own `links[]`; a `config.<key>` isn't a declared setting;
-a `select` value isn't a declared option) - all **fatal, refuse to boot**.
-One indexer entry's own resolution/capability failure is logged and
-excluded; everything else still boots.
+ **Config (`config/trackarr.yml`)**: keyed by instance name (also the
+ route). Two instances can share one `definition:` (different `config:`
+ overrides) - each gets its own in-memory cache, never shared. Resolution
+ order: `DEFINITIONS_DIR` volume (wins even over an explicit `source:`) ->
+ `source:` pin/URL (fetched, disk-cached under `CARDIGANN_CACHE_DIR`, falls
+ back to the cache on fetch failure) -> bundled `definitions/`. `source:`
+ pins resolve to a **commit SHA**, never a branch - reproducibility. A
+ schema-invalid config, or any of three cross-checks needing both documents
+ at once (`link:` isn't in the definition's own `links[]`; a `config.<key>`
+ isn't a declared setting; a `select` value isn't a declared option) - all
+ **fatal, refuse to boot**. (A fourth cross-check, an instance id colliding
+ with a built-in provider, existed only while built-in providers did -
+ removed along with them, section 1.) One indexer entry's own
+ resolution/capability failure is logged and excluded; everything else
+ still boots.
+
+ **Schema resolution mirrors definition resolution, per-tier, not always
+ the bundled one.** A `DEFINITIONS_DIR` volume mount validates against its
+ own `schema.json` (must carry one, no fallback - a missing schema fails
+ that definition loudly). A `source:`-fetched definition validates against
+ **that same source's own `schema.json`** (`resolve.ts`'s `buildSchemaUrl` -
+ same directory for a pin, one path segment up for a raw URL to one `.yml`
+ file), fetched and disk-cached exactly like the `.yml` itself (one cache
+ file per distinct `source:` string, not per definition - several indexers
+ sharing one `source:` don't refetch it redundantly) - so a pin can never
+ silently drift out of sync with its own schema version. A fetch failure
+ with no prior cache is fatal for that definition, same as the `.yml`'s own
+ fetch failing - never a silent fallback to the bundled schema, which would
+ defeat the entire point of matching it exactly. Only the bundled
+ `definitions/` tier uses the bundled `definitions/schema.json`
+ (`load.ts`'s `defaultSchemaPath()`, hardcoded cwd-relative).
 
 **Engine** (`filters,template,select,engine,extract.ts`) - pure functions,
 **no network I/O**; `runSearchAll(definition, body, ctx)` takes an
@@ -590,12 +592,24 @@ cache-miss path always passes `itemTitle: ''`). No canonical tracker list
 exists in the format's docs for `infohash`-built magnets - the four used
 here came from a real, live-captured magnet URI.
 
-**Live-verified today**: `kickasstorrents-to.yml`, `ext-to.yml`
-(redesigned during its live test to zero extra fetches - the whole signed
-AJAX request is built into `fields.download` as a template) and vendored,
-unmodified `1337x.yml`/`eztv.yml` all resolve real search results and real
-magnets/`.torrent` bytes against their live sites, including in Docker
-under the real Linux `headless:false`+Xvfb path. Hand-written
-`providers/{ext-to,1337x,eztv}.ts` are untouched and still the live routes
-- whether to retire them now that their Cardigann equivalents are proven
-correct is still open.
+**Live-verified in Docker** (real Linux `headless:false`+Xvfb path,
+`config/trackarr.yml.example`'s own entries): `ext-to.yml` (bundled, no
+`source:` - trackarr's own definition, redesigned during its live test to
+zero extra fetches, the whole signed AJAX request built into
+`fields.download` as a template), `1337x.yml`/`eztv.yml`/
+`kickasstorrents-to.yml` (all `source: prowlarr:v11`) all resolved real
+search results and real magnets/`.torrent` bytes against their live sites.
+Zero-config boot (no `config/trackarr.yml` at all) verified separately:
+starts cleanly with zero routes, doesn't crash.
+
+`definitions/kickasstorrents-to.yml` is gone, replaced by
+`test/fixtures/cardigann/faketracker.yml` as the disk-read fixture for
+`adapter.test.ts`/`engine.test.ts`/`index.test.ts` - the real thing only
+reaches this repo via `source:` now, never bundled.
+`test/lib/cardigann/ext-to-definition.test.ts` is the equivalent
+protection for `ext-to.yml` (the one definition trackarr actually owns and
+can regress): the same hand-built fixture the old hand-written
+`providers/ext-to.ts` test used, now driven through the real engine
+instead. Hand-written `providers/{ext-to,1337x,eztv}.ts` (and
+`lib/paging.ts`, only ever used by them) are gone - every indexer is
+Cardigann-driven and config-declared (section 1).

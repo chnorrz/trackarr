@@ -69,7 +69,7 @@ test('resolveIndexerConfig: a fully valid config resolves every indexer', () =>
       }
     };
 
-    const { ok, errors } = await resolveIndexerConfig(config, { repoDefinitionsDir: repo, cacheDir: path.join(repo, '.cache') }, new Set());
+    const { ok, errors } = await resolveIndexerConfig(config, { repoDefinitionsDir: repo, cacheDir: path.join(repo, '.cache') });
 
     assert.equal(errors.length, 0);
     assert.equal(ok.length, 2);
@@ -85,7 +85,7 @@ test('resolveIndexerConfig: two instances of the same definition are independent
       }
     };
 
-    const { ok } = await resolveIndexerConfig(config, { repoDefinitionsDir: repo, cacheDir: path.join(repo, '.cache') }, new Set());
+    const { ok } = await resolveIndexerConfig(config, { repoDefinitionsDir: repo, cacheDir: path.join(repo, '.cache') });
 
     assert.equal(ok.length, 2);
     assert.equal(ok.find((r: { key: string }) => r.key === 'tpb')?.entry.config?.top100, 'recent');
@@ -96,28 +96,18 @@ test('resolveIndexerConfig: a definition that fails the capability gate lands in
   withRepoDir(async (repo) => {
     const config = { indexers: { priv: { definition: 'privatesite' } } };
 
-    const { ok, errors } = await resolveIndexerConfig(config, { repoDefinitionsDir: repo, cacheDir: path.join(repo, '.cache') }, new Set());
+    const { ok, errors } = await resolveIndexerConfig(config, { repoDefinitionsDir: repo, cacheDir: path.join(repo, '.cache') });
 
     assert.equal(ok.length, 0);
     assert.equal(errors.length, 1);
     assert.match(errors[0].reasons[0], /login\.method/);
   }));
 
-test('resolveIndexerConfig: an entry key colliding with a built-in provider lands in errors', () =>
-  withRepoDir(async (repo) => {
-    const config = { indexers: { '1337x': { definition: 'thepiratebay' } } };
-
-    const { errors } = await resolveIndexerConfig(config, { repoDefinitionsDir: repo, cacheDir: path.join(repo, '.cache') }, new Set(['1337x']));
-
-    assert.equal(errors.length, 1);
-    assert.match(errors[0].reasons[0], /collides with a built-in provider/);
-  }));
-
 test('resolveIndexerConfig: an unresolvable definition (not found anywhere) lands in errors, not a thrown exception', () =>
   withRepoDir(async (repo) => {
     const config = { indexers: { ghost: { definition: 'does-not-exist' } } };
 
-    const { ok, errors } = await resolveIndexerConfig(config, { repoDefinitionsDir: repo, cacheDir: path.join(repo, '.cache') }, new Set());
+    const { ok, errors } = await resolveIndexerConfig(config, { repoDefinitionsDir: repo, cacheDir: path.join(repo, '.cache') });
 
     assert.equal(ok.length, 0);
     assert.equal(errors.length, 1);
@@ -133,7 +123,7 @@ test('resolveIndexerConfig: one bad indexer does not stop the others from resolv
       }
     };
 
-    const { ok, errors } = await resolveIndexerConfig(config, { repoDefinitionsDir: repo, cacheDir: path.join(repo, '.cache') }, new Set());
+    const { ok, errors } = await resolveIndexerConfig(config, { repoDefinitionsDir: repo, cacheDir: path.join(repo, '.cache') });
 
     assert.equal(ok.length, 1);
     assert.equal(ok[0].key, 'good');

@@ -300,16 +300,19 @@ async function shutdown(): Promise<void> {
 
 const isMain = import.meta.url === `file://${process.argv[1]}`;
 if (isMain) {
-  // Cardigann indexers with a source: URL need a real fetch to resolve, so
-  // this is awaited before listen() rather than built synchronously like
-  // the hand-written providers. A malformed config file throws out of here
-  // and crashes the boot - see buildProviderMap()'s own doc comment.
+  // Every indexer is Cardigann-driven and config-declared; a source: URL
+  // needs a real fetch to resolve, so this is awaited before listen()
+  // rather than built synchronously. A malformed config file throws out of
+  // here and crashes the boot - see buildProviderMap()'s own doc comment.
   const providers = await buildProviderMap();
   const statusTracker = new ProviderStatusTracker();
   const app = createApp(providers, { statusTracker });
   app.listen(PORT, () => {
     console.log(`Torznab server listening on http://localhost:${PORT}`);
     console.log(`  status page: http://localhost:${PORT}/`);
+    if (Object.keys(providers).length === 0) {
+      console.log(`  No indexers configured - see config/trackarr.yml.example (CONFIG_FILE env var to point elsewhere).`);
+    }
     for (const provider of Object.values(providers)) {
       console.log(`  ${provider.name}: http://localhost:${PORT}/${provider.id}/api`);
     }

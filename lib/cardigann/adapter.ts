@@ -126,8 +126,7 @@ export function createCardigannProvider(indexer: ResolvedIndexerLike, opts: Crea
   const mappings = collectCategoryMappings(definition);
   const advertisedCategories = [...new Set(mappings.map((m) => categoryIdByName(m.standardName)))];
 
-  // Bounded, no TTL - matches providers/eztv.ts's own magnetCache exactly
-  // (magnets don't go stale the way page content does).
+  // Bounded, no TTL - magnets don't go stale the way page content does.
   const MAGNET_CACHE_MAX = 500;
   const magnetCache = new Map<string, string>();
   function rememberMagnet(url: string, magnet: string): void {

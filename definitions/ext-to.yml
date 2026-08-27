@@ -14,8 +14,8 @@ caps:
     # (oneOf), so there's no separate fallback field - the category field's
     # own regexp filter (below) does both jobs in one pass: return the full
     # href for these six distinguished subcategories, else collapse to the
-    # bare top-level href. Matches providers/ext-to.ts's CATEGORY_RULES
-    # exactly (verified against all its category-classification tests).
+    # bare top-level href. Covered end to end by
+    # test/lib/cardigann/ext-to-definition.test.ts.
     - {id: "/books/audio-books/", cat: Audio/Audiobook}
     - {id: "/books/ebooks/", cat: Books/EBook}
     - {id: "/games/pc-games/", cat: PC/Games}
@@ -109,11 +109,11 @@ search:
 
 # fields.download (above) already IS the fully-signed AJAX request, as a
 # GET-shaped URL captured at search time. This block just replays its own
-# query params as a POST body against its own path - the API requires POST
-# (providers/ext-to.ts:193-204), and does not accept the request as a plain
-# GET. No fetch happens here at all: .DownloadUri.Query.* reads straight
-# from the captured URL, so a grab is exactly one HTTP request, same as the
-# API call itself.
+# query params as a POST body against its own path - the API requires POST,
+# confirmed live, and does not accept the request as a plain GET. No fetch
+# happens here at all: .DownloadUri.Query.* reads straight from the
+# captured URL, so a grab is exactly one HTTP request, same as the API call
+# itself.
 download:
   headers:
     X-Requested-With: [XMLHttpRequest]

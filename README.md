@@ -9,9 +9,12 @@ and sign their download links with JavaScript. This bridges that gap: it
 drives a real browser, does the site-specific work, and hands Prowlarr a plain
 Torznab feed.
 
-Currently supported:
+Every indexer is a [Cardigann](https://wiki.servarr.com/prowlarr/cardigann-yml-definition)
+YAML definition, declared in `config/trackarr.yml` - nothing is built in.
+`config/trackarr.yml.example` ships working entries for the 3 trackers this
+project exists for:
 
-| Provider | Endpoint path | Notes |
+| Provider | Endpoint path (once configured) | Notes |
 |---|---|---|
 | ext.to | `/ext-to/api` | General catalog; magnet via signed API |
 | 1337x | `/1337x/api` | General catalog; magnet embedded in detail page |
@@ -30,7 +33,9 @@ definition format:
 2. **Signed magnet links.** ext.to doesn't put magnets in the HTML. The page
    asks an internal API for them, signing each request with
    `sha256(torrentId|timestamp|pageToken)` where the token is a per-page-load
-   nonce. A YAML definition cannot compute that.
+   nonce. A *stock* Cardigann definition can't compute that - trackarr
+   extends the format with `sha256`/`concat` filters so its own
+   `definitions/ext-to.yml` can (see `NOTES.md` section 17).
 
 FlareSolverr-style proxies only solve the first problem. This solves both, by
 keeping the whole flow inside one browser session.
@@ -78,12 +83,20 @@ background keep-alive warms every provider at boot, before Prowlarr asks.
 
 ## Quick start
 
-Pull the published image:
+No indexers exist until you write a config file - copy the example and edit
+it if you want (it already declares ext.to/1337x/EZTV, see below):
+
+```bash
+cp config/trackarr.yml.example config/trackarr.yml
+```
+
+Pull the published image, mounting that file in:
 
 ```bash
 docker run -d --name trackarr \
   -p 9117:9117 \
   -e API_KEY=pick-something-random \
+  -v "$(pwd)/config/trackarr.yml:/app/config/trackarr.yml:ro" \
   ghcr.io/chnorrz/trackarr:latest
 ```
 
@@ -94,11 +107,15 @@ docker build -t trackarr .
 docker run -d --name trackarr \
   -p 9117:9117 \
   -e API_KEY=pick-something-random \
+  -v "$(pwd)/config/trackarr.yml:/app/config/trackarr.yml:ro" \
   trackarr
 ```
 
 Check it's alive by opening `http://localhost:9117/` in a browser - the
-status page needs no API key. Or from the command line:
+status page needs no API key, and lists every indexer that actually
+resolved (an indexer that failed to resolve is logged to the container's
+own output, not shown here - `docker logs trackarr`). Or from the command
+line:
 
 ```bash
 curl "http://localhost:9117/ext-to/api?t=caps"
@@ -148,7 +165,9 @@ Once per provider:
 4. **Test**, then **Save**.
 
 Repeat for the other providers: `http://<host>:9117/1337x` and
-`http://<host>:9117/eztv`.
+`http://<host>:9117/eztv`. Each only exists if it's declared in
+`config/trackarr.yml` - an indexer key you haven't configured returns a
+plain 404, not a Torznab error.
 
 **If Prowlarr runs in Docker too**, `localhost` won't reach this container.
 Use the host's LAN IP, or put both on the same Docker network and use the
@@ -178,24 +197,29 @@ All via environment variables.
 | `KEEPALIVE_INTERVAL_MS` | `900000` | Background Cloudflare warm-up (15 min). `0` disables |
 | `PROXY_URL` | *(unset)* | Upstream proxy, see below. Unset = direct |
 | `DOMAIN_OVER_PROXY` | *(unset)* | Comma-separated hostnames routed through the proxy (a listed name also matches its subdomains). **Unset or empty = none** - opt-in, not opt-out |
-| `CONFIG_FILE` | `config/trackarr.yml` | Cardigann indexer config - see below. Missing file = no Cardigann indexers, no effect on `ext-to`/`1337x`/`eztv` |
+| `CONFIG_FILE` | `config/trackarr.yml` | Indexer config - see below. **Required for any indexer to exist at all** - missing file means zero routes, not a fallback set |
 | `DEFINITIONS_DIR` | *(unset)* | Volume of Cardigann `.yml` definitions, checked before the repo's bundled `definitions/` and before any `source:` fetch - drop an edited copy here to override one. **Must also contain its own `schema.json`** - a definition resolved from here never falls back to the bundled schema, so a mount missing it fails that definition rather than silently validating against the wrong schema version |
-| `CARDIGANN_CACHE_DIR` | `.cardigann-cache` | Disk cache for `source:`-fetched definitions, so a restart works offline |
+| `CARDIGANN_CACHE_DIR` | `.cardigann-cache` | Disk cache for `source:`-fetched definitions **and their own `schema.json`** (fetched from that same source, not the bundled one - see `NOTES.md` section 17), so a restart works offline |
 
-### Cardigann indexer config (optional)
+### Indexer config (required)
 
-Adds a tracker from a [Prowlarr Cardigann](https://wiki.servarr.com/prowlarr/cardigann-yml-definition)
-YAML definition instead of a hand-written provider. See `config/trackarr.yml.example`
-and `NOTES.md` section 17/18 for the full design (two validation gates, definition
+Every indexer is a [Prowlarr Cardigann](https://wiki.servarr.com/prowlarr/cardigann-yml-definition)
+YAML definition, declared here. See `config/trackarr.yml.example` (a
+working starting point - copy it, it already has ext.to/1337x/EZTV) and
+`NOTES.md` section 17 for the full design (two validation gates, definition
 resolution order, why settings without a default are still safe to use).
 
 ```yaml
 # config/trackarr.yml
 indexers:
-  kickass:
-    definition: kickasstorrents-to
+  ext-to:
+    definition: ext-to        # trackarr's own definition, bundled - no source:
 
-  tpb-audio:                        # a second instance of the same definition
+  1337x:
+    definition: 1337x         # Prowlarr's own upstream definition
+    source: prowlarr:v11
+
+  tpb-audio:                  # a second instance of the same definition
     definition: thepiratebay
     source: prowlarr:v11
     config:
@@ -203,8 +227,8 @@ indexers:
 ```
 
 A config file present but failing validation refuses to boot (typos should
-be seen immediately, not silently ignored); no config file at all just means
-no Cardigann indexers.
+be seen immediately, not silently ignored); **no config file at all, or an
+empty `indexers:` block, means zero indexers** - not a fallback set.
 
 ### Proxy (optional)
 
@@ -240,34 +264,30 @@ proxy-obtained cookie can't clobber a direct one.
 
 ## Adding a tracker
 
-Create `providers/<id>.ts` exporting a default that satisfies the `Provider`
-interface from `lib/types.ts`:
+No code, ever - every tracker is a Cardigann YAML definition, declared in
+`config/trackarr.yml`.
 
-```ts
-import type { Provider } from '../lib/types.js';
+**If Prowlarr already has a definition for it**: add an entry with
+`source: prowlarr:v11` and the definition's id (Prowlarr's own
+[Indexers repo](https://github.com/Prowlarr/Indexers/tree/master/definitions/v11)),
+fetched and disk-cached on demand - see the config example above.
 
-export default {
-  id: 'mytracker',
-  name: 'My Tracker',
-  async search(q) {
-    // -> [{ title, detailUrl, id, size, seeds, leechers, category, pubDate }]
-  },
-  async resolveMagnet({ id, url }) {
-    // -> 'magnet:?xt=...'
-  }
-} satisfies Provider;
+**If it needs something Cardigann's stock format can't express** (a signed
+API like ext.to's, or any other trackarr-only extension - `NOTES.md`
+section 17 lists them all: `sha256`/`concat` filters, `search.vars`,
+`download.headers`, `$`-prefixed JSON download selectors,
+`download.before.vars`/`allowEmptyInputs`): write the YAML by hand, drop it
+in `definitions/`, and reference it with no `source:`. `definitions/ext-to.yml`
+is the worked example - read its comments alongside `NOTES.md` section 2 and
+17 for the reasoning behind each field. Validate it before wiring it up:
+
+```bash
+npm run validate:definitions   # schema + capability gate against definitions/
 ```
 
-Register it in `providers/index.ts`. It gets `/<id>/api` and `/<id>/download`
-automatically. Use `cfFetch(url, opts?)` from `lib/browser.ts` for every
-fetch - same request shape as `fetch()` (`method`/`headers`/`body`), and it
-handles Cloudflare, caching and proxy routing for you. It returns a
-`CfResponse` (`.text()`/`.buffer()`, both re-readable), auto-detecting a raw
-file download (a `.torrent` link) vs. a normal page - no separate function
-needed for either.
-
-`providers/1337x.ts` is the simpler reference (magnets sit in the HTML);
-`providers/ext-to.ts` shows the signed-API case.
+`test/lib/cardigann/ext-to-definition.test.ts` is the pattern for testing a
+hand-written definition end to end against a real (hand-built, not
+captured) HTML fixture.
 
 ---
 
@@ -278,17 +298,21 @@ npm run typecheck   # tsc --noEmit
 npm test            # builds, then runs the test suite
 ```
 
-The test suite needs no browser, no Docker, and no network access - provider
-tests run against hand-built fixtures in `test/fixtures/`, and the server is
-tested via dependency injection rather than the real process. See NOTES.md
-section 13 for how the mocking works and how to add tests for a new
-provider.
+The test suite needs no browser, no Docker, and no network access - Cardigann
+definitions run against hand-built fixtures in `test/fixtures/` via an
+injected `Fetcher` (no mocking machinery needed), and the server is tested
+via dependency injection rather than the real process. See `NOTES.md`
+section 13 for how that works, and "Adding a tracker" above for a new
+definition's own test pattern.
 
 ---
 
 ## Limitations
 
-- **Search returns the first page only.** No pagination.
+- **Search returns whatever pages a definition's own `search.paths[]`
+  unconditionally fetches** (2 for `ext-to.yml`/`kickasstorrents-to.yml`) -
+  not true offset-driven pagination, so a broad query can miss results
+  beyond that fixed set.
 - **Scrapers break.** These are unofficial integrations against markup and
   private APIs that can change without notice.
 - **The Turnstile auto-solver is inherently fragile** - it depends on the

@@ -147,6 +147,61 @@ test('runSearch (HTML): case block resolves downloadvolumefactor-style fields, s
   void items;
 });
 
+// ---- bare (unquoted) YAML numeric scalars in text:/default:/case: --------
+//
+// The schema (definitions/schema.json's SelectorBlock) explicitly allows
+// text/default/case values to be `oneOf: [string, number]` - an unquoted
+// `text: 1` in a real definition (eztv.yml's own `category: {text: 1}`)
+// parses as a genuine JS number, not a string. Confirmed live: this used to
+// silently render as '' (renderTemplate() given a non-string returned '',
+// not the literal "1"), which broke eztv.yml's category mapping end to end
+// (fell through to "Other" instead of "TV"). These reproduce it directly
+// with the same non-string-typed JS values YAML.parse would produce.
+
+test('runSearch (HTML): a bare numeric text: field (e.g. `text: 1`, unquoted in YAML) renders its literal value, not empty', () => {
+  const def = minimalHtmlDefinition();
+  (def.search.fields as Record<string, unknown>).category = { text: 1 };
+  const items = runSearch(def, HTML_BODY, baseSearchCtx());
+  assert.equal(items[0].category, 'Movies', 'tracker id "1" (from the bare number) must still map via categorymappings');
+});
+
+test('runSearch (HTML): a bare numeric default: (optional field, no match) renders its literal value, not empty', () => {
+  const def = minimalHtmlDefinition();
+  (def.search.fields as Record<string, unknown>).poster = { selector: 'img.nonexistent', optional: true, default: 0 };
+  const items = runSearch(def, HTML_BODY, baseSearchCtx());
+  assert.equal(items[0].poster, '0');
+});
+
+test('runSearch (HTML): case: with bare numeric values (e.g. `case: {a.magnet: 0, "*": 1}`) resolves to the literal value, not empty', () => {
+  const def = minimalHtmlDefinition();
+  (def.search.fields as Record<string, unknown>).downloadvolumefactor = { case: { 'a.magnet': 0, '*': 1 } };
+  (def.search.fields as Record<string, unknown>).description = { text: 'dlvf={{ .Result.downloadvolumefactor }}' };
+  const items = runSearch(def, HTML_BODY, baseSearchCtx());
+  assert.equal(items[0].description, 'dlvf=0');
+});
+
+test('runSearch (JSON): case: with bare numeric values (thepiratebay.yml\'s own shape) resolves to the literal value, not empty', () => {
+  const def = minimalJsonDefinition();
+  (def.search.fields as Record<string, unknown>).downloadvolumefactor = { selector: 'freeleech', case: { 0: 1, 1: 0 } };
+  const items = runSearch(def, JSON_BODY, baseSearchCtx());
+  assert.equal(items[0].downloadvolumefactor, undefined); // not surfaced on CardigannItem directly
+  const withDesc = minimalJsonDefinition();
+  (withDesc.search.fields as Record<string, unknown>).downloadvolumefactor = { selector: 'freeleech', case: { 0: 1, 1: 0 } };
+  (withDesc.search.fields as Record<string, unknown>).description = { text: 'dlvf={{ .Result.downloadvolumefactor }}' };
+  const itemsWithDesc = runSearch(withDesc, JSON_BODY, baseSearchCtx());
+  assert.equal(itemsWithDesc[0].description, 'dlvf=1'); // freeleech:0 -> case 0 -> 1
+});
+
+test('runSearch (HTML): a filter arg array with a bare numeric element renders it, not empty', () => {
+  const def = minimalHtmlDefinition();
+  (def.search.fields as Record<string, unknown>).title = {
+    selector: 'a.title',
+    filters: [{ name: 'append', args: [0] }]
+  };
+  const items = runSearch(def, HTML_BODY, baseSearchCtx());
+  assert.equal(items[0].title, 'Ubuntu 24.04 Desktop0');
+});
+
 test('runSearch (HTML): optional + default supplies a value when the selector does not match', () => {
   const def = minimalHtmlDefinition();
   (def.search.fields as Record<string, unknown>).poster = { selector: 'img.nonexistent', optional: true, default: 'no-poster' };
@@ -272,19 +327,18 @@ test('runSearch (JSON): count.selector resolving falsy short-circuits to zero re
   assert.deepEqual(items, []);
 });
 
-// ---- End-to-end against the real, checked-in kickasstorrents-to.yml ---------
+// ---- End-to-end against the real, checked-in faketracker.yml fixture ------
 
-test('runSearch: end to end against the real definitions/kickasstorrents-to.yml (mechanics, not live-site fidelity)', () => {
-  const raw = fs.readFileSync(path.join(ROOT, 'definitions', 'kickasstorrents-to.yml'), 'utf8');
+test('runSearch: end to end against the real, checked-in faketracker.yml fixture (mechanics, not live-site fidelity)', () => {
+  const raw = fs.readFileSync(path.join(ROOT, 'test', 'fixtures', 'cardigann', 'faketracker.yml'), 'utf8');
   const result = validateDefinitionYaml(raw);
   assert.equal(result.ok, true, JSON.stringify(result.ok === false ? result.errors : null));
 
-  // Synthetic HTML built to match the real definition's own selectors
+  // Synthetic HTML built to match the fixture's own selectors
   // (table.data > tbody > tr:has(a[href^="magnet:?xt="]), a.cellMainLink,
   // span > strong, td.timeago, td:nth-child(N)) - this proves the ENGINE
-  // correctly executes a real definition's selector/filter syntax. It does
-  // NOT prove kickass.torrentbay.st's actual live markup matches these
-  // selectors - that's phase 4's live test, against real captured HTML.
+  // correctly executes a real definition's selector/filter syntax, without
+  // depending on any live tracker's actual markup.
   const body = `
     <table class="data"><tbody>
       <tr>
@@ -308,14 +362,13 @@ test('runSearch: end to end against the real definitions/kickasstorrents-to.yml 
   const item = items[0];
   assert.equal(item.title, 'Ubuntu 24.04 LTS Desktop');
   assert.equal(item.detailUrl, '/torrent/123-ubuntu');
-  // kickass's own field is named "download" (see line 154-156 of the real
-  // file), even though it selects a magnet: URI - it lands in
-  // item.download, not item.magnet.
+  // The fixture's own field is named "download", even though it selects a
+  // magnet: URI - it lands in item.download, not item.magnet.
   assert.equal(item.download, 'magnet:?xt=urn:btih:ABCDEF1234567890&dn=Ubuntu');
   assert.equal(item.size, Math.round(1.5 * 1024 ** 3));
   assert.equal(item.seeds, 50);
   assert.equal(item.leechers, 5);
-  assert.equal(item.category, 'Movies'); // via id "Movies" -> cat "Movies" (line 86 of the real file)
+  assert.equal(item.category, 'Movies'); // via id "Movies" -> cat "Movies"
   // timeago filter parsed "2 hours and 1 day" relative to real "now" -
   // assert it landed roughly 26h in the past, not an exact instant.
   const deltaMs = Date.now() - item.pubDate.getTime();
@@ -365,8 +418,9 @@ test('runSearchAll returns every item unsliced; runSearch slices to offset/limit
 });
 
 test('runSearch (HTML): search.rows.selector is itself a template, rendered against topCtx before matching', () => {
-  // Real precedent: 1337x.yml's rows.selector appends an optional
-  // :has(...) uploader filter driven off .Config.uploader.
+  // Real precedent: Prowlarr's 1337x.yml (definition/prowlarr:v11) has a
+  // rows.selector that appends an optional :has(...) uploader filter
+  // driven off .Config.uploader.
   const def = minimalHtmlDefinition({
     rows: { selector: 'tr.row{{ if .Config.strict }}:has(.magnet[href*="ABCDEF1234567890"]){{ end }}' }
   });

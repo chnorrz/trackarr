@@ -59,6 +59,12 @@ function giveVolumeItsOwnSchema(volume: string): void {
   fs.copyFileSync(path.join(ROOT, 'definitions', 'schema.json'), path.join(volume, 'schema.json'));
 }
 
+const REAL_SCHEMA = fs.readFileSync(path.join(ROOT, 'definitions', 'schema.json'), 'utf8');
+
+// A source:-fetched definition now also fetches schema.json from that same
+// source (resolve.ts's buildSchemaUrl) - any fetchImpl mock for a source:
+// test needs to serve both URLs, not just the .yml's.
+
 test('resolveDefinition: finds a definition in the bundled repo dir', () =>
   withTempDirs(async ({ repo, volume, cache }) => {
     fs.writeFileSync(path.join(repo, 'foo.yml'), minimalDefinitionYaml('foo'));
@@ -102,12 +108,13 @@ test('resolveDefinition: a volume mount without its own schema.json fails that d
     );
   }));
 
-test('resolveDefinition: a source URL is fetched and cached to disk', () =>
+test('resolveDefinition: a source URL is fetched and cached to disk, schema.json included', () =>
   withTempDirs(async ({ repo, cache }) => {
-    let calls = 0;
+    const urls: string[] = [];
     const fetchImpl = async (url: string | URL) => {
-      calls++;
-      assert.equal(String(url), 'https://example.test/foo.yml');
+      const u = String(url);
+      urls.push(u);
+      if (u.endsWith('/schema.json')) return new Response(REAL_SCHEMA, { status: 200 });
       return new Response(minimalDefinitionYaml('foo', 'Fetched'), { status: 200 });
     };
 
@@ -115,17 +122,21 @@ test('resolveDefinition: a source URL is fetched and cached to disk', () =>
       repoDefinitionsDir: repo, cacheDir: cache, fetchImpl: fetchImpl as unknown as typeof fetch
     });
 
-    assert.equal(calls, 1);
+    assert.deepEqual(urls.sort(), ['https://example.test/foo.yml', 'https://example.test/schema.json'].sort());
     assert.equal(result.definition.name, 'Fetched');
     assert.ok(fs.existsSync(path.join(cache, 'foo.yml')));
     assert.ok(fs.existsSync(path.join(cache, 'foo.meta.json')));
+    const schemaCacheFile = fs.readdirSync(cache).find((f) => f.startsWith('schema-') && f.endsWith('.json'));
+    assert.ok(schemaCacheFile, 'schema.json must be cached to disk too, same as the .yml');
   }));
 
-test('resolveDefinition: a pin shorthand builds the URL from pins.json, appending <id>.yml', () =>
+test('resolveDefinition: a pin shorthand builds the URL from pins.json, appending <id>.yml (and its own schema.json)', () =>
   withTempDirs(async ({ repo, cache }) => {
-    let requestedUrl = '';
+    const requestedUrls: string[] = [];
     const fetchImpl = async (url: string | URL) => {
-      requestedUrl = String(url);
+      const u = String(url);
+      requestedUrls.push(u);
+      if (u.endsWith('/schema.json')) return new Response(REAL_SCHEMA, { status: 200 });
       return new Response(minimalDefinitionYaml('kickasstorrents-to'), { status: 200 });
     };
 
@@ -133,24 +144,48 @@ test('resolveDefinition: a pin shorthand builds the URL from pins.json, appendin
       repoDefinitionsDir: repo, cacheDir: cache, fetchImpl: fetchImpl as unknown as typeof fetch
     });
 
-    assert.match(requestedUrl, /^https:\/\/raw\.githubusercontent\.com\/Prowlarr\/Indexers\/[a-f0-9]{40}\/definitions\/v11\/kickasstorrents-to\.yml$/);
+    const defUrl = requestedUrls.find((u) => u.endsWith('.yml'));
+    const schemaUrl = requestedUrls.find((u) => u.endsWith('/schema.json'));
+    assert.match(defUrl ?? '', /^https:\/\/raw\.githubusercontent\.com\/Prowlarr\/Indexers\/[a-f0-9]{40}\/definitions\/v11\/kickasstorrents-to\.yml$/);
+    // Same directory as the .yml, same commit - never the bundled schema.
+    assert.match(schemaUrl ?? '', /^https:\/\/raw\.githubusercontent\.com\/Prowlarr\/Indexers\/[a-f0-9]{40}\/definitions\/v11\/schema\.json$/);
   }));
 
-test('resolveDefinition: a failed fetch falls back to a previously cached copy (offline restart)', () =>
+test('resolveDefinition: a failed fetch falls back to a previously cached copy (offline restart), schema.json included', () =>
   withTempDirs(async ({ repo, cache }) => {
     fs.mkdirSync(cache, { recursive: true });
     fs.writeFileSync(path.join(cache, 'foo.yml'), minimalDefinitionYaml('foo', 'Stale Cache'));
+    // Mirrors resolve.ts's own sanitizeForFilename() - a real offline
+    // restart would have this cached from the last successful boot too.
+    const source = 'https://example.test/foo.yml';
+    const schemaCacheFile = path.join(cache, `schema-${source.replace(/[^a-zA-Z0-9_.-]/g, '_')}.json`);
+    fs.writeFileSync(schemaCacheFile, REAL_SCHEMA);
 
     const fetchImpl = async () => {
       throw new Error('network down');
     };
 
-    const result = await resolveDefinition('foo', 'https://example.test/foo.yml', {
+    const result = await resolveDefinition('foo', source, {
       repoDefinitionsDir: repo, cacheDir: cache, fetchImpl: fetchImpl as unknown as typeof fetch
     });
 
     assert.equal(result.definition.name, 'Stale Cache');
     assert.match(result.from, /stale cache/);
+  }));
+
+test('resolveDefinition: schema.json fetch fails with no prior cache - fatal, same as the .yml\'s own fetch failing', () =>
+  withTempDirs(async ({ repo, cache }) => {
+    const fetchImpl = async (url: string | URL) => {
+      if (String(url).endsWith('/schema.json')) throw new Error('schema fetch down');
+      return new Response(minimalDefinitionYaml('foo', 'Fetched'), { status: 200 });
+    };
+
+    await assert.rejects(
+      () => resolveDefinition('foo', 'https://example.test/foo.yml', {
+        repoDefinitionsDir: repo, cacheDir: cache, fetchImpl: fetchImpl as unknown as typeof fetch
+      }),
+      /schema fetch down/
+    );
   }));
 
 test('resolveDefinition: a failed fetch with no cache and no local copy throws', () =>
