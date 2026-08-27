@@ -4,14 +4,6 @@
 // so a bad definition is rejected loudly (see NOTES.md) rather than silently
 // mis-parsed. See lib/cardigann/schema.json's FilterBlock/RowFilterBlock
 // `name` enums for the full upstream filter vocabulary this is checked against.
-
-// Every filter in the 25-filter upstream FilterBlock enum is implemented
-// (filters.ts) - see there for jsonjoinarray's own note on which JSON path
-// subset it supports. sha256/concat are not part of that upstream enum at
-// all - they're a trackarr-only extension (filters.ts, schema-extensions.json);
-// listing them here is what makes trackarr-only definitions using them
-// actually runnable, distinct from (and additional to) load.ts's
-// portable:false schema labeling.
 const SUPPORTED_FIELD_FILTERS = new Set([
   'querystring', 'prepend', 'append', 'tolower', 'toupper', 'replace', 'split',
   'trim', 'regexp', 're_replace', 'validate', 'dateparse', 'timeparse',
@@ -74,19 +66,8 @@ export function checkCapability(definition: Record<string, unknown>): string[] {
     reasons.push(`login.method: ${String(login?.method)} (login/private-tracker flows are not supported)`);
   }
 
-  // We have no config UI/storage: unset .Config.$name resolves to "" at
-  // runtime (lib/cardigann's template engine), matching the standard
-  // Cardigann idiom of guarding optional settings with
-  // `{{ if .Config.X }}...{{ else }}{{ end }}` - confirmed against real
-  // definitions (e.g. 1337x.yml's `uploader` filter). Once type is public and
-  // no login block is present (both checked above), nothing in a definition
-  // could legitimately *require* a settings value - only a login flow would
-  // treat one as a mandatory credential - so settings themselves are never a
-  // capability blocker for the definitions we accept. multi-select is the
-  // one exception: broken even in Prowlarr's own engine per the wiki ("Using
-  // this type will throw a runtime error"), so it's rejected regardless of
-  // how it's used.
   const settings = definition.settings;
+
   if (Array.isArray(settings)) {
     for (const s of settings as Record<string, unknown>[]) {
       if (s.type === 'multi-select') {

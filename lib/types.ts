@@ -1,7 +1,6 @@
 export interface SearchItem {
   title: string;
   detailUrl: string;
-  id: number | null;
   size: number;
   seeds: number;
   leechers: number;
@@ -10,8 +9,7 @@ export interface SearchItem {
 }
 
 export interface MagnetRef {
-  id: number | null;
-  url: string | null;
+  url: string;
 }
 
 // What a grab resolves to: either a magnet: URI (server.ts redirects the
@@ -32,6 +30,12 @@ export interface ProviderCookie {
 }
 
 export interface SearchOptions {
+  /** Raw Torznab t= value (search/tvsearch/movie/music/book) - a definition
+   * can branch on it via .Query.Type (real Prowlarr: SearchType is the
+   * literal t= value, not the caps.modes name - confirmed against
+   * ReleaseSearchService.cs). Defaults to 'search' for callers that don't
+   * pass one (every test, and any future caller with nothing more specific). */
+  type?: string;
   categories?: number[];
   offset: number;
   limit: number;
@@ -42,12 +46,21 @@ export interface SearchResult {
   total: number;
 }
 
+// Torznab t= values, not caps.modes' own names - server.ts dispatches on
+// these directly, and they double as the raw .Query.Type a definition sees
+// (see SearchOptions.type). 'music'/'book' render as caps' <audio-search>/
+// <book-search> respectively - Newznab's own naming mismatch, confirmed
+// against Prowlarr's IndexerCapabilities.cs, not something we invented.
+export type SearchMode = 'search' | 'tvsearch' | 'movie' | 'music' | 'book';
+
 export interface Provider {
   id: string;
   name: string;
   keepAlive?: KeepAliveTarget;
   cookies?: ProviderCookie[];
   categories: number[];
+  /** Always includes 'search' (caps.modes.search is schema-required). */
+  searchModes: SearchMode[];
   search(q: string, opts: SearchOptions): Promise<SearchResult>;
   resolveMagnet(ref: MagnetRef): Promise<ResolvedDownload>;
 }

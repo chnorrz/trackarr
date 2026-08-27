@@ -13,14 +13,14 @@ import type { ResolvedDownload } from '../types.js';
 // see NOTES.md). Live-tested against ext.to, 1337x and EZTV's real
 // definitions (NOTES.md).
 
-export interface SimpleSelectorSpec {
+interface SimpleSelectorSpec {
   selector?: string;
   attribute?: string;
   usebeforeresponse?: boolean;
   filters?: FilterSpec[];
 }
 
-export interface BeforeBlock {
+interface BeforeBlock {
   path?: string;
   pathselector?: SimpleSelectorSpec;
   method?: string;
@@ -38,13 +38,13 @@ export interface BeforeBlock {
   allowEmptyInputs?: boolean;
 }
 
-export interface InfoHashBlock {
+interface InfoHashBlock {
   hash: SimpleSelectorSpec;
   title: SimpleSelectorSpec;
   usebeforeresponse?: boolean;
 }
 
-export interface DownloadBlockDef {
+interface DownloadBlockDef {
   method?: string;
   before?: BeforeBlock;
   selectors?: SimpleSelectorSpec[];
@@ -193,8 +193,7 @@ export async function resolveCardigannDownload(opts: ResolveOptions): Promise<Re
 
   if (!download) {
     // No download block declared: the item's own captured link is assumed
-    // to be a real page containing a magnet, same fallback our hand-written
-    // providers (ext-to/1337x/eztv) all use on their detail pages.
+    // to be a real page containing a magnet, on the item's detail page.
     const html = await (await opts.fetch(opts.downloadUri)).text();
     const magnet = extractFromBody(html, { selector: 'a[href^="magnet:"]', attribute: 'href' }, ctx);
     if (magnet) return { kind: 'magnet', magnet };

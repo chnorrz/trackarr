@@ -7,7 +7,7 @@ import { applyFilters, type FilterSpec } from './filters.js';
 import { buildPathRequests, type SearchBlockForPaths } from './paths.js';
 import type { ResolvedDefinition } from './resolve.js';
 import type { TemplateContext } from './template.js';
-import type { MagnetRef, Provider, ResolvedDownload, SearchItem, SearchOptions, SearchResult } from '../types.js';
+import type { MagnetRef, Provider, ResolvedDownload, SearchItem, SearchMode, SearchOptions, SearchResult } from '../types.js';
 
 // Ties every lib/cardigann module together into a real Provider: fetches
 // aren't made here directly, they go through an injected Fetcher (real
@@ -126,6 +126,21 @@ export function createCardigannProvider(indexer: ResolvedIndexerLike, opts: Crea
   const mappings = collectCategoryMappings(definition);
   const advertisedCategories = [...new Set(mappings.map((m) => categoryIdByName(m.standardName)))];
 
+  // caps.modes' own key names, not Torznab's t= values or caps element
+  // names - both of those are SearchMode's own concern (see types.ts).
+  // caps.modes.search is schema-required, so this is never empty.
+  const MODE_KEYS: Record<string, SearchMode> = {
+    search: 'search',
+    'tv-search': 'tvsearch',
+    'movie-search': 'movie',
+    'music-search': 'music',
+    'book-search': 'book'
+  };
+  const declaredModes = asRecord(asRecord(definition.caps).modes);
+  const searchModes = Object.entries(MODE_KEYS)
+    .filter(([capsKey]) => capsKey in declaredModes)
+    .map(([, mode]) => mode);
+
   // Bounded, no TTL - magnets don't go stale the way page content does.
   const MAGNET_CACHE_MAX = 500;
   const magnetCache = new Map<string, string>();
@@ -171,7 +186,7 @@ export function createCardigannProvider(indexer: ResolvedIndexerLike, opts: Crea
     const ctx: TemplateContext = {
       Keywords: keywords,
       Query: {
-        Type: 'search',
+        Type: searchOpts.type ?? 'search',
         Q: q,
         Keywords: q,
         Categories: (searchOpts.categories ?? []).join(','),
@@ -200,7 +215,7 @@ export function createCardigannProvider(indexer: ResolvedIndexerLike, opts: Crea
 
     // Cardigann definitions don't filter server-side beyond a path's own
     // categories restriction (paths.ts) - apply the caller's category
-    // filter here, same as our hand-written providers' own `filter` step.
+    // filter here instead.
     const filtered =
       searchOpts.categories && searchOpts.categories.length > 0
         ? allItems.filter((it) => searchOpts.categories?.includes(categoryIdByName(it.category)))
@@ -220,7 +235,6 @@ export function createCardigannProvider(indexer: ResolvedIndexerLike, opts: Crea
       return {
         title: it.title,
         detailUrl,
-        id: null,
         size: it.size,
         seeds: it.seeds,
         leechers: it.leechers,
@@ -239,10 +253,9 @@ export function createCardigannProvider(indexer: ResolvedIndexerLike, opts: Crea
     if (cached) return { kind: 'magnet', magnet: cached };
 
     // Cache miss: the original item's title is gone by now (MagnetRef only
-    // carries id/url) - fall back to re-deriving a magnet from whichever
-    // page this detailUrl's row pointed at (its own download link if it had
-    // a distinct one, else the detail page itself), same trade-off our
-    // hand-written providers make on their own cache-miss path.
+    // carries url) - fall back to re-deriving a magnet from whichever page
+    // this detailUrl's row pointed at (its own download link if it had a
+    // distinct one, else the detail page itself).
     const downloadUri = downloadUrlCache.get(url) ?? url;
     const resolved = await resolveCardigannDownload({
       definition,
@@ -265,6 +278,7 @@ export function createCardigannProvider(indexer: ResolvedIndexerLike, opts: Crea
     name: String(definition.name ?? key),
     keepAlive: { url: baseUrl },
     categories: advertisedCategories,
+    searchModes,
     search,
     resolveMagnet
   };

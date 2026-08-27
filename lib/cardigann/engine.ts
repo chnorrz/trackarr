@@ -89,9 +89,8 @@ function resolveCategoryName(definition: Record<string, unknown>, categoryRaw: s
 function parseSizeBytes(raw: string): number {
   // Cardigann's own size parsing accepts both thousands-comma and
   // thousands-dot forms (the wiki: "Sites using European numbering schemes
-  // ... there is no need to remove commas or extra dots"). Strip thousands
-  // separators before handing off to our existing parseSize, which expects
-  // a plain "1234.5 MB" shape.
+  // ... there is no need to remove commas or extra dots") - stripped below
+  // before parsing the plain "1234.5 MB" shape that remains.
   const trimmed = raw.trim();
   // JSON APIs commonly report a plain byte count with no unit at all (e.g.
   // milkie.yml's own `size_bytes` selector name implies this) - HTML
@@ -114,11 +113,9 @@ function parseDateOrNow(raw: string): Date {
   return Number.isNaN(parsed.getTime()) ? new Date() : parsed;
 }
 
-// Unsliced: returns every item the response yields. runSearch() below is the
-// normal single-response entry point (slices to searchCtx.offset/limit); a
-// multi-path search (adapter.ts, phase 3) needs the raw list from each
-// path's own response so it can concatenate before slicing once, not once
-// per path.
+// Unsliced: returns every item the response yields. adapter.ts's search()
+// needs the raw list from each path's own response so it can concatenate
+// across paths before slicing offset/limit once, not once per path.
 export function runSearchAll(definition: Record<string, unknown>, body: string, searchCtx: SearchContext): CardigannItem[] {
   const search = asRecord(definition.search) as unknown as SearchBlock;
   const responseType = search.response?.type;
@@ -223,9 +220,4 @@ export function runSearchAll(definition: Record<string, unknown>, body: string, 
   }
 
   return items;
-}
-
-export function runSearch(definition: Record<string, unknown>, body: string, searchCtx: SearchContext): CardigannItem[] {
-  const items = runSearchAll(definition, body, searchCtx);
-  return items.slice(searchCtx.offset, searchCtx.offset + searchCtx.limit);
 }

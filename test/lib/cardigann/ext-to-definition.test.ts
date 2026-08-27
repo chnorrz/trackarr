@@ -106,7 +106,7 @@ test('ext-to.yml: resolveMagnet() replays the signed AJAX request captured at se
   const provider = makeProvider(fn);
 
   const { items } = await provider.search('anything', { offset: 0, limit: 50 });
-  const resolved = await provider.resolveMagnet({ id: null, url: items[0]?.detailUrl ?? '' });
+  const resolved = await provider.resolveMagnet({ url: items[0]?.detailUrl ?? '' });
 
   assert.equal(resolved.kind, 'magnet');
   assert.match(resolved.magnet, /^magnet:\?xt=urn:btih:0000000000000000000000000000000000ccc1/);

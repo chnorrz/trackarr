@@ -390,6 +390,23 @@ subcategory. Errors are spec-shaped XML with **HTTP 200**
 param, `201` bad param, `203` unknown `t=`, `900` internal error.
 `offset`/`limit` reject non-integer/negative with `201`.
 
+**`caps.modes` drives real per-definition capability, not a hardcoded
+list.** `Provider.searchModes: SearchMode[]` (`lib/types.ts`) is derived
+once from a definition's own `caps.modes` keys (`adapter.ts`) -
+`music-search`/`book-search` map to `music`/`book`, matching the literal
+`t=` values (confirmed against Prowlarr's own `ReleaseSearchService.cs`:
+`spec.SearchType = query.t` verbatim, not the caps.modes name).
+`server.ts`'s `capsXml()` always emits all 5 `<search>`/`<tv-search>`/
+`<movie-search>`/`<audio-search>`/`<book-search>` elements (never omitted,
+matching Prowlarr's own `IndexerCapabilities.cs`) with `available="yes"`
+only for modes the definition actually declares - `music-search` renders
+as `<audio-search>`, Newznab's own naming mismatch. The dispatch route
+rejects a syntactically valid `t=` the provider doesn't declare with
+`203`, same as an unknown one. `SearchOptions.type` carries the raw `t=`
+through to `.Query.Type` (previously hardcoded to `'search'` always -
+a definition branching on `{{ if eq .Query.Type "tv-search" }}` used to
+always take the wrong branch).
+
 ---
 
 ## 13. Testing

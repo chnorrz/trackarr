@@ -15,7 +15,6 @@ function fakeItem(overrides: Record<string, unknown> = {}) {
   return {
     title: 'Fake Title',
     detailUrl: 'https://example.invalid/1',
-    id: 42,
     size: 1024,
     seeds: 5,
     leechers: 2,
@@ -30,6 +29,7 @@ function fakeProvider(overrides: Record<string, unknown> = {}) {
     id: 'fake',
     name: 'Fake Provider',
     categories: [2000, 5000],
+    searchModes: ['search', 'tvsearch', 'movie'],
     search: async () => ({ items: [fakeItem()], total: 1 }),
     resolveMagnet: async () => ({ kind: 'magnet', magnet: 'magnet:?xt=urn:btih:fake' }),
     ...overrides
@@ -62,6 +62,19 @@ test('GET /:provider/api?t=caps needs no apikey and returns caps XML', async () 
   });
 });
 
+test('caps always emits all 5 search elements, available reflecting the provider\'s own searchModes - never omitted', async () => {
+  await withServer({ fake: fakeProvider({ searchModes: ['search', 'music'] }) }, async (base) => {
+    const body = await (await fetch(`${base}/fake/api?t=caps`)).text();
+    assert.match(body, /<search available="yes" supportedParams="q" \/>/);
+    assert.match(body, /<tv-search available="no" supportedParams="q" \/>/);
+    assert.match(body, /<movie-search available="no" supportedParams="q" \/>/);
+    // music (caps.modes' own key: music-search) renders as audio-search -
+    // Newznab's own naming mismatch, confirmed against Prowlarr's source.
+    assert.match(body, /<audio-search available="yes" supportedParams="q" \/>/);
+    assert.match(body, /<book-search available="no" supportedParams="q" \/>/);
+  });
+});
+
 test('caps only advertises the categories a provider actually declares', async () => {
   await withServer({ fake: fakeProvider({ categories: [2000, 5000] }) }, async (base) => {
     const body = await (await fetch(`${base}/fake/api?t=caps`)).text();
@@ -84,7 +97,7 @@ test('unknown provider returns 404 on both routes', async () => {
   await withServer({ fake: fakeProvider() }, async (base) => {
     const res1 = await fetch(`${base}/nope/api?t=caps`);
     assert.equal(res1.status, 404);
-    const res2 = await fetch(`${base}/nope/download?apikey=${API_KEY}&id=1`);
+    const res2 = await fetch(`${base}/nope/download?apikey=${API_KEY}`);
     assert.equal(res2.status, 404);
   });
 });
@@ -98,7 +111,7 @@ test('search returns a Torznab RSS document built from the provider items', asyn
     assert.match(body, /<torznab:attr name="category" value="2000" \/>/);
     assert.match(body, /<torznab:attr name="seeders" value="5" \/>/);
     assert.match(body, /<torznab:attr name="peers" value="7" \/>/);
-    assert.match(body, new RegExp(`/fake/download\\?apikey=${API_KEY}&amp;id=42&amp;url=`));
+    assert.match(body, new RegExp(`/fake/download\\?apikey=${API_KEY}&amp;url=`));
   });
 });
 
@@ -137,7 +150,7 @@ test('cat/offset/limit query params are parsed and forwarded to provider.search'
   });
   await withServer({ fake: provider }, async (base) => {
     await fetch(`${base}/fake/api?t=search&q=&cat=5000&offset=20&limit=10&apikey=${API_KEY}`);
-    assert.deepEqual(calls, [{ categories: [5000], offset: 20, limit: 10 }]);
+    assert.deepEqual(calls, [{ categories: [5000], offset: 20, limit: 10, type: 'search' }]);
   });
 });
 
@@ -151,7 +164,7 @@ test('cat accepts a comma-separated list, parsed into multiple ids', async () =>
   });
   await withServer({ fake: provider }, async (base) => {
     await fetch(`${base}/fake/api?t=search&q=&cat=2000,5000&apikey=${API_KEY}`);
-    assert.deepEqual(calls, [{ categories: [2000, 5000], offset: 0, limit: 50 }]);
+    assert.deepEqual(calls, [{ categories: [2000, 5000], offset: 0, limit: 50, type: 'search' }]);
   });
 });
 
@@ -161,6 +174,37 @@ test('t=tvsearch and t=movie (unhyphenated) are accepted, matching the spec func
     assert.equal(tv.status, 200);
     const movie = await fetch(`${base}/fake/api?t=movie&q=x&apikey=${API_KEY}`);
     assert.equal(movie.status, 200);
+  });
+});
+
+test('t=music and t=book are accepted for a provider that declares them', async () => {
+  await withServer({ fake: fakeProvider({ searchModes: ['search', 'music', 'book'] }) }, async (base) => {
+    const music = await fetch(`${base}/fake/api?t=music&q=x&apikey=${API_KEY}`);
+    assert.equal(music.status, 200);
+    const book = await fetch(`${base}/fake/api?t=book&q=x&apikey=${API_KEY}`);
+    assert.equal(book.status, 200);
+  });
+});
+
+test('a syntactically valid t= that the provider does not declare in searchModes is rejected with <error code="203">, not passed through', async () => {
+  await withServer({ fake: fakeProvider({ searchModes: ['search'] }) }, async (base) => {
+    const res = await fetch(`${base}/fake/api?t=movie&q=x&apikey=${API_KEY}`);
+    assert.equal(res.status, 200);
+    assert.match(await res.text(), /<error code="203"/);
+  });
+});
+
+test('the raw t= value is forwarded to provider.search() as opts.type, not the caps.modes name', async () => {
+  const calls: unknown[] = [];
+  const provider = fakeProvider({
+    search: async (q: string, opts: unknown) => {
+      calls.push(opts);
+      return { items: [fakeItem()], total: 1 };
+    }
+  });
+  await withServer({ fake: provider }, async (base) => {
+    await fetch(`${base}/fake/api?t=tvsearch&q=x&apikey=${API_KEY}`);
+    assert.deepEqual(calls, [{ categories: undefined, offset: 0, limit: 50, type: 'tvsearch' }]);
   });
 });
 
@@ -174,7 +218,7 @@ test('limit is clamped to the caps-advertised max of 100', async () => {
   });
   await withServer({ fake: provider }, async (base) => {
     await fetch(`${base}/fake/api?t=search&q=x&limit=500&apikey=${API_KEY}`);
-    assert.deepEqual(calls, [{ categories: undefined, offset: 0, limit: 100 }]);
+    assert.deepEqual(calls, [{ categories: undefined, offset: 0, limit: 100, type: 'search' }]);
   });
 });
 
@@ -188,7 +232,7 @@ test('missing cat/offset/limit default to no category, offset 0, limit 50', asyn
   });
   await withServer({ fake: provider }, async (base) => {
     await fetch(`${base}/fake/api?t=search&q=x&apikey=${API_KEY}`);
-    assert.deepEqual(calls, [{ categories: undefined, offset: 0, limit: 50 }]);
+    assert.deepEqual(calls, [{ categories: undefined, offset: 0, limit: 50, type: 'search' }]);
   });
 });
 
@@ -260,7 +304,7 @@ test('cat rejects non-numeric or malformed values with a torznab <error code="20
 test('download redirects to the resolved magnet (302)', async () => {
   const provider = fakeProvider({ resolveMagnet: async () => ({ kind: 'magnet', magnet: 'magnet:?xt=urn:btih:deadbeef' }) });
   await withServer({ fake: provider }, async (base) => {
-    const res = await fetch(`${base}/fake/download?apikey=${API_KEY}&id=42`, { redirect: 'manual' });
+    const res = await fetch(`${base}/fake/download?apikey=${API_KEY}&url=https://example.invalid/1`, { redirect: 'manual' });
     assert.equal(res.status, 302);
     assert.equal(res.headers.get('location'), 'magnet:?xt=urn:btih:deadbeef');
   });
@@ -272,7 +316,7 @@ test('download streams a real .torrent file\'s bytes directly, not a redirect', 
     resolveMagnet: async () => ({ kind: 'torrent', data: torrentBytes, filename: 'Example.torrent' })
   });
   await withServer({ fake: provider }, async (base) => {
-    const res = await fetch(`${base}/fake/download?apikey=${API_KEY}&id=42`, { redirect: 'manual' });
+    const res = await fetch(`${base}/fake/download?apikey=${API_KEY}&url=https://example.invalid/1`, { redirect: 'manual' });
     assert.equal(res.status, 200, 'a real file, not a redirect the client can\'t reach on its own');
     assert.equal(res.headers.get('content-type'), 'application/x-bittorrent');
     assert.match(res.headers.get('content-disposition') ?? '', /attachment; filename="Example\.torrent"/);
@@ -281,7 +325,7 @@ test('download streams a real .torrent file\'s bytes directly, not a redirect', 
   });
 });
 
-test('download without id or url returns a torznab <error code="200"> document', async () => {
+test('download without url returns a torznab <error code="200"> document', async () => {
   await withServer({ fake: fakeProvider() }, async (base) => {
     const res = await fetch(`${base}/fake/download?apikey=${API_KEY}`, { redirect: 'manual' });
     assert.equal(res.status, 200);
@@ -298,8 +342,8 @@ test('magnets are cached - a second identical download does not call resolveMagn
     }
   });
   await withServer({ fake: provider }, async (base) => {
-    await fetch(`${base}/fake/download?apikey=${API_KEY}&id=1`, { redirect: 'manual' });
-    await fetch(`${base}/fake/download?apikey=${API_KEY}&id=1`, { redirect: 'manual' });
+    await fetch(`${base}/fake/download?apikey=${API_KEY}&url=https://example.invalid/1`, { redirect: 'manual' });
+    await fetch(`${base}/fake/download?apikey=${API_KEY}&url=https://example.invalid/1`, { redirect: 'manual' });
     assert.equal(calls, 1);
   });
 });
@@ -307,7 +351,7 @@ test('magnets are cached - a second identical download does not call resolveMagn
 test('download errors surface as a torznab <error code="900"> document with the error message', async () => {
   const provider = fakeProvider({ resolveMagnet: async () => { throw new Error('resolve failed'); } });
   await withServer({ fake: provider }, async (base) => {
-    const res = await fetch(`${base}/fake/download?apikey=${API_KEY}&id=1`, { redirect: 'manual' });
+    const res = await fetch(`${base}/fake/download?apikey=${API_KEY}&url=https://example.invalid/1`, { redirect: 'manual' });
     assert.equal(res.status, 200);
     const body = await res.text();
     assert.match(body, /<error code="900"/);
@@ -412,8 +456,8 @@ test('GET / request stats count a failed search separately from successes', asyn
 test('GET / request stats also count download requests, not just search', async () => {
   const statusTracker = new ProviderStatusTracker();
   await withServer({ fake: fakeProvider() }, async (base) => {
-    await fetch(`${base}/fake/download?apikey=${API_KEY}&id=1`, { redirect: 'manual' });
-    await fetch(`${base}/fake/download?apikey=${API_KEY}&id=1`, { redirect: 'manual' });
+    await fetch(`${base}/fake/download?apikey=${API_KEY}&url=https://example.invalid/1`, { redirect: 'manual' });
+    await fetch(`${base}/fake/download?apikey=${API_KEY}&url=https://example.invalid/1`, { redirect: 'manual' });
     const body = await (await fetch(`${base}/`)).text();
     assert.match(body, /2 served/);
     assert.match(body, /2 ok \(50% cached\)/);

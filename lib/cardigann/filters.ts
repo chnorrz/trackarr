@@ -4,16 +4,6 @@ import { formatRFC1123, parseWithFormat } from './date-format.js';
 import { parseFuzzyTime, parseTimeAgo } from './relative-time.js';
 import { resolveJsonPath } from './select.js';
 
-// All 25 FilterBlock names implemented. Semantics and every worked example
-// below are transcribed from wiki.servarr.com/prowlarr/cardigann-yml-definition
-// ("Filters" section) - each filter's test asserts its own wiki example,
-// which is the closest thing to a spec this format has.
-//
-// sha256/concat below are NOT upstream Cardigann filters - they're a
-// trackarr-only extension (lib/cardigann/schema-extensions.json adds them to
-// FilterBlock's name enum), for building HMAC-signed download links like
-// ext.to's. A definition using either validates only under the extended
-// schema (load.ts's `portable: false`).
 export type FilterArgs = string | number | string[] | undefined;
 
 function toStringArg(args: FilterArgs): string {
@@ -217,8 +207,6 @@ export interface FilterSpec {
   args?: FilterArgs;
 }
 
-// Row filters (search.rows.filters) use a different, much smaller vocabulary
-// than field filters - see capability.ts's SUPPORTED_ROW_FILTERS.
 export function applyFilter(name: string, args: FilterArgs, value: string): string {
   const fn = FILTERS[name];
   if (!fn) throw new Error(`applyFilter: unsupported filter "${name}" - should have been caught by the capability gate`);

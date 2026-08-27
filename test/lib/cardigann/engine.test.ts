@@ -7,7 +7,7 @@ import { fileURLToPath } from 'node:url';
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.resolve(__dirname, '..', '..', '..');
 
-const { runSearch, runSearchAll } = await import(path.join(ROOT, 'dist', 'lib', 'cardigann', 'engine.js'));
+const { runSearchAll } = await import(path.join(ROOT, 'dist', 'lib', 'cardigann', 'engine.js'));
 const { validateDefinitionYaml } = await import(path.join(ROOT, 'dist', 'lib', 'cardigann', 'load.js'));
 
 function baseSearchCtx(overrides: Record<string, unknown> = {}) {
@@ -65,7 +65,7 @@ const HTML_BODY = `
 `;
 
 test('runSearch (HTML): full pipeline - rows, fields, size parsing, category mapping, magnet capture', () => {
-  const items = runSearch(minimalHtmlDefinition(), HTML_BODY, baseSearchCtx());
+  const items = runSearchAll(minimalHtmlDefinition(), HTML_BODY, baseSearchCtx());
   assert.equal(items.length, 2);
 
   const first = items[0];
@@ -84,19 +84,13 @@ test('runSearch (HTML): full pipeline - rows, fields, size parsing, category map
 
 test('runSearch (HTML): category falls back to Other when the tracker id has no mapping', () => {
   const body = HTML_BODY.replace('<td class="cat">1</td>', '<td class="cat">999</td>');
-  const items = runSearch(minimalHtmlDefinition(), body, baseSearchCtx());
+  const items = runSearchAll(minimalHtmlDefinition(), body, baseSearchCtx());
   assert.equal(items[0].category, 'Other');
-});
-
-test('runSearch (HTML): offset/limit slices the final item list', () => {
-  const items = runSearch(minimalHtmlDefinition(), HTML_BODY, baseSearchCtx({ offset: 1, limit: 1 }));
-  assert.equal(items.length, 1);
-  assert.equal(items[0].title, 'Some TV Show S01E01');
 });
 
 test('runSearch (HTML): search.rows.filters andmatch excludes rows not matching every keyword', () => {
   const def = minimalHtmlDefinition({ rows: { selector: 'tr.row', filters: [{ name: 'andmatch' }] } });
-  const items = runSearch(def, HTML_BODY, baseSearchCtx({ keywords: 'ubuntu 24.04' }));
+  const items = runSearchAll(def, HTML_BODY, baseSearchCtx({ keywords: 'ubuntu 24.04' }));
   assert.equal(items.length, 1);
   assert.equal(items[0].title, 'Ubuntu 24.04 Desktop');
 });
@@ -105,7 +99,7 @@ test('runSearch (HTML): .Result chaining - a later field can reference an earlie
   const def = minimalHtmlDefinition();
   (def.search.fields as Record<string, unknown>).title = { selector: 'a.title' };
   (def.search.fields as Record<string, unknown>).description = { text: 'Category was: {{ .Result.category }}' };
-  const items = runSearch(def, HTML_BODY, baseSearchCtx());
+  const items = runSearchAll(def, HTML_BODY, baseSearchCtx());
   // .Result.category is the field's own raw extracted value ("1") - category
   // NAME mapping (caps.categorymappings) happens once, after every field has
   // been extracted, and is never written back into .Result for other fields
@@ -127,7 +121,7 @@ test('runSearch (HTML): a filter with a templated arg is rendered against .Resul
     _year: { text: '2020' },
     title: { selector: 'a.title', filters: [{ name: 'append', args: '.{{ .Result._year }}' }] }
   };
-  const items = runSearch(def, HTML_BODY, baseSearchCtx());
+  const items = runSearchAll(def, HTML_BODY, baseSearchCtx());
   assert.equal(items[0].title, 'Ubuntu 24.04 Desktop.2020');
 });
 
@@ -136,13 +130,13 @@ test('runSearch (HTML): case block resolves downloadvolumefactor-style fields, s
   (def.search.fields as Record<string, unknown>).downloadvolumefactor = {
     case: { 'a.magnet': '0', '*': '1' }
   };
-  const items = runSearch(def, HTML_BODY, baseSearchCtx());
+  const items = runSearchAll(def, HTML_BODY, baseSearchCtx());
   // Every row here has a.magnet, so both should resolve to "0" via case,
-  // captured only as ctx.Result - runSearch doesn't surface arbitrary fields
+  // captured only as ctx.Result - runSearchAll doesn't surface arbitrary fields
   // beyond the known CardigannItem shape, so assert indirectly via a
   // description field referencing it.
   (def.search.fields as Record<string, unknown>).description = { text: 'dlvf={{ .Result.downloadvolumefactor }}' };
-  const items2 = runSearch(def, HTML_BODY, baseSearchCtx());
+  const items2 = runSearchAll(def, HTML_BODY, baseSearchCtx());
   assert.equal(items2[0].description, 'dlvf=0');
   void items;
 });
@@ -161,14 +155,14 @@ test('runSearch (HTML): case block resolves downloadvolumefactor-style fields, s
 test('runSearch (HTML): a bare numeric text: field (e.g. `text: 1`, unquoted in YAML) renders its literal value, not empty', () => {
   const def = minimalHtmlDefinition();
   (def.search.fields as Record<string, unknown>).category = { text: 1 };
-  const items = runSearch(def, HTML_BODY, baseSearchCtx());
+  const items = runSearchAll(def, HTML_BODY, baseSearchCtx());
   assert.equal(items[0].category, 'Movies', 'tracker id "1" (from the bare number) must still map via categorymappings');
 });
 
 test('runSearch (HTML): a bare numeric default: (optional field, no match) renders its literal value, not empty', () => {
   const def = minimalHtmlDefinition();
   (def.search.fields as Record<string, unknown>).poster = { selector: 'img.nonexistent', optional: true, default: 0 };
-  const items = runSearch(def, HTML_BODY, baseSearchCtx());
+  const items = runSearchAll(def, HTML_BODY, baseSearchCtx());
   assert.equal(items[0].poster, '0');
 });
 
@@ -176,19 +170,19 @@ test('runSearch (HTML): case: with bare numeric values (e.g. `case: {a.magnet: 0
   const def = minimalHtmlDefinition();
   (def.search.fields as Record<string, unknown>).downloadvolumefactor = { case: { 'a.magnet': 0, '*': 1 } };
   (def.search.fields as Record<string, unknown>).description = { text: 'dlvf={{ .Result.downloadvolumefactor }}' };
-  const items = runSearch(def, HTML_BODY, baseSearchCtx());
+  const items = runSearchAll(def, HTML_BODY, baseSearchCtx());
   assert.equal(items[0].description, 'dlvf=0');
 });
 
 test('runSearch (JSON): case: with bare numeric values (thepiratebay.yml\'s own shape) resolves to the literal value, not empty', () => {
   const def = minimalJsonDefinition();
   (def.search.fields as Record<string, unknown>).downloadvolumefactor = { selector: 'freeleech', case: { 0: 1, 1: 0 } };
-  const items = runSearch(def, JSON_BODY, baseSearchCtx());
+  const items = runSearchAll(def, JSON_BODY, baseSearchCtx());
   assert.equal(items[0].downloadvolumefactor, undefined); // not surfaced on CardigannItem directly
   const withDesc = minimalJsonDefinition();
   (withDesc.search.fields as Record<string, unknown>).downloadvolumefactor = { selector: 'freeleech', case: { 0: 1, 1: 0 } };
   (withDesc.search.fields as Record<string, unknown>).description = { text: 'dlvf={{ .Result.downloadvolumefactor }}' };
-  const itemsWithDesc = runSearch(withDesc, JSON_BODY, baseSearchCtx());
+  const itemsWithDesc = runSearchAll(withDesc, JSON_BODY, baseSearchCtx());
   assert.equal(itemsWithDesc[0].description, 'dlvf=1'); // freeleech:0 -> case 0 -> 1
 });
 
@@ -198,32 +192,32 @@ test('runSearch (HTML): a filter arg array with a bare numeric element renders i
     selector: 'a.title',
     filters: [{ name: 'append', args: [0] }]
   };
-  const items = runSearch(def, HTML_BODY, baseSearchCtx());
+  const items = runSearchAll(def, HTML_BODY, baseSearchCtx());
   assert.equal(items[0].title, 'Ubuntu 24.04 Desktop0');
 });
 
 test('runSearch (HTML): optional + default supplies a value when the selector does not match', () => {
   const def = minimalHtmlDefinition();
   (def.search.fields as Record<string, unknown>).poster = { selector: 'img.nonexistent', optional: true, default: 'no-poster' };
-  const items = runSearch(def, HTML_BODY, baseSearchCtx());
+  const items = runSearchAll(def, HTML_BODY, baseSearchCtx());
   assert.equal(items[0].poster, 'no-poster');
 });
 
 test('runSearch (HTML): a field with no match and no default resolves to empty, not an error', () => {
   const def = minimalHtmlDefinition();
-  const items = runSearch(def, HTML_BODY, baseSearchCtx());
+  const items = runSearchAll(def, HTML_BODY, baseSearchCtx());
   assert.equal(items[0].imdbid, undefined);
 });
 
 test('runSearch (HTML): an unparseable date field falls back to "now", not a crash', () => {
   const body = HTML_BODY.replace('2024-01-15T10:00:00Z', 'not-a-real-date');
-  const items = runSearch(minimalHtmlDefinition(), body, baseSearchCtx());
+  const items = runSearchAll(minimalHtmlDefinition(), body, baseSearchCtx());
   const delta = Math.abs(items[0].pubDate.getTime() - Date.now());
   assert.ok(delta < 5000, 'pubDate should fall back to approximately now');
 });
 
 test('runSearch (HTML): a row that fails to match at all is simply excluded, not fatal for the rest', () => {
-  const items = runSearch(minimalHtmlDefinition(), '<table><tbody></tbody></table>', baseSearchCtx());
+  const items = runSearchAll(minimalHtmlDefinition(), '<table><tbody></tbody></table>', baseSearchCtx());
   assert.deepEqual(items, []);
 });
 
@@ -234,7 +228,7 @@ test('runSearch (HTML): search.vars is extracted once per response, from anywher
   (def.search as Record<string, unknown>).vars = { token: { selector: 'meta[name=csrf-token]', attribute: 'content' } };
   (def.search.fields as Record<string, unknown>).description = { text: 'token={{ .Vars.token }}' };
   const body = `<html><head><meta name="csrf-token" content="page-tok"></head><body>${HTML_BODY}</body></html>`;
-  const items = runSearch(def, body, baseSearchCtx());
+  const items = runSearchAll(def, body, baseSearchCtx());
   assert.equal(items.length, 2);
   assert.equal(items[0].description, 'token=page-tok');
   assert.equal(items[1].description, 'token=page-tok');
@@ -244,14 +238,14 @@ test('runSearch (HTML): a var with no match and no default resolves to empty, no
   const def = minimalHtmlDefinition();
   (def.search as Record<string, unknown>).vars = { token: { selector: 'meta[name=nonexistent]', attribute: 'content' } };
   (def.search.fields as Record<string, unknown>).description = { text: 'token=[{{ .Vars.token }}]' };
-  const items = runSearch(def, HTML_BODY, baseSearchCtx());
+  const items = runSearchAll(def, HTML_BODY, baseSearchCtx());
   assert.equal(items[0].description, 'token=[]');
 });
 
 test('runSearch (HTML): .Now is bound once per response - every row sees the exact same value', () => {
   const def = minimalHtmlDefinition();
   (def.search.fields as Record<string, unknown>).description = { text: '{{ .Now }}' };
-  const items = runSearch(def, HTML_BODY, baseSearchCtx());
+  const items = runSearchAll(def, HTML_BODY, baseSearchCtx());
   assert.equal(items.length, 2);
   assert.match(items[0].description as string, /^\d+$/);
   assert.equal(items[0].description, items[1].description);
@@ -263,7 +257,7 @@ test('runSearch (JSON): search.vars reads from the parsed root, alongside the ro
   (def.search.fields as Record<string, unknown>).details = { text: '{{ .Vars.token }}/{{ .Result._id }}' };
   const body = JSON.stringify({ meta: { token: 'json-tok' }, results: JSON.parse(JSON_BODY) });
   (def.search.rows as Record<string, unknown>).selector = 'results';
-  const items = runSearch(def, body, baseSearchCtx());
+  const items = runSearchAll(def, body, baseSearchCtx());
   assert.equal(items[0].detailUrl, 'json-tok/42');
 });
 
@@ -298,7 +292,7 @@ const JSON_BODY = JSON.stringify([
 ]);
 
 test('runSearch (JSON): full pipeline - $-rooted rows, numeric category mapping, templated details from .Result._id', () => {
-  const items = runSearch(minimalJsonDefinition(), JSON_BODY, baseSearchCtx());
+  const items = runSearchAll(minimalJsonDefinition(), JSON_BODY, baseSearchCtx());
   assert.equal(items.length, 2);
 
   const first = items[0];
@@ -315,7 +309,7 @@ test('runSearch (JSON): full pipeline - $-rooted rows, numeric category mapping,
 test('runSearch (JSON): case-block downloadvolumefactor resolves by value equality against a sibling field', () => {
   const def = minimalJsonDefinition();
   (def.search.fields as Record<string, unknown>).description = { text: 'dlvf={{ .Result.downloadvolumefactor }}' };
-  const items = runSearch(def, JSON_BODY, baseSearchCtx());
+  const items = runSearchAll(def, JSON_BODY, baseSearchCtx());
   assert.equal(items[0].description, 'dlvf=1'); // freeleech:0 -> case "0" -> "1"
   assert.equal(items[1].description, 'dlvf=0'); // freeleech:1 -> case "1" -> "0"
 });
@@ -323,13 +317,13 @@ test('runSearch (JSON): case-block downloadvolumefactor resolves by value equali
 test('runSearch (JSON): count.selector resolving falsy short-circuits to zero results', () => {
   const def = minimalJsonDefinition();
   (def.search.rows as { count?: unknown }).count = { selector: '$[0].id' };
-  const items = runSearch(def, '[]', baseSearchCtx());
+  const items = runSearchAll(def, '[]', baseSearchCtx());
   assert.deepEqual(items, []);
 });
 
 // ---- End-to-end against the real, checked-in faketracker.yml fixture ------
 
-test('runSearch: end to end against the real, checked-in faketracker.yml fixture (mechanics, not live-site fidelity)', () => {
+test('runSearchAll: end to end against the real, checked-in faketracker.yml fixture (mechanics, not live-site fidelity)', () => {
   const raw = fs.readFileSync(path.join(ROOT, 'test', 'fixtures', 'cardigann', 'faketracker.yml'), 'utf8');
   const result = validateDefinitionYaml(raw);
   assert.equal(result.ok, true, JSON.stringify(result.ok === false ? result.errors : null));
@@ -356,7 +350,7 @@ test('runSearch: end to end against the real, checked-in faketracker.yml fixture
     </tbody></table>
   `;
 
-  const items = runSearch(result.definition, body, baseSearchCtx({ keywords: 'ubuntu' }));
+  const items = runSearchAll(result.definition, body, baseSearchCtx({ keywords: 'ubuntu' }));
   assert.equal(items.length, 1);
 
   const item = items[0];
@@ -392,7 +386,7 @@ test('search.preprocessingfilters run on the raw body before row parsing', () =>
     ]
   });
 
-  const items = runSearch(definition, bareRows, baseSearchCtx());
+  const items = runSearchAll(definition, bareRows, baseSearchCtx());
   assert.equal(items.length, 1);
   assert.equal(items[0].title, 'Bare Row');
 });
@@ -402,19 +396,15 @@ test('runSearch (HTML): caps.categories object form is also read, not just categ
     caps: { categories: { '1': 'Movies', '2': 'TV' } },
     search: minimalHtmlDefinition().search
   };
-  const items = runSearch(definition, HTML_BODY, baseSearchCtx());
+  const items = runSearchAll(definition, HTML_BODY, baseSearchCtx());
   assert.equal(items[0].category, 'Movies');
   assert.equal(items[1].category, 'TV');
 });
 
-test('runSearchAll returns every item unsliced; runSearch slices to offset/limit on top of the same list', () => {
+test('runSearchAll ignores offset/limit entirely - slicing is adapter.ts\'s job, once across every path\'s concatenated results', () => {
   const definition = minimalHtmlDefinition();
   const all = runSearchAll(definition, HTML_BODY, baseSearchCtx({ offset: 0, limit: 1 }));
-  assert.equal(all.length, 2, 'runSearchAll ignores offset/limit entirely');
-
-  const sliced = runSearch(definition, HTML_BODY, baseSearchCtx({ offset: 0, limit: 1 }));
-  assert.equal(sliced.length, 1);
-  assert.equal(sliced[0].title, all[0].title);
+  assert.equal(all.length, 2);
 });
 
 test('runSearch (HTML): search.rows.selector is itself a template, rendered against topCtx before matching', () => {
@@ -424,10 +414,10 @@ test('runSearch (HTML): search.rows.selector is itself a template, rendered agai
   const def = minimalHtmlDefinition({
     rows: { selector: 'tr.row{{ if .Config.strict }}:has(.magnet[href*="ABCDEF1234567890"]){{ end }}' }
   });
-  const withoutConfig = runSearch(def, HTML_BODY, baseSearchCtx());
+  const withoutConfig = runSearchAll(def, HTML_BODY, baseSearchCtx());
   assert.equal(withoutConfig.length, 2, 'empty .Config.strict renders the plain, unfiltered selector');
 
-  const withConfig = runSearch(def, HTML_BODY, baseSearchCtx({ config: { strict: 'True' } }));
+  const withConfig = runSearchAll(def, HTML_BODY, baseSearchCtx({ config: { strict: 'True' } }));
   assert.equal(withConfig.length, 1, 'non-empty .Config.strict renders the :has(...) clause, filtering rows');
   assert.equal(withConfig[0].title, 'Ubuntu 24.04 Desktop');
 });

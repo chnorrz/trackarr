@@ -15,7 +15,7 @@ import { renderTemplate, type TemplateContext } from './template.js';
 //     empty then Cardigann will not use that key/value pair").
 export type InputsBlock = Record<string, string | number | boolean>;
 
-export function renderInputValue(value: string | number | boolean, ctx: TemplateContext): string {
+function renderInputValue(value: string | number | boolean, ctx: TemplateContext): string {
   return typeof value === 'string' ? renderTemplate(value, ctx) : String(value);
 }
 

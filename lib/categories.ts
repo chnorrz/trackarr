@@ -149,15 +149,3 @@ export function categoriesXml(ids: number[]): string {
     })
     .join('\n');
 }
-
-export type CategoryRule = [string[], number];
-
-/** Rules are ordered and the first substring match wins, so more specific
- * keywords must come first ("tv" before "movie", or "TV Movies" mis-buckets). */
-export function matchCategory(text: string | undefined | null, rules: CategoryRule[]): number {
-  const haystack = (text || '').toLowerCase();
-  for (const [keywords, category] of rules) {
-    if (keywords.some((k) => haystack.includes(k))) return category;
-  }
-  return CATEGORIES.OTHER;
-}

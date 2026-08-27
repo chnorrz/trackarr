@@ -6,7 +6,7 @@ import { categoriesXml } from './lib/categories.js';
 import { TTLCache } from './lib/cache.js';
 import { ProviderStatusTracker, renderStatusPage } from './lib/status.js';
 import { buildProviderMap } from './providers/index.js';
-import type { MagnetRef, Provider, ResolvedDownload, SearchItem } from './lib/types.js';
+import type { MagnetRef, Provider, ResolvedDownload, SearchItem, SearchMode } from './lib/types.js';
 
 const PORT = process.env.PORT || 9117;
 const API_KEY = process.env.API_KEY || 'changeme';
@@ -44,15 +44,35 @@ function sendError(res: Response, code: number, description: string): void {
 <error code="${code}" description="${xmlEscape(description)}" />`);
 }
 
+// Torznab convention (confirmed against Prowlarr's own IndexerCapabilities.cs):
+// every element is always present, available="no" for an unsupported mode -
+// not omitted. music (Cardigann's own caps.modes key: music-search) renders
+// as <audio-search> - Newznab's own naming mismatch, not ours.
+const ALL_MODES: readonly SearchMode[] = ['search', 'tvsearch', 'movie', 'music', 'book'];
+const MODE_ELEMENT: Record<SearchMode, string> = {
+  search: 'search',
+  tvsearch: 'tv-search',
+  movie: 'movie-search',
+  music: 'audio-search',
+  book: 'book-search'
+};
+
+function isSearchMode(t: string | undefined): t is SearchMode {
+  return t !== undefined && (ALL_MODES as readonly string[]).includes(t);
+}
+
 function capsXml(provider: Provider): string {
+  const supported = new Set(provider.searchModes);
+  const searching = ALL_MODES
+    .map((mode) => `    <${MODE_ELEMENT[mode]} available="${supported.has(mode) ? 'yes' : 'no'}" supportedParams="q" />`)
+    .join('\n');
+
   return `<?xml version="1.0" encoding="UTF-8"?>
 <caps>
   <server title="${xmlEscape(provider.name)}" strapline="${xmlEscape(provider.name)} Torznab proxy" />
   <limits max="${MAX_LIMIT}" default="${DEFAULT_LIMIT}" />
   <searching>
-    <search available="yes" supportedParams="q" />
-    <tv-search available="yes" supportedParams="q" />
-    <movie-search available="yes" supportedParams="q" />
+${searching}
   </searching>
   <categories>
 ${categoriesXml(provider.categories)}
@@ -80,7 +100,7 @@ export function createApp(providers: Record<string, Provider>, opts: AppOptions 
   }
 
   async function resolveMagnet(provider: Provider, ref: MagnetRef): Promise<{ resolved: ResolvedDownload; cached: boolean }> {
-    const cacheKey = `${provider.id}:${ref.id ?? ref.url}`;
+    const cacheKey = `${provider.id}:${ref.url}`;
     const cachedResolved = magnetCache.get(cacheKey);
     if (cachedResolved) {
       console.error(`[cache] magnet hit for ${provider.id} ${JSON.stringify(ref)}`);
@@ -102,7 +122,6 @@ export function createApp(providers: Record<string, Provider>, opts: AppOptions 
       .map((it) => {
         const downloadUrl =
           `${req.protocol}://${req.get('host')}/${provider.id}/download?apikey=${encodeURIComponent(apiKey)}` +
-          (it.id != null ? `&id=${it.id}` : '') +
           `&url=${encodeURIComponent(it.detailUrl)}`;
         const peers = it.seeds + it.leechers;
         return `  <item>
@@ -169,7 +188,12 @@ ${rows}
 
     if (!checkKey(req, res)) return;
 
-    if (t === 'search' || t === 'tvsearch' || t === 'movie') {
+    if (isSearchMode(t)) {
+      if (!provider.searchModes.includes(t)) {
+        sendError(res, 203, `Function not available: t=${t}`);
+        return;
+      }
+
       const q = queryString(req.query.q) || '';
       const catParam = queryString(req.query.cat);
       if (catParam && !/^\d+(,\d+)*$/.test(catParam)) {
@@ -200,7 +224,7 @@ ${rows}
       limit = Math.min(limit, MAX_LIMIT);
 
       try {
-        const { items, total } = await provider.search(q, { categories, offset, limit });
+        const { items, total } = await provider.search(q, { categories, offset, limit, type: t });
         statusTracker.recordRequest(provider.id, true);
         res.type('application/xml').send(buildRss(req, provider, items, total));
       } catch (err) {
@@ -221,16 +245,14 @@ ${rows}
 
     if (!checkKey(req, res)) return;
 
-    const idParam = queryString(req.query.id);
-    const id = idParam ? parseInt(idParam, 10) : null;
-    const url = queryString(req.query.url) || null;
-    if (!id && !url) {
-      sendError(res, 200, 'Missing parameter: id or url');
+    const url = queryString(req.query.url);
+    if (!url) {
+      sendError(res, 200, 'Missing parameter: url');
       return;
     }
 
     try {
-      const { resolved, cached } = await resolveMagnet(provider, { id, url });
+      const { resolved, cached } = await resolveMagnet(provider, { url });
       statusTracker.recordRequest(provider.id, true, { cached });
       if (resolved.kind === 'magnet') {
         res.redirect(302, resolved.magnet);

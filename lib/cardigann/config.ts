@@ -21,15 +21,11 @@ export interface TrackarrConfig {
   indexers: Record<string, IndexerConfigEntry>;
 }
 
-// A missing config file is not an error - it means "no Cardigann indexers",
-// and the three hand-written providers behave exactly as they always have.
-// A *present but invalid* file is fatal (refuse to boot): unlike a single
-// bad definition, a broken config is something the operator just edited and
-// should see immediately, not have silently ignored.
 export function loadConfig(configPath: string): TrackarrConfig | null {
   if (!fs.existsSync(configPath)) return null;
 
   let parsed: unknown;
+
   try {
     parsed = YAML.parse(fs.readFileSync(configPath, 'utf8'));
   } catch (err) {

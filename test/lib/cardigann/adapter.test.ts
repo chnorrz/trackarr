@@ -110,7 +110,7 @@ test('faketracker.yml: a magnet already present in the listing is cached, so res
   assert.equal(items.length, 1);
   const callsBeforeResolve = calls.length;
 
-  const resolved = await provider.resolveMagnet({ id: null, url: items[0].detailUrl });
+  const resolved = await provider.resolveMagnet({ url: items[0].detailUrl });
   assert.equal(resolved.kind, 'magnet');
   assert.match(resolved.magnet, /^magnet:\?xt=urn:btih:/);
   assert.equal(calls.length, callsBeforeResolve, 'resolveMagnet must serve from cache, no network call');
@@ -172,7 +172,7 @@ test('requestDelay gates every fetch this provider instance makes, including a r
 
   // The real flow (server.ts) only ever hands resolveMagnet the item's
   // detailUrl, never its download field - never the raw download URL.
-  await provider.resolveMagnet({ id: null, url: items[0]?.detailUrl ?? '' });
+  await provider.resolveMagnet({ url: items[0]?.detailUrl ?? '' });
   // Second call (a different URL, not cached - "download" field here is a
   // real link, not a magnet, so it's not cached at listing time either):
   // must be gated behind the same 3s requestDelay as the first.
@@ -198,7 +198,7 @@ test('resolveMagnet cache miss follows the row\'s own download URL, not the deta
   const { items } = await provider.search('x', { offset: 0, limit: 50 });
   assert.equal(items[0]?.detailUrl, 'https://synth.example/t/1');
 
-  const resolved = await provider.resolveMagnet({ id: null, url: items[0]?.detailUrl ?? '' });
+  const resolved = await provider.resolveMagnet({ url: items[0]?.detailUrl ?? '' });
   assert.equal(resolved.kind, 'magnet');
   assert.match(resolved.magnet, /FROMDOWNLOADPAGE/);
   assert.ok(
@@ -271,7 +271,7 @@ test('directMagnet priority: a bare magnet field wins over a magnet-shaped downl
     { fetch: fn, sleep: noSleep }
   );
   const { items } = await provider.search('x', { offset: 0, limit: 50 });
-  const resolved = await provider.resolveMagnet({ id: null, url: items[0].detailUrl });
+  const resolved = await provider.resolveMagnet({ url: items[0].detailUrl });
   assert.equal(resolved.kind, 'magnet');
   assert.match(resolved.magnet, /REAL/);
 });
@@ -306,7 +306,7 @@ test('a bare fields.infohash builds a magnet immediately at listing time, no dow
   );
   const { items } = await provider.search('x', { offset: 0, limit: 50 });
   const callsAfterSearch = calls.length;
-  const resolved = await provider.resolveMagnet({ id: null, url: items[0].detailUrl });
+  const resolved = await provider.resolveMagnet({ url: items[0].detailUrl });
   assert.equal(resolved.kind, 'magnet');
   assert.match(resolved.magnet, new RegExp(`^magnet:\\?xt=urn:btih:${'C'.repeat(40)}`));
   assert.equal(calls.length, callsAfterSearch, 'no extra fetch - the magnet was already fully constructed at listing time');
@@ -354,6 +354,29 @@ test('provider.categories advertises every standard id reachable via categorymap
     { fetch: async () => ({ text: async () => '', buffer: async () => Buffer.from('') }), sleep: noSleep }
   );
   assert.deepEqual([...provider.categories].sort(), [2000, 5000]);
+});
+
+test('provider.searchModes is derived from caps.modes\' own keys, translated to Torznab t= values (music-search -> music, not audio)', () => {
+  const definition = syntheticDefinition({
+    caps: {
+      categorymappings: [{ id: '1', cat: 'Movies', desc: 'Movies' }],
+      modes: { search: ['q'], 'tv-search': ['q'], 'music-search': ['q'] }
+    }
+  });
+  const provider = createCardigannProvider(
+    { key: 'synth', entry: { definition: 'synth' }, resolved: { definitionId: 'synth', from: 'test', definition } },
+    { fetch: async () => ({ text: async () => '', buffer: async () => Buffer.from('') }), sleep: noSleep }
+  );
+  assert.deepEqual(provider.searchModes, ['search', 'tvsearch', 'music']);
+});
+
+test('provider.searchModes is empty (not "search" by default) when caps.modes is absent - schema requires it, this is the honest reflection of that absence', () => {
+  const definition = syntheticDefinition();
+  const provider = createCardigannProvider(
+    { key: 'synth', entry: { definition: 'synth' }, resolved: { definitionId: 'synth', from: 'test', definition } },
+    { fetch: async () => ({ text: async () => '', buffer: async () => Buffer.from('') }), sleep: noSleep }
+  );
+  assert.deepEqual(provider.searchModes, []);
 });
 
 test('entry.link overrides links[0] as the base URL', async () => {
@@ -458,7 +481,7 @@ test('resolveMagnet threads the same .Config (settings defaults + overrides) int
     { fetch: fn, sleep: noSleep }
   );
   const { items } = await provider.search('x', { offset: 0, limit: 50 });
-  const resolved = await provider.resolveMagnet({ id: null, url: items[0].detailUrl });
+  const resolved = await provider.resolveMagnet({ url: items[0].detailUrl });
 
   // .Config.downloadlink must have resolved to its real default
   // (http://itorrents.org/), not empty - an empty prefix would have
