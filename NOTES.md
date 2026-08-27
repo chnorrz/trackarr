@@ -395,7 +395,7 @@ param, `201` bad param, `203` unknown `t=`, `900` internal error.
 ## 13. Testing
 
 `npm test` builds then runs `node --experimental-test-module-mocks --test
-"test/**/*.test.ts"` (312 tests). `npm run typecheck` checks source+tests.
+"test/**/*.test.ts"` (317 tests). `npm run typecheck` checks source+tests.
 CI gates both; the release build depends on the `test` job. **No
 browser/Docker/network needed** - the mock boundary is `cfFetch()`.
 
@@ -497,11 +497,15 @@ the *extended* schema and is marked `portable: false`.
 Ajv2019 + `ajv-formats`) doesn't mean runnable - `capability.ts` rejects
 what the engine can't execute: `type: private`/`semi-private` + any
 `login` block (deliberately out of scope), `rows.dateheaders`/`rows.after`
-(rare, deferred), any filter outside the ~26 implemented (`jsonjoinarray`
-is the one gap). Settings in general, and
-`fields.infohash`/`download.infohash`/`download.before`, are **not**
-blockers, despite looking like they should. Last full-corpus scan (547
-upstream v11 definitions): 76 runnable end to end - re-run
+(rare, deferred). All 27 filters (25 upstream FilterBlock names + the 2
+trackarr-only `sha256`/`concat`) are implemented - `jsonjoinarray` reuses
+select.ts's own JSON path engine rather than a real JSONPath dependency
+(see filters.ts's own note on the subset that implies - no wildcards/
+recursive descent, unaddressed by any known definition using this filter).
+Settings in general, and `fields.infohash`/`download.infohash`/
+`download.before`, are **not** blockers, despite looking like they should.
+Last full-corpus scan (547 upstream v11 definitions): 76 runnable end to
+end - re-run
 `npm run validate:definitions` on a fresh clone if this number matters
 again, it drifts with upstream. `yaml`, not `js-yaml`, is the parser: the
 latter's default schema turns ISO-date-looking scalars into `Date` objects,

@@ -54,8 +54,8 @@ interface SearchBlock {
   fields: FieldsBlock;
   response?: ResponseBlock;
   /** Applied to the raw response body before any row parsing - e.g. wrapping
-   * a bare <tr> soup in <table></table>, or (not implemented - jsonjoinarray
-   * is capability-gated out) reshaping a JSON envelope. */
+   * a bare <tr> soup in <table></table>, or reshaping a JSON envelope with
+   * jsonjoinarray. */
   preprocessingfilters?: FilterSpec[];
   /** Extracted once per response (not once per row) into .Vars.* - e.g. a
    * page-level csrf/session token that every row's download link needs. */

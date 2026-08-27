@@ -172,8 +172,31 @@ test('applyFilters: undefined filter list is a no-op', () => {
   assert.equal(applyFilters(undefined, 'unchanged'), 'unchanged');
 });
 
-test('applyFilter: an unimplemented filter name throws rather than silently passing through', () => {
-  assert.throws(() => applyFilter('jsonjoinarray', undefined, 'x'), /unsupported filter/);
+test('applyFilter: an unknown filter name throws rather than silently passing through', () => {
+  assert.throws(() => applyFilter('not-a-real-filter', undefined, 'x'), /unsupported filter/);
+});
+
+// Confirmed against Prowlarr's own CardigannBase.cs (jsonjoinarray case):
+// JObject.Parse(data).SelectToken(args[0]), then string.Join(args[1], ...)
+// over the resulting array's own ToString() of each element.
+test('jsonjoinarray: parses the value as JSON, selects an array by path, joins with the separator', () => {
+  const value = JSON.stringify({ tags: ['x264', '1080p', 'WEB-DL'] });
+  assert.equal(applyFilter('jsonjoinarray', ['tags', ', '], value), 'x264, 1080p, WEB-DL');
+});
+
+test('jsonjoinarray: a $-rooted path works the same as a bare relative one', () => {
+  const value = JSON.stringify({ tags: ['a', 'b'] });
+  assert.equal(applyFilter('jsonjoinarray', ['$.tags', '-'], value), 'a-b');
+});
+
+test('jsonjoinarray: non-string array elements are stringified, not dropped', () => {
+  const value = JSON.stringify({ ids: [1, 2, 3] });
+  assert.equal(applyFilter('jsonjoinarray', ['ids', ','], value), '1,2,3');
+});
+
+test('jsonjoinarray: a path that resolves to something other than an array yields empty', () => {
+  const value = JSON.stringify({ tags: 'not-an-array' });
+  assert.equal(applyFilter('jsonjoinarray', ['tags', ','], value), '');
 });
 
 // sha256/concat are a trackarr-only extension, not upstream Cardigann

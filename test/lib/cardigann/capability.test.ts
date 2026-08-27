@@ -68,11 +68,20 @@ test('checkCapability: an unsupported field filter is rejected by name, with its
   const def = baseDefinition();
   (def.search as { fields: Record<string, unknown> }).fields.title = {
     selector: 'a',
-    filters: [{ name: 'jsonjoinarray', args: ['$.x', ','] }]
+    filters: [{ name: 'not-a-real-filter', args: ['$.x', ','] }]
   };
   const reasons = checkCapability(def);
-  assert.match(reasons[0], /unsupported filter: jsonjoinarray/);
+  assert.match(reasons[0], /unsupported filter: not-a-real-filter/);
   assert.match(reasons[0], /fields\.title\.filters/);
+});
+
+test('checkCapability: jsonjoinarray (all 25 upstream FilterBlock names) is accepted', () => {
+  const def = baseDefinition();
+  (def.search as { fields: Record<string, unknown> }).fields.title = {
+    selector: 'a',
+    filters: [{ name: 'jsonjoinarray', args: ['$.x', ','] }]
+  };
+  assert.deepEqual(checkCapability(def), []);
 });
 
 test('checkCapability: an unsupported row filter is rejected using the RowFilterBlock vocabulary, not FilterBlock\'s', () => {

@@ -5,19 +5,19 @@
 // mis-parsed. See lib/cardigann/schema.json's FilterBlock/RowFilterBlock
 // `name` enums for the full upstream filter vocabulary this is checked against.
 
-// jsonjoinarray needs a JSONPath dependency we don't carry, for one rare use
-// (preprocessingfilters on JSON APIs). Everything else in the 25-filter
-// FilterBlock enum is implemented. sha256/concat are not part of that
-// upstream enum at all - they're a trackarr-only extension (filters.ts,
-// schema-extensions.json); listing them here is what makes trackarr-only
-// definitions using them actually runnable, distinct from (and additional
-// to) load.ts's portable:false schema labeling.
+// Every filter in the 25-filter upstream FilterBlock enum is implemented
+// (filters.ts) - see there for jsonjoinarray's own note on which JSON path
+// subset it supports. sha256/concat are not part of that upstream enum at
+// all - they're a trackarr-only extension (filters.ts, schema-extensions.json);
+// listing them here is what makes trackarr-only definitions using them
+// actually runnable, distinct from (and additional to) load.ts's
+// portable:false schema labeling.
 const SUPPORTED_FIELD_FILTERS = new Set([
   'querystring', 'prepend', 'append', 'tolower', 'toupper', 'replace', 'split',
   'trim', 'regexp', 're_replace', 'validate', 'dateparse', 'timeparse',
   'timeago', 'reltime', 'fuzzytime', 'htmldecode', 'htmlencode', 'urldecode',
   'urlencode', 'validfilename', 'diacritics', 'hexdump', 'strdump',
-  'sha256', 'concat'
+  'jsonjoinarray', 'sha256', 'concat'
 ]);
 
 const SUPPORTED_ROW_FILTERS = new Set(['andmatch', 'strdump']);

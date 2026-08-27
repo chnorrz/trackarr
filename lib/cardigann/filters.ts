@@ -2,10 +2,10 @@ import { createHash } from 'node:crypto';
 import * as cheerio from 'cheerio';
 import { formatRFC1123, parseWithFormat } from './date-format.js';
 import { parseFuzzyTime, parseTimeAgo } from './relative-time.js';
+import { resolveJsonPath } from './select.js';
 
-// The 24 of 25 FilterBlock names implemented (jsonjoinarray excluded - see
-// lib/cardigann/capability.ts). Semantics and every worked example below are
-// transcribed from wiki.servarr.com/prowlarr/cardigann-yml-definition
+// All 25 FilterBlock names implemented. Semantics and every worked example
+// below are transcribed from wiki.servarr.com/prowlarr/cardigann-yml-definition
 // ("Filters" section) - each filter's test asserts its own wiki example,
 // which is the closest thing to a spec this format has.
 //
@@ -157,6 +157,23 @@ function sha256(value: string): string {
   return createHash('sha256').update(value).digest('hex');
 }
 
+// Confirmed against Prowlarr's own CardigannBase.cs: value is parsed as
+// JSON, args[0] (a JSONPath-ish selector) picks a token out of it, args[1]
+// is the join separator. Real Prowlarr uses Newtonsoft's SelectToken (full
+// JSONPath, wildcards included); this reuses select.ts's own path engine
+// instead of adding a JSONPath dependency for one filter - same $-rooted
+// dot-path/:has()/:not()/:contains()/[N] subset every other JSON selector
+// in this codebase already uses (see select.ts's own documented limits:
+// no wildcards, no recursive descent - unaddressed by any real definition
+// found using this filter, upstream or not, as of this writing).
+function jsonJoinArray(value: string, args: FilterArgs): string {
+  const [path, separator] = toArgsArray(args);
+  const root: unknown = JSON.parse(value);
+  const selected = resolveJsonPath(root, path ?? '');
+  if (!Array.isArray(selected)) return '';
+  return selected.map((v) => (typeof v === 'string' ? v : JSON.stringify(v))).join(separator ?? '');
+}
+
 // No separator is inserted - callers pass any needed separators as their own
 // literal args, e.g. {{ sha256 (concat .A "|" .B "|" .C) }}.
 function concat(value: string, args: FilterArgs): string {
@@ -191,7 +208,8 @@ const FILTERS: Record<string, FilterFn> = {
   hexdump,
   strdump,
   sha256,
-  concat
+  concat,
+  jsonjoinarray: jsonJoinArray
 };
 
 export interface FilterSpec {
