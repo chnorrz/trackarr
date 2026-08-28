@@ -64,7 +64,10 @@ function isSearchMode(t: string | undefined): t is SearchMode {
 function capsXml(provider: Provider): string {
   const supported = new Set(provider.searchModes);
   const searching = ALL_MODES
-    .map((mode) => `    <${MODE_ELEMENT[mode]} available="${supported.has(mode) ? 'yes' : 'no'}" supportedParams="q" />`)
+    .map((mode) => {
+      const params = provider.searchParams[mode] ?? ['q'];
+      return `    <${MODE_ELEMENT[mode]} available="${supported.has(mode) ? 'yes' : 'no'}" supportedParams="${params.join(',')}" />`;
+    })
     .join('\n');
 
   return `<?xml version="1.0" encoding="UTF-8"?>
@@ -195,6 +198,8 @@ ${rows}
       }
 
       const q = queryString(req.query.q) || '';
+      const season = queryString(req.query.season);
+      const ep = queryString(req.query.ep);
       const catParam = queryString(req.query.cat);
       if (catParam && !/^\d+(,\d+)*$/.test(catParam)) {
         sendError(res, 201, 'Incorrect parameter: cat must be a comma-separated list of non-negative integers');
@@ -224,7 +229,7 @@ ${rows}
       limit = Math.min(limit, MAX_LIMIT);
 
       try {
-        const { items, total } = await provider.search(q, { categories, offset, limit, type: t });
+        const { items, total } = await provider.search(q, { categories, offset, limit, type: t, season, ep });
         statusTracker.recordRequest(provider.id, true);
         res.type('application/xml').send(buildRss(req, provider, items, total));
       } catch (err) {

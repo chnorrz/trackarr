@@ -30,6 +30,7 @@ function fakeProvider(overrides: Record<string, unknown> = {}) {
     name: 'Fake Provider',
     categories: [2000, 5000],
     searchModes: ['search', 'tvsearch', 'movie'],
+    searchParams: { search: ['q'], tvsearch: ['q', 'season', 'ep'], movie: ['q'] },
     search: async () => ({ items: [fakeItem()], total: 1 }),
     resolveMagnet: async () => ({ kind: 'magnet', magnet: 'magnet:?xt=urn:btih:fake' }),
     ...overrides
@@ -63,15 +64,25 @@ test('GET /:provider/api?t=caps needs no apikey and returns caps XML', async () 
 });
 
 test('caps always emits all 5 search elements, available reflecting the provider\'s own searchModes - never omitted', async () => {
-  await withServer({ fake: fakeProvider({ searchModes: ['search', 'music'] }) }, async (base) => {
+  await withServer(
+    { fake: fakeProvider({ searchModes: ['search', 'music'], searchParams: { search: ['q'], music: ['q'] } }) },
+    async (base) => {
+      const body = await (await fetch(`${base}/fake/api?t=caps`)).text();
+      assert.match(body, /<search available="yes" supportedParams="q" \/>/);
+      assert.match(body, /<tv-search available="no" supportedParams="q" \/>/);
+      assert.match(body, /<movie-search available="no" supportedParams="q" \/>/);
+      // music (caps.modes' own key: music-search) renders as audio-search -
+      // Newznab's own naming mismatch, confirmed against Prowlarr's source.
+      assert.match(body, /<audio-search available="yes" supportedParams="q" \/>/);
+      assert.match(body, /<book-search available="no" supportedParams="q" \/>/);
+    }
+  );
+});
+
+test('caps supportedParams reflects a mode\'s real declared params, not just "q" - the season & ep advertisement Sonarr\'s Standard series search requires', async () => {
+  await withServer({ fake: fakeProvider() }, async (base) => {
     const body = await (await fetch(`${base}/fake/api?t=caps`)).text();
-    assert.match(body, /<search available="yes" supportedParams="q" \/>/);
-    assert.match(body, /<tv-search available="no" supportedParams="q" \/>/);
-    assert.match(body, /<movie-search available="no" supportedParams="q" \/>/);
-    // music (caps.modes' own key: music-search) renders as audio-search -
-    // Newznab's own naming mismatch, confirmed against Prowlarr's source.
-    assert.match(body, /<audio-search available="yes" supportedParams="q" \/>/);
-    assert.match(body, /<book-search available="no" supportedParams="q" \/>/);
+    assert.match(body, /<tv-search available="yes" supportedParams="q,season,ep" \/>/);
   });
 });
 
@@ -150,7 +161,7 @@ test('cat/offset/limit query params are parsed and forwarded to provider.search'
   });
   await withServer({ fake: provider }, async (base) => {
     await fetch(`${base}/fake/api?t=search&q=&cat=5000&offset=20&limit=10&apikey=${API_KEY}`);
-    assert.deepEqual(calls, [{ categories: [5000], offset: 20, limit: 10, type: 'search' }]);
+    assert.deepEqual(calls, [{ categories: [5000], offset: 20, limit: 10, type: 'search', season: undefined, ep: undefined }]);
   });
 });
 
@@ -164,7 +175,7 @@ test('cat accepts a comma-separated list, parsed into multiple ids', async () =>
   });
   await withServer({ fake: provider }, async (base) => {
     await fetch(`${base}/fake/api?t=search&q=&cat=2000,5000&apikey=${API_KEY}`);
-    assert.deepEqual(calls, [{ categories: [2000, 5000], offset: 0, limit: 50, type: 'search' }]);
+    assert.deepEqual(calls, [{ categories: [2000, 5000], offset: 0, limit: 50, type: 'search', season: undefined, ep: undefined }]);
   });
 });
 
@@ -204,7 +215,7 @@ test('the raw t= value is forwarded to provider.search() as opts.type, not the c
   });
   await withServer({ fake: provider }, async (base) => {
     await fetch(`${base}/fake/api?t=tvsearch&q=x&apikey=${API_KEY}`);
-    assert.deepEqual(calls, [{ categories: undefined, offset: 0, limit: 50, type: 'tvsearch' }]);
+    assert.deepEqual(calls, [{ categories: undefined, offset: 0, limit: 50, type: 'tvsearch', season: undefined, ep: undefined }]);
   });
 });
 
@@ -218,7 +229,7 @@ test('limit is clamped to the caps-advertised max of 100', async () => {
   });
   await withServer({ fake: provider }, async (base) => {
     await fetch(`${base}/fake/api?t=search&q=x&limit=500&apikey=${API_KEY}`);
-    assert.deepEqual(calls, [{ categories: undefined, offset: 0, limit: 100, type: 'search' }]);
+    assert.deepEqual(calls, [{ categories: undefined, offset: 0, limit: 100, type: 'search', season: undefined, ep: undefined }]);
   });
 });
 
@@ -232,7 +243,21 @@ test('missing cat/offset/limit default to no category, offset 0, limit 50', asyn
   });
   await withServer({ fake: provider }, async (base) => {
     await fetch(`${base}/fake/api?t=search&q=x&apikey=${API_KEY}`);
-    assert.deepEqual(calls, [{ categories: undefined, offset: 0, limit: 50, type: 'search' }]);
+    assert.deepEqual(calls, [{ categories: undefined, offset: 0, limit: 50, type: 'search', season: undefined, ep: undefined }]);
+  });
+});
+
+test('season and ep query params are parsed and forwarded to provider.search', async () => {
+  const calls: unknown[] = [];
+  const provider = fakeProvider({
+    search: async (q: string, opts: unknown) => {
+      calls.push(opts);
+      return { items: [fakeItem()], total: 1 };
+    }
+  });
+  await withServer({ fake: provider }, async (base) => {
+    await fetch(`${base}/fake/api?t=tvsearch&q=x&season=1&ep=2&apikey=${API_KEY}`);
+    assert.deepEqual(calls, [{ categories: undefined, offset: 0, limit: 50, type: 'tvsearch', season: '1', ep: '2' }]);
   });
 });
 

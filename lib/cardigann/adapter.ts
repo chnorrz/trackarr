@@ -1,6 +1,7 @@
 import { buildMagnetFromInfohash, resolveCardigannDownload, type Fetcher } from './download.js';
 import { collectCategoryMappings } from './category-mapping.js';
 import { categoryIdByName, categoryNameById } from '../categories.js';
+import { parseWithFormat } from './date-format.js';
 import type { IndexerConfigEntry } from './config.js';
 import { runSearchAll, type CardigannItem } from './engine.js';
 import { applyFilters, type FilterSpec } from './filters.js';
@@ -15,9 +16,9 @@ import type { MagnetRef, Provider, ResolvedDownload, SearchItem, SearchMode, Sea
 // browser/network concerns, same discipline as the rest of lib/cardigann.
 //
 // Known, deliberate limitations (see NOTES.md section 20 for the full list):
-//  - .Query.* only carries Type/Q/Keywords/Categories/Offset/Limit - our own
-//    server.ts doesn't parse season/ep/imdbid/tvdbid/etc from the request at
-//    all yet, so a definition referencing those always sees "".
+//  - .Query.* carries Type/Q/Keywords/Season/Ep/Episode/Categories/Offset/
+//    Limit - imdbid/tvdbid/tmdbid/etc are still not parsed by server.ts, so
+//    a definition referencing those always sees "".
 //  - SearchPathBlock.response (a per-path response-type override) is not
 //    respected; the top-level search.response.type is used for every path.
 //  - A single path's fetch failure fails the whole search; no partial
@@ -71,6 +72,29 @@ function settingDefaults(definition: Record<string, unknown>): Record<string, st
     defaults[s.name] = configValueToString(s.default);
   }
   return defaults;
+}
+
+// Mirrors Prowlarr's TvSearchCriteria.GetEpisodeSearchString() exactly
+// (confirmed against its own source, not guessed), so the token appended to
+// Keywords for a tv-search is the same one a real Cardigann definition
+// would see: "S01E02" for a standard episode, "S01" for a season pack, or
+// "2024.03.27" for a daily show (season carries the air year, ep "MM/dd").
+function episodeSearchString(season: string | undefined, ep: string | undefined): string {
+  if (!season || Number(season) === 0) return '';
+
+  const asDate = parseWithFormat(`${season} ${ep ?? ''}`, 'yyyy MM/dd');
+  if (asDate) {
+    const y = asDate.getUTCFullYear();
+    const m = String(asDate.getUTCMonth() + 1).padStart(2, '0');
+    const d = String(asDate.getUTCDate()).padStart(2, '0');
+    return `${y}.${m}.${d}`;
+  }
+
+  const seasonToken = season.padStart(2, '0');
+  if (!ep) return `S${seasonToken}`;
+  const epNum = Number(ep);
+  const epToken = ep !== '' && Number.isInteger(epNum) ? String(epNum).padStart(2, '0') : ep;
+  return `S${seasonToken}E${epToken}`;
 }
 
 function directMagnet(item: CardigannItem): string | undefined {
@@ -140,6 +164,11 @@ export function createCardigannProvider(indexer: ResolvedIndexerLike, opts: Crea
   const searchModes = Object.entries(MODE_KEYS)
     .filter(([capsKey]) => capsKey in declaredModes)
     .map(([, mode]) => mode);
+  const searchParams: Partial<Record<SearchMode, string[]>> = {};
+  for (const [capsKey, mode] of Object.entries(MODE_KEYS)) {
+    const raw = declaredModes[capsKey];
+    if (Array.isArray(raw)) searchParams[mode] = raw.filter((p): p is string => typeof p === 'string');
+  }
 
   // Bounded, no TTL - magnets don't go stale the way page content does.
   const MAGNET_CACHE_MAX = 500;
@@ -171,7 +200,12 @@ export function createCardigannProvider(indexer: ResolvedIndexerLike, opts: Crea
     const keywordsFilters = Array.isArray((definition.search as Record<string, unknown> | undefined)?.keywordsfilters)
       ? ((definition.search as Record<string, unknown>).keywordsfilters as FilterSpec[])
       : [];
-    const keywords = applyFilters(keywordsFilters, q);
+    // Mirrors Cardigann's own Keywords assembly (Q + ... + Episode, joined
+    // by spaces, skipping empties) - we only carry Q and Episode of the
+    // real token set (see the file-level limitations comment).
+    const episodeToken = episodeSearchString(searchOpts.season, searchOpts.ep);
+    const rawKeywords = [q, episodeToken].filter(Boolean).join(' ');
+    const keywords = applyFilters(keywordsFilters, rawKeywords);
 
     // .Categories: requested numeric Torznab ids -> this tracker's own
     // native category ids, via the standard-name each side agrees on.
@@ -188,7 +222,10 @@ export function createCardigannProvider(indexer: ResolvedIndexerLike, opts: Crea
       Query: {
         Type: searchOpts.type ?? 'search',
         Q: q,
-        Keywords: q,
+        Keywords: rawKeywords,
+        Season: searchOpts.season ?? '',
+        Ep: searchOpts.ep ?? '',
+        Episode: episodeToken,
         Categories: (searchOpts.categories ?? []).join(','),
         Offset: String(searchOpts.offset),
         Limit: String(searchOpts.limit)
@@ -279,6 +316,7 @@ export function createCardigannProvider(indexer: ResolvedIndexerLike, opts: Crea
     keepAlive: { url: baseUrl },
     categories: advertisedCategories,
     searchModes,
+    searchParams,
     search,
     resolveMagnet
   };

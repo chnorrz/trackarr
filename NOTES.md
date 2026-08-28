@@ -407,6 +407,28 @@ through to `.Query.Type` (previously hardcoded to `'search'` always -
 a definition branching on `{{ if eq .Query.Type "tv-search" }}` used to
 always take the wrong branch).
 
+**`supportedParams` reflects each mode's real declared params, and
+`season`/`ep` actually flow into the search.** Previously `capsXml()`
+hardcoded `supportedParams="q"` for every element regardless of what the
+definition declared, so Sonarr's `NewznabRequestGenerator.SupportsEpisodeSearch`
+(needs `season` *and* `ep` in `tv-search`'s advertised params) was always
+false and it silently skipped Standard series search entirely, logging
+"Indexer capabilities lacking season & ep query parameters" and sending zero
+requests. `Provider.searchParams: Partial<Record<SearchMode, string[]>>`
+(`lib/types.ts`) now carries each mode's own declared param array straight
+from `caps.modes` (`adapter.ts`), and `capsXml()` joins it instead of the
+old literal. `server.ts` now also parses `season=`/`ep=` off the request and
+forwards them as `SearchOptions.season`/`.ep`; `adapter.ts`'s
+`episodeSearchString()` turns them into the same token Prowlarr's own
+`TvSearchCriteria.GetEpisodeSearchString()` would (`S01E02`, `S01` for a
+season-only pack, `2024.03.27` for a daily show, `''` when season is
+absent or `0`/`"00"` - confirmed against that method's actual C# source,
+not guessed), appended to `.Keywords`/`.Query.Keywords` alongside `q` the
+same way Cardigann's own `Q`+`Episode` token join does. `.Query.Season`/
+`.Query.Ep`/`.Query.Episode` are exposed too, for any definition that wants
+the raw values. `imdbid`/`tvdbid`/`tmdbid`/etc are still not parsed - only
+season/ep made it in, since that's what Sonarr's Standard search needs.
+
 ---
 
 ## 13. Testing

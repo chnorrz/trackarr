@@ -379,6 +379,83 @@ test('provider.searchModes is empty (not "search" by default) when caps.modes is
   assert.deepEqual(provider.searchModes, []);
 });
 
+test('provider.searchParams carries each declared mode\'s own param list - what capsXml needs to advertise season/ep truthfully', () => {
+  const definition = syntheticDefinition({
+    caps: {
+      categorymappings: [{ id: '1', cat: 'Movies', desc: 'Movies' }],
+      modes: { search: ['q'], 'tv-search': ['q', 'season', 'ep'], 'movie-search': ['q'] }
+    }
+  });
+  const provider = createCardigannProvider(
+    { key: 'synth', entry: { definition: 'synth' }, resolved: { definitionId: 'synth', from: 'test', definition } },
+    { fetch: async () => ({ text: async () => '', buffer: async () => Buffer.from('') }), sleep: noSleep }
+  );
+  assert.deepEqual(provider.searchParams, { search: ['q'], tvsearch: ['q', 'season', 'ep'], movie: ['q'] });
+});
+
+test('provider.searchParams is empty when caps.modes is absent, same honesty as searchModes', () => {
+  const definition = syntheticDefinition();
+  const provider = createCardigannProvider(
+    { key: 'synth', entry: { definition: 'synth' }, resolved: { definitionId: 'synth', from: 'test', definition } },
+    { fetch: async () => ({ text: async () => '', buffer: async () => Buffer.from('') }), sleep: noSleep }
+  );
+  assert.deepEqual(provider.searchParams, {});
+});
+
+// ---- season/ep -> Keywords (Prowlarr's TvSearchCriteria.EpisodeSearchString) ----
+
+test('search: season+ep build an "S01E02" token appended to Keywords, matching Prowlarr\'s own tv-search request generator', async () => {
+  const result = validateDefinitionYaml(fs.readFileSync(FAKE_TRACKER_YAML, 'utf8'));
+  if (!result.ok) return assert.fail('fixture must be valid');
+
+  const page1Url = 'https://faketracker.example/search/?q=Ubuntu%20S01E02';
+  const page2Url = 'https://faketracker.example/search/?page=2&q=Ubuntu%20S01E02';
+  const { fn } = fakeFetch({
+    [page1Url]: fakeTrackerPage([]),
+    [page2Url]: fakeTrackerPage([])
+  });
+  const provider = createCardigannProvider(
+    { key: 'faketracker', entry: { definition: 'faketracker' }, resolved: { definitionId: 'faketracker', from: 'test', definition: result.definition } },
+    { fetch: fn, sleep: noSleep }
+  );
+
+  // fakeFetch throws on any URL without a canned response, so a wrong
+  // Keywords token would fail this call outright rather than silently pass.
+  await provider.search('Ubuntu', { offset: 0, limit: 50, type: 'tvsearch', season: '1', ep: '2' });
+});
+
+test('search: season with no ep builds an "S01" season-pack token', async () => {
+  const result = validateDefinitionYaml(fs.readFileSync(FAKE_TRACKER_YAML, 'utf8'));
+  if (!result.ok) return assert.fail('fixture must be valid');
+
+  const { fn } = fakeFetch({
+    'https://faketracker.example/search/?q=Ubuntu%20S01': fakeTrackerPage([]),
+    'https://faketracker.example/search/?page=2&q=Ubuntu%20S01': fakeTrackerPage([])
+  });
+  const provider = createCardigannProvider(
+    { key: 'faketracker', entry: { definition: 'faketracker' }, resolved: { definitionId: 'faketracker', from: 'test', definition: result.definition } },
+    { fetch: fn, sleep: noSleep }
+  );
+
+  await provider.search('Ubuntu', { offset: 0, limit: 50, type: 'tvsearch', season: '1' });
+});
+
+test('search: season "00" (Sonarr\'s NewznabifySeasonNumber encoding of season 0) is treated as absent, matching Prowlarr\'s "Season is null or 0" rule', async () => {
+  const result = validateDefinitionYaml(fs.readFileSync(FAKE_TRACKER_YAML, 'utf8'));
+  if (!result.ok) return assert.fail('fixture must be valid');
+
+  const { fn } = fakeFetch({
+    'https://faketracker.example/search/?q=Ubuntu': fakeTrackerPage([]),
+    'https://faketracker.example/search/?page=2&q=Ubuntu': fakeTrackerPage([])
+  });
+  const provider = createCardigannProvider(
+    { key: 'faketracker', entry: { definition: 'faketracker' }, resolved: { definitionId: 'faketracker', from: 'test', definition: result.definition } },
+    { fetch: fn, sleep: noSleep }
+  );
+
+  await provider.search('Ubuntu', { offset: 0, limit: 50, type: 'tvsearch', season: '00', ep: '5' });
+});
+
 test('entry.link overrides links[0] as the base URL', async () => {
   const definition = syntheticDefinition({ links: ['https://synth.example/', 'https://mirror.example/'] });
   const { fn, calls } = fakeFetch({

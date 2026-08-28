@@ -36,6 +36,11 @@ export interface SearchOptions {
    * ReleaseSearchService.cs). Defaults to 'search' for callers that don't
    * pass one (every test, and any future caller with nothing more specific). */
   type?: string;
+  /** Raw season/ep Torznab params (tvsearch only). Passed through as-is;
+   * the Cardigann adapter turns them into an "S01E02"-style token appended
+   * to Keywords, mirroring Prowlarr's own TvSearchCriteria.EpisodeSearchString. */
+  season?: string;
+  ep?: string;
   categories?: number[];
   offset: number;
   limit: number;
@@ -61,6 +66,12 @@ export interface Provider {
   categories: number[];
   /** Always includes 'search' (caps.modes.search is schema-required). */
   searchModes: SearchMode[];
+  /** Per-mode supported Torznab param names, exactly as declared in the
+   * definition's caps.modes (e.g. tvsearch -> ['q','season','ep']). Only
+   * has an entry for modes present in searchModes; a caller should fall
+   * back to ['q'] for any mode without one (matches Prowlarr's own
+   * IndexerCapabilities default). */
+  searchParams: Partial<Record<SearchMode, string[]>>;
   search(q: string, opts: SearchOptions): Promise<SearchResult>;
   resolveMagnet(ref: MagnetRef): Promise<ResolvedDownload>;
 }
