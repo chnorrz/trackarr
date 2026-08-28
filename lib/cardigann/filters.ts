@@ -84,9 +84,13 @@ function validate(value: string, args: FilterArgs): string {
     .join(', ');
 }
 
+// Prowlarr's own dateparse/timeparse swallow a parse failure and leave the
+// value untouched rather than blanking it (CardigannBase.cs), so a bad match
+// still has a chance downstream (e.g. via JS's own Date() at extraction
+// time) instead of always falling back to now().
 function dateparse(value: string, args: FilterArgs): string {
   const date = parseWithFormat(value, toStringArg(args));
-  return date ? formatRFC1123(date) : '';
+  return date ? formatRFC1123(date) : value;
 }
 
 function timeago(value: string): string {

@@ -27,7 +27,7 @@ const TOKENS: [string, string][] = [
   ['ff', '(?<ff>\\d{2})'],
   ['f', '(?<f>\\d{1})'],
   ['tt', '(?<tt>[AaPp][Mm])'],
-  ['zzz', '(?<zzz>[+-]\\d{2}:\\d{2})'],
+  ['zzz', '(?<zzz>[+-]\\d{2}:?\\d{2})'],
   ['zz', '(?<zz>[+-]\\d{2})']
 ];
 
@@ -84,7 +84,7 @@ export function parseWithFormat(value: string, format: string): Date | null {
 
   let offsetMinutes = 0;
   if (g.zzz) {
-    const m = /^([+-])(\d{2}):(\d{2})$/.exec(g.zzz);
+    const m = /^([+-])(\d{2}):?(\d{2})$/.exec(g.zzz);
     if (m) offsetMinutes = (m[1] === '-' ? -1 : 1) * (Number(m[2]) * 60 + Number(m[3]));
   } else if (g.zz) {
     const m = /^([+-])(\d{2})$/.exec(g.zz);
