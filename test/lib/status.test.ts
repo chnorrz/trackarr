@@ -5,7 +5,9 @@ import { fileURLToPath } from 'node:url';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.resolve(__dirname, '..', '..');
-const { ProviderStatusTracker, renderStatusPage } = await import(path.join(ROOT, 'dist', 'lib', 'status.js'));
+const { ProviderStatusTracker, renderStatusPage, buildStatusJson } = await import(path.join(ROOT, 'dist', 'lib', 'status.js'));
+
+const NOT_RUNNING = { running: false, processCount: 0, totalRssBytes: 0, processes: [] };
 
 function fakeProvider(id: string, name: string) {
   return { id, name, search: async () => [], resolveMagnet: async () => '' };
@@ -168,5 +170,45 @@ test('renderStatusPage omits the cached percentage when nothing has succeeded ye
   const html = renderStatusPage(providers, tracker);
   assert.match(html, /1 served/);
   assert.match(html, /0 ok \u00b7/);
-  assert.doesNotMatch(html, /cached\)/);
+  // A loose /cached\)/ substring match would also hit the inline client-side
+  // script's own "% cached)" format string - scope to the rendered pattern.
+  assert.doesNotMatch(html, /\(\d+% cached\)/);
+});
+
+test('buildStatusJson includes every provider with its id, name, state and stats', () => {
+  const tracker = new ProviderStatusTracker();
+  tracker.recordCheck('one', true);
+  tracker.recordRequest('two', false, { error: 'boom' });
+  const providers = { one: fakeProvider('one', 'Provider One'), two: fakeProvider('two', 'Provider Two') };
+  const json = buildStatusJson(providers, tracker, NOT_RUNNING);
+
+  assert.ok(json.generatedAt);
+  assert.equal(json.providers.length, 2);
+
+  const one = json.providers.find((p: { id: string }) => p.id === 'one');
+  assert.equal(one.name, 'Provider One');
+  assert.equal(one.state, 'ok');
+  assert.equal(typeof one.lastCheckedAt, 'string');
+  assert.equal(one.lastError, null);
+
+  const two = json.providers.find((p: { id: string }) => p.id === 'two');
+  assert.equal(two.state, 'error');
+  assert.equal(two.lastError, 'boom');
+  assert.deepEqual(two.stats, { total: 1, successful: 0, cached: 0, failed: 1 });
+});
+
+test('buildStatusJson passes the camoufox snapshot through unchanged', () => {
+  const tracker = new ProviderStatusTracker();
+  const camoufox = { running: true, processCount: 3, totalRssBytes: 123456, processes: [{ pid: 1, rssBytes: 123456 }] };
+  const json = buildStatusJson({}, tracker, camoufox);
+  assert.deepEqual(json.camoufox, camoufox);
+});
+
+test('buildStatusJson reports a provider with no recorded status as unknown with null timestamp/error', () => {
+  const tracker = new ProviderStatusTracker();
+  const providers = { one: fakeProvider('one', 'Provider One') };
+  const json = buildStatusJson(providers, tracker, NOT_RUNNING);
+  assert.equal(json.providers[0].state, 'unknown');
+  assert.equal(json.providers[0].lastCheckedAt, null);
+  assert.equal(json.providers[0].lastError, null);
 });

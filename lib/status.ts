@@ -1,3 +1,4 @@
+import type { CamoufoxMemoryUsage } from './processStats.js';
 import type { Provider } from './types.js';
 
 export type ProviderState = 'ok' | 'error' | 'unknown';
@@ -58,6 +59,43 @@ export class ProviderStatusTracker {
   }
 }
 
+export interface StatusJsonProvider {
+  id: string;
+  name: string;
+  state: ProviderState;
+  lastCheckedAt: string | null;
+  lastError: string | null;
+  stats: ProviderStats;
+}
+
+export interface StatusJson {
+  generatedAt: string;
+  providers: StatusJsonProvider[];
+  camoufox: CamoufoxMemoryUsage;
+}
+
+export function buildStatusJson(
+  providers: Record<string, Provider>,
+  tracker: ProviderStatusTracker,
+  camoufox: CamoufoxMemoryUsage
+): StatusJson {
+  return {
+    generatedAt: new Date().toISOString(),
+    providers: Object.values(providers).map((provider) => {
+      const status = tracker.get(provider.id);
+      return {
+        id: provider.id,
+        name: provider.name,
+        state: status.state,
+        lastCheckedAt: status.lastCheckedAt ? status.lastCheckedAt.toISOString() : null,
+        lastError: status.lastError,
+        stats: status.stats
+      };
+    }),
+    camoufox
+  };
+}
+
 function escapeHtml(str: unknown): string {
   const entities: Record<string, string> = {
     '&': '&amp;',
@@ -111,11 +149,11 @@ export function renderStatusPage(providers: Record<string, Provider>, tracker: P
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<meta http-equiv="refresh" content="30">
 <title>trackarr status</title>
 <style>
   body { font-family: system-ui, sans-serif; background: #111; color: #eee; margin: 2rem; }
   h1 { font-size: 1.2rem; font-weight: 600; }
+  h2 { font-size: 1rem; font-weight: 600; color: #ccc; margin-top: 2rem; }
   table { border-collapse: collapse; width: 100%; }
   th, td { text-align: left; padding: 0.5rem 0.75rem; border-bottom: 1px solid #333; }
   th { color: #999; font-weight: 500; font-size: 0.85rem; }
@@ -125,16 +163,96 @@ export function renderStatusPage(providers: Record<string, Provider>, tracker: P
   .badge-unknown { background: #3a3a3a; color: #aaa; }
   .stats-cell { color: #aaa; font-size: 0.85rem; white-space: nowrap; }
   .error-cell { color: #ff8a8a; font-size: 0.85rem; font-family: ui-monospace, monospace; }
+  #camoufox-stats { color: #aaa; font-size: 0.85rem; }
+  #camoufox-stats .proc-list { color: #666; font-size: 0.8rem; margin-top: 0.25rem; }
   footer { margin-top: 1.5rem; color: #666; font-size: 0.8rem; }
 </style>
 </head>
 <body>
 <h1>trackarr</h1>
 <table>
-  <tr><th>Provider</th><th>Status</th><th>Last checked/used</th><th>Requests</th><th>Error</th></tr>
+  <thead>
+    <tr><th>Provider</th><th>Status</th><th>Last checked/used</th><th>Requests</th><th>Error</th></tr>
+  </thead>
+  <tbody id="provider-rows">
 ${rows}
+  </tbody>
 </table>
-<footer>Auto-refreshes every 30s.</footer>
+<h2>Camoufox</h2>
+<div id="camoufox-stats">Loading\u2026</div>
+<footer>Updates automatically every 30s &middot; last updated <span id="last-updated">just now</span></footer>
+<script>
+(function () {
+  var STATE_LABEL = { ok: 'OK', error: 'ERROR', unknown: 'UNKNOWN' };
+
+  function escapeHtml(str) {
+    var entities = { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&apos;' };
+    return String(str).replace(/[&<>'"]/g, function (c) { return entities[c]; });
+  }
+
+  function formatRelativeTime(iso) {
+    if (!iso) return 'never';
+    var seconds = Math.round((Date.now() - new Date(iso).getTime()) / 1000);
+    if (seconds < 5) return 'just now';
+    if (seconds < 60) return seconds + 's ago';
+    var minutes = Math.round(seconds / 60);
+    if (minutes < 60) return minutes + 'm ago';
+    var hours = Math.round(minutes / 60);
+    if (hours < 24) return hours + 'h ago';
+    var days = Math.round(hours / 24);
+    return days + 'd ago';
+  }
+
+  function formatStats(stats) {
+    if (stats.total === 0) return 'no requests yet';
+    var cachedPart = stats.successful > 0
+      ? ' (' + Math.round((stats.cached / stats.successful) * 100) + '% cached)'
+      : '';
+    return stats.total + ' served \\u00b7 ' + stats.successful + ' ok' + cachedPart + ' \\u00b7 ' + stats.failed + ' failed';
+  }
+
+  function renderRow(p) {
+    var errorCell = p.lastError ? escapeHtml(p.lastError) : '';
+    return '<tr class="state-' + p.state + '">' +
+      '<td>' + escapeHtml(p.name) + '</td>' +
+      '<td><span class="badge badge-' + p.state + '">' + STATE_LABEL[p.state] + '</span></td>' +
+      '<td title="' + (p.lastCheckedAt ? escapeHtml(p.lastCheckedAt) : '') + '">' + escapeHtml(formatRelativeTime(p.lastCheckedAt)) + '</td>' +
+      '<td class="stats-cell">' + escapeHtml(formatStats(p.stats)) + '</td>' +
+      '<td class="error-cell">' + errorCell + '</td>' +
+      '</tr>';
+  }
+
+  function formatBytes(bytes) {
+    return (bytes / (1024 * 1024)).toFixed(1) + ' MB';
+  }
+
+  function renderCamoufox(c) {
+    if (!c.running) return 'Not running';
+    var procList = c.processes
+      .slice()
+      .sort(function (a, b) { return b.rssBytes - a.rssBytes; })
+      .map(function (p) { return 'pid ' + p.pid + ': ' + formatBytes(p.rssBytes); })
+      .join(', ');
+    return 'Running &middot; ' + c.processCount + ' process' + (c.processCount === 1 ? '' : 'es') +
+      ' &middot; ' + formatBytes(c.totalRssBytes) + ' total' +
+      '<div class="proc-list">' + escapeHtml(procList) + '</div>';
+  }
+
+  function refresh() {
+    fetch('/status.json')
+      .then(function (res) { return res.json(); })
+      .then(function (data) {
+        document.getElementById('provider-rows').innerHTML = data.providers.map(renderRow).join('\\n');
+        document.getElementById('camoufox-stats').innerHTML = renderCamoufox(data.camoufox);
+        document.getElementById('last-updated').textContent = 'just now';
+      })
+      .catch(function (err) { console.error('status refresh failed', err); });
+  }
+
+  refresh();
+  setInterval(refresh, 30000);
+})();
+</script>
 </body>
 </html>`;
 }

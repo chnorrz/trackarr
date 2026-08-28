@@ -4,7 +4,8 @@ import express, { type Application, type Request, type Response } from 'express'
 import { closeBrowser, cfFetch } from './lib/browser.js';
 import { categoriesXml } from './lib/categories.js';
 import { TTLCache } from './lib/cache.js';
-import { ProviderStatusTracker, renderStatusPage } from './lib/status.js';
+import { getCamoufoxMemoryUsage, type CamoufoxMemoryUsage } from './lib/processStats.js';
+import { ProviderStatusTracker, buildStatusJson, renderStatusPage } from './lib/status.js';
 import { buildProviderMap } from './providers/index.js';
 import type { MagnetRef, Provider, ResolvedDownload, SearchItem, SearchMode } from './lib/types.js';
 
@@ -87,12 +88,14 @@ export interface AppOptions {
   apiKey?: string;
   magnetCacheTtlMs?: number;
   statusTracker?: ProviderStatusTracker;
+  getCamoufoxMemoryUsage?: () => Promise<CamoufoxMemoryUsage>;
 }
 
 export function createApp(providers: Record<string, Provider>, opts: AppOptions = {}): Application {
   const apiKey = opts.apiKey ?? API_KEY;
   const magnetCache = new TTLCache<ResolvedDownload>(opts.magnetCacheTtlMs ?? MAGNET_CACHE_TTL_MS);
   const statusTracker = opts.statusTracker ?? new ProviderStatusTracker();
+  const camoufoxMemoryUsage = opts.getCamoufoxMemoryUsage ?? getCamoufoxMemoryUsage;
 
   function checkKey(req: Request, res: Response): boolean {
     if (queryString(req.query.apikey) !== apiKey) {
@@ -167,6 +170,11 @@ ${rows}
 
   app.get('/', (_req: Request, res: Response) => {
     res.type('html').send(renderStatusPage(providers, statusTracker));
+  });
+
+  app.get('/status.json', async (_req: Request, res: Response) => {
+    const camoufox = await camoufoxMemoryUsage();
+    res.json(buildStatusJson(providers, statusTracker, camoufox));
   });
 
   function getProvider(req: Request, res: Response): Provider | null {

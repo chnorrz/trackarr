@@ -478,6 +478,49 @@ test('GET / request stats count a failed search separately from successes', asyn
   }, { statusTracker });
 });
 
+const NOT_RUNNING = { running: false, processCount: 0, totalRssBytes: 0, processes: [] };
+
+test('GET /status.json needs no apikey and returns a JSON document listing every provider', async () => {
+  await withServer({ fake: fakeProvider() }, async (base) => {
+    const res = await fetch(`${base}/status.json`);
+    assert.equal(res.status, 200);
+    assert.match(res.headers.get('content-type') ?? '', /application\/json/);
+    const body = await res.json();
+    assert.ok(body.generatedAt);
+    assert.equal(body.providers.length, 1);
+    assert.equal(body.providers[0].id, 'fake');
+    assert.equal(body.providers[0].name, 'Fake Provider');
+    assert.equal(body.providers[0].state, 'unknown');
+    assert.deepEqual(body.camoufox, NOT_RUNNING);
+  }, { getCamoufoxMemoryUsage: async () => NOT_RUNNING });
+});
+
+test('GET /status.json reflects a successful search as ok, with its stats', async () => {
+  const statusTracker = new ProviderStatusTracker();
+  await withServer({ fake: fakeProvider() }, async (base) => {
+    await fetch(`${base}/fake/api?t=search&q=x&apikey=${API_KEY}`);
+    const body = await (await fetch(`${base}/status.json`)).json();
+    assert.equal(body.providers[0].state, 'ok');
+    assert.deepEqual(body.providers[0].stats, { total: 1, successful: 1, cached: 0, failed: 0 });
+  }, { statusTracker, getCamoufoxMemoryUsage: async () => NOT_RUNNING });
+});
+
+test('GET /status.json surfaces the injected camoufox memory usage snapshot', async () => {
+  const camoufox = {
+    running: true,
+    processCount: 2,
+    totalRssBytes: 200 * 1024 * 1024,
+    processes: [
+      { pid: 111, rssBytes: 150 * 1024 * 1024 },
+      { pid: 112, rssBytes: 50 * 1024 * 1024 }
+    ]
+  };
+  await withServer({ fake: fakeProvider() }, async (base) => {
+    const body = await (await fetch(`${base}/status.json`)).json();
+    assert.deepEqual(body.camoufox, camoufox);
+  }, { getCamoufoxMemoryUsage: async () => camoufox });
+});
+
 test('GET / request stats also count download requests, not just search', async () => {
   const statusTracker = new ProviderStatusTracker();
   await withServer({ fake: fakeProvider() }, async (base) => {
