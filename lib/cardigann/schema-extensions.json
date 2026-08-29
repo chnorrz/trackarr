@@ -1,0 +1,45 @@
+[
+  {
+    "op": "add",
+    "path": "/definitions/FilterBlock/properties/name/enum/-",
+    "value": "sha256"
+  },
+  {
+    "op": "add",
+    "path": "/definitions/FilterBlock/properties/name/enum/-",
+    "value": "concat"
+  },
+  {
+    "op": "add",
+    "path": "/definitions/Search/properties/vars",
+    "value": {
+      "type": "object",
+      "additionalProperties": false,
+      "patternProperties": {
+        "^[A-Za-z0-9_]+$": {
+          "$ref": "#/definitions/SelectorBlock"
+        }
+      }
+    }
+  },
+  {
+    "op": "add",
+    "path": "/definitions/BeforeBlock/properties/vars",
+    "value": {
+      "type": "object",
+      "additionalProperties": false,
+      "patternProperties": {
+        "^[A-Za-z0-9_]+$": {
+          "$ref": "#/definitions/SelectorBlock"
+        }
+      }
+    }
+  },
+  {
+    "op": "add",
+    "path": "/definitions/BeforeBlock/properties/allowEmptyInputs",
+    "value": {
+      "type": "boolean"
+    }
+  }
+]

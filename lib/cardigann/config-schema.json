@@ -1,0 +1,49 @@
+{
+  "$schema": "https://json-schema.org/draft/2019-09/schema",
+  "title": "TrackarrConfig",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["indexers"],
+  "properties": {
+    "indexers": {
+      "type": "object",
+      "additionalProperties": false,
+      "patternProperties": {
+        "^[a-z0-9][a-z0-9-]*$": {
+          "$ref": "#/definitions/IndexerEntry"
+        }
+      }
+    }
+  },
+  "definitions": {
+    "IndexerEntry": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["definition"],
+      "properties": {
+        "definition": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Cardigann definition id, e.g. kickasstorrents-to"
+        },
+        "source": {
+          "type": "string",
+          "minLength": 1,
+          "description": "A pin shorthand (e.g. prowlarr:v11) or a raw URL, used if the definition isn't found in DEFINITIONS_DIR"
+        },
+        "link": {
+          "type": "string",
+          "format": "uri",
+          "description": "Must be one of the definition's own links[] - checked at resolve time, not by this schema"
+        },
+        "config": {
+          "type": "object",
+          "additionalProperties": {
+            "type": ["string", "number", "boolean"]
+          },
+          "description": "Values for the definition's settings[] - checked against the actual settings at resolve time, not by this schema"
+        }
+      }
+    }
+  }
+}

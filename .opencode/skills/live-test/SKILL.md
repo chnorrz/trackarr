@@ -98,11 +98,16 @@ Three providers, one stable query each. These are chosen to be well-seeded and
 long-lived; do not swap them for topical terms, or a failure becomes ambiguous
 between "provider broken" and "nothing matches".
 
-| Provider | id       | Query    | Expected |
-| -------- | -------- | -------- | -------- |
-| ext.to   | `ext-to` | `matrix` | ~50 items, real seed counts |
-| 1337x    | `1337x`  | `ubuntu` | ~50 items, real seed counts |
-| EZTV     | `eztv`   | `matrix` | ~48 items, real seed counts |
+| Provider | id       | Query          | Expected |
+| -------- | -------- | -------------- | -------- |
+| ext.to   | `ext-to` | `matrix`       | ~50 items, real seed counts |
+| 1337x    | `1337x`  | `ubuntu`       | ~50 items, real seed counts |
+| EZTV     | `eztv`   | `breaking bad` | ~48 items, real seed counts |
+
+EZTV only indexes TV episodes, so a movie title like `matrix` matches almost
+nothing seeded there (near-all-zero seeders is expected for that query on
+EZTV specifically, not a regression) — `breaking bad` is a real, long-lived
+TV show and gets a proper seeded result set instead.
 
 All three providers report real seed counts from a keyword search. EZTV's
 search rows carry seeds too (see `NOTES.md` section 16) — a low/zero
@@ -110,7 +115,7 @@ search rows carry seeds too (see `NOTES.md` section 16) — a low/zero
 
 ```bash
 for p in ext-to 1337x eztv; do
-  case $p in ext-to|eztv) q=matrix;; 1337x) q=ubuntu;; esac
+  case $p in ext-to) q=matrix;; 1337x) q=ubuntu;; eztv) q=breaking+bad;; esac
   printf '%-8s ' "$p"
   curl -sS --max-time 300 \
     "http://localhost:9117/$p/api?t=search&q=$q&apikey=livetest" \

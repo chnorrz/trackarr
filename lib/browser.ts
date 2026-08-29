@@ -1,9 +1,8 @@
-import crypto from 'crypto';
+import crypto from 'node:crypto';
 import { Camoufox } from 'camoufox-js';
-import type { Browser, BrowserContext, Page } from 'playwright-core';
+import type { Browser, BrowserContext, Download, Page, Response as PlaywrightResponse } from 'playwright-core';
 import { TTLCache } from './cache.js';
 import { isBlocked, solveChallenge } from './challenge.js';
-import { Response as PlaywrightResponse } from 'playwright-core';
 import type { ProviderCookie } from './types.js';
 
 // Must stay within the Xvfb geometry in the Dockerfile's CMD: a window larger
@@ -44,13 +43,9 @@ function createSerializer() {
 const serializeSolve = createSerializer();
 const serializeNav = createSerializer();
 
-// serializeNav/serializeSolve each only guard one step (one goto, one solve),
-// not the operation as a whole. Two cfFetch() calls for the same hostname
-// otherwise race on the same page - e.g. one is mid-solveChallenge() (only
-// inside serializeSolve) while the other calls page.goto() on that same page
-// (only inside serializeNav), interrupting the solve's own navigation. This
-// wraps a whole recovery attempt per hostname so a second call for a page
-// already in use waits for the first to finish, instead of touching it too.
+// serializeNav/serializeSolve each guard only one step; two cfFetch() calls
+// for the same hostname would otherwise race on the same page. This wraps a
+// whole recovery attempt per hostname instead, so a second call waits.
 const hostSerializers = new Map<string, ReturnType<typeof createSerializer>>();
 
 function serializeHost(hostname: string) {
@@ -119,11 +114,13 @@ async function launchSession(): Promise<BrowserSession> {
     ? { 'network.proxy.type': 2, 'network.proxy.autoconfig_url': pacDataUri }
     : undefined;
 
+  // Logged so the effective prefs used for a memory-optimization pass are a
+  // fact, not an assumption - see /status.json for what they cost in RAM.
+  console.error(`[camoufox] effective firefox_user_prefs: ${JSON.stringify(firefoxPrefs ?? {})}`);
+
   // Keep the argument as one object literal: Camoufox()'s return type is
   // generic on user_data_dir, and hoisting it to a variable loses that.
-  const browser = os
-    ? await Camoufox({ headless, os, window: WINDOW_SIZE, ...(firefoxPrefs ? { firefox_user_prefs: firefoxPrefs } : {}) })
-    : await Camoufox({ headless, window: WINDOW_SIZE, ...(firefoxPrefs ? { firefox_user_prefs: firefoxPrefs } : {}) });
+  const browser = await Camoufox({ headless, os, window: WINDOW_SIZE, firefox_user_prefs: firefoxPrefs });
 
   const context = await browser.newContext();
   if (registeredCookies.length) {
@@ -179,27 +176,41 @@ async function openPersistentPage(hostname: string): Promise<Page> {
   }
 }
 
-function recyclePage(page: Page): void {
-  for (const [hostname, tracked] of persistentPages) {
-    if (tracked === page) {
-      persistentPages.delete(hostname);
-      break;
-    }
-  }
-
+function recyclePage(hostname: string, page: Page): void {
+  if (persistentPages.get(hostname) === page) persistentPages.delete(hostname);
   void page.close().catch(() => {});
 }
 
-type TryFetchResponse = { challenged: false, content: string} | { challenged: true } | null;
+// Body always read as base64 via res.blob() + FileReader.readAsDataURL(),
+// not res.arrayBuffer(): Firefox's Xray wrappers (the boundary
+// page.evaluate()'s injected code runs under) forbid reading TypedArray
+// elements across it - a real error hit live, Camoufox is Firefox-based.
+type TryFetchResponse = { challenged: false; base64: string; filename?: string } | { challenged: true } | null;
 
 async function tryFetch(page: Page, url: string, init: FetchOptions): Promise<TryFetchResponse> {
   if (page.isClosed()) return null;
   try {
     return await page.evaluate<TryFetchResponse, { url: string; init: FetchOptions }>(async ({ url, init }) => {
       const res = await fetch(url, init);
-      return res.headers.get('cf-mitigated') === 'challenge'
-        ? { challenged: true }
-        : { challenged: false, content: await res.text() };
+      if (res.headers.get('cf-mitigated') === 'challenge') return { challenged: true };
+
+      const blob = await res.blob();
+      const dataUrl: string = await new Promise((resolve, reject) => {
+        const reader = new FileReader();
+        reader.onload = () => resolve(reader.result as string);
+        reader.onerror = () => reject(reader.error);
+        reader.readAsDataURL(blob);
+      });
+      const base64 = dataUrl.slice(dataUrl.indexOf(',') + 1);
+
+      // A same-origin .torrent reads fine through plain fetch() - CORS only
+      // restricts cross-origin bodies. Filename parsed from the response
+      // header the same way suggestedFilename() derives it from a Download.
+      const cd = res.headers.get('content-disposition') || '';
+      const match = cd.match(/filename\*?=(?:UTF-8''|")?([^";]+)/i);
+      const filename = match?.[1] ? decodeURIComponent(match[1].replace(/"/g, '')) : undefined;
+
+      return { challenged: false, base64, filename };
     }, { url, init });
   } catch {
     return null;
@@ -209,51 +220,143 @@ async function tryFetch(page: Page, url: string, init: FetchOptions): Promise<Tr
 const CACHE_TTL_MS = Number(process.env.CACHE_TTL_MS) || 5 * 60 * 1000;
 const pageCache = new TTLCache<string>(CACHE_TTL_MS);
 
-export function isChallenge(response: TryFetchResponse | PlaywrightResponse | null): response is { challenged: true } | PlaywrightResponse {
+function isChallenge(response: TryFetchResponse | PlaywrightResponse | null): response is { challenged: true } | PlaywrightResponse {
   if (response === null) return false;
   if ('challenged' in response) return response.challenged;
   return response.headers()['cf-mitigated'] === 'challenge';
 }
 
-export async function cfFetch(url: string, opts: FetchOptions = {}): Promise<string> {
+// `Cookie` is a forbidden header name per the Fetch spec, silently dropped
+// by every browser rather than erroring. Uses Playwright's own cookie jar
+// instead, which also covers page.goto()'s slow path (no opts.headers there).
+async function applyCookieHeader(page: Page, hostname: string, headers: Record<string, string> | undefined): Promise<void> {
+  if (!headers) return;
+  const key = Object.keys(headers).find((k) => k.toLowerCase() === 'cookie');
+  if (!key || !headers[key]) return;
+
+  const cookies = headers[key]
+    .split(';')
+    .map((pair) => pair.trim())
+    .filter(Boolean)
+    .map((pair) => {
+      const eq = pair.indexOf('=');
+      const name = eq === -1 ? pair : pair.slice(0, eq);
+      const value = eq === -1 ? '' : pair.slice(eq + 1);
+      return { name, value, domain: hostname, path: '/' };
+    });
+
+  if (cookies.length) await page.context().addCookies(cookies);
+}
+
+const NAV_TIMEOUT_MS = 15000;
+
+type NavResult = { kind: 'page'; response: PlaywrightResponse | null } | { kind: 'download'; base64: string; filename: string };
+
+// page.goto() throws "Download is starting" exactly when Firefox fires the
+// 'download' event - one nav lands on a page or resolves as a Download.
+// allowDownload=false warms the bare origin instead (a POST warm-up must never look like a download).
+async function navigateOrDownload(page: Page, url: string, allowDownload: boolean): Promise<NavResult> {
+  // Armed before goto(): Firefox fires 'download' at essentially the same
+  // instant as the nav's "Download is starting" error, so listening only in
+  // the catch below would race it. Left to reject on its own timeout if unused.
+  const downloadPromise = allowDownload ? page.waitForEvent('download', { timeout: NAV_TIMEOUT_MS }) : null;
+  downloadPromise?.catch(() => {});
+
+  try {
+    const response = await page.goto(url, { waitUntil: 'commit', timeout: NAV_TIMEOUT_MS });
+    return { kind: 'page', response };
+  } catch (err) {
+    if (!(err instanceof Error) || !err.message.includes('Download is starting')) throw err;
+
+    if (!downloadPromise) {
+      const response = await page.goto(`${new URL(url).origin}/`, { waitUntil: 'commit', timeout: NAV_TIMEOUT_MS });
+      return { kind: 'page', response };
+    }
+
+    const download: Download = await downloadPromise;
+    const failure = await download.failure();
+    if (failure) throw new Error(`cfFetch: download failed for ${url}: ${failure}`, { cause: err });
+
+    const stream = await download.createReadStream();
+    const chunks: Buffer[] = [];
+    for await (const chunk of stream) chunks.push(chunk as Buffer);
+    const filename = download.suggestedFilename();
+    await download.delete().catch(() => {});
+
+    return { kind: 'download', base64: Buffer.concat(chunks).toString('base64'), filename };
+  }
+}
+
+// A browser download can't carry arbitrary request headers the way fetch()
+// can - Cookie goes through the context's cookie jar (applyCookieHeader)
+// regardless of path; anything else silently vanishes on the download path.
+function warnDroppedDownloadHeaders(url: string, headers: Record<string, string> | undefined): void {
+  for (const key of Object.keys(headers ?? {})) {
+    if (key.toLowerCase() !== 'cookie') {
+      console.error(`[cf] cfFetch: header "${key}" can't be sent by a browser download, ignored for ${url}.`);
+    }
+  }
+}
+
+async function fetchViaSession(url: string, opts: FetchOptions): Promise<{ base64: string; filename?: string }> {
   const { method = 'GET', headers, body } = opts;
-  const init: FetchOptions = { method, headers, body };
+  // Cookie is stripped here (see applyCookieHeader) rather than left for
+  // fetch() to silently ignore - one clear mechanism, not two that could
+  // disagree.
+  const remainingHeaders = headers ? Object.fromEntries(Object.entries(headers).filter(([k]) => k.toLowerCase() !== 'cookie')) : undefined;
+  const init: FetchOptions = { method, headers: remainingHeaders, body };
   const cacheKey = crypto.createHash('sha256').update(`${method}:${url}:${body ?? ''}`).digest('hex');
 
   const cached = pageCache.get(cacheKey);
-  if (cached !== undefined) return cached;
+  if (cached !== undefined) return { base64: cached };
 
   const hostname = new URL(url).hostname;
   const page = await getOrCreatePersistentPage(hostname);
+  await applyCookieHeader(page, hostname, headers);
+
+  const allowDownload = method === 'GET' && !body;
+
+  // A download's bytes ARE the response - nothing left to fetch, and (like
+  // resolveMagnet's own choice for a Cardigann torrent) not worth caching.
+  const navigate = async (allow: boolean): Promise<{ download: { base64: string; filename?: string } } | { response: PlaywrightResponse | null }> => {
+    const nav = await serializeNav(() => navigateOrDownload(page, url, allow));
+    if (nav.kind === 'download') {
+      warnDroppedDownloadHeaders(url, headers);
+      return { download: { base64: nav.base64, filename: nav.filename } };
+    }
+    return { response: nav.response };
+  };
 
   // Exclusive per hostname: a second call for the same page must wait for
   // this one to finish, not interleave its own goto()/solveChallenge() with it.
   return serializeHost(hostname)(async () => {
     try {
-      // A new page sits on about:blank, where fetch()'s same-origin rules make
-      // tryFetch() fail regardless of cookies - not a challenge signal.
       let firstNav = false;
       let response: PlaywrightResponse | null = null;
 
       if (page.url() === 'about:blank') {
-        response = await serializeNav(() => page.goto(url, { waitUntil: 'commit', timeout: 15000 }));
+        const nav = await navigate(allowDownload);
         firstNav = true;
+        if ('download' in nav) return nav.download;
+        response = nav.response;
       }
 
       if (!isChallenge(response)) {
         const fast = await tryFetch(page, url, init);
         if (fast !== null && !isChallenge(fast)) {
-          if (isBlocked(fast.content)) {
+          if (isBlocked(Buffer.from(fast.base64, 'base64').toString('utf-8'))) {
             throw new Error(`cfFetch: fetch failed for ${url} even though the page shows no challenge - probably your IP got blocked.`);
           }
-          pageCache.set(cacheKey, fast.content);
-          return fast.content;
+          pageCache.set(cacheKey, fast.base64);
+          return { base64: fast.base64, filename: fast.filename };
         }
       }
 
       console.error(`[cf] cfFetch: fast path unavailable for ${url}, recovering session.`);
       if (!firstNav) {
-        response = await serializeNav(() => page.goto(url, { waitUntil: 'commit', timeout: 15000 }));
+        const nav = await navigate(allowDownload);
+        if ('download' in nav) return nav.download;
+        response = nav.response;
       }
 
       if (isChallenge(response)) {
@@ -273,19 +376,49 @@ export async function cfFetch(url: string, opts: FetchOptions = {}): Promise<str
 
       const retried = await tryFetch(page, url, init);
 
-      if (retried === null || isChallenge(retried) || isBlocked(retried.content)) {
+      // A challenge-gated file download can't be read by tryFetch's in-page
+      // fetch() once cross-origin (no CORS headers). With clearance now
+      // obtained, one more nav gives detection the chance it missed before.
+      if ((retried === null || isChallenge(retried)) && allowDownload) {
+        const nav = await navigate(true);
+        if ('download' in nav) return nav.download;
+      }
+
+      if (retried === null || isChallenge(retried) || isBlocked(Buffer.from(retried.base64, 'base64').toString('utf-8'))) {
         throw new Error(`cfFetch: fetch failed for ${url} even after session recovery.`);
       }
 
-      pageCache.set(cacheKey, retried.content);
-      return retried.content;
+      pageCache.set(cacheKey, retried.base64);
+      return { base64: retried.base64, filename: retried.filename };
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
       console.error(`[cf] recycling page for ${url} after failure: ${message}`);
-      recyclePage(page);
+      recyclePage(hostname, page);
       throw err;
     }
   });
+}
+
+// Mirrors fetch()'s Response shape, but not its laziness: the body is
+// already fully read and base64-encoded by the time this resolves, so
+// text()/buffer() can each be called any number of times. filename is only
+// set when the fetch actually had one (a Download or Content-Disposition).
+export interface CfResponse {
+  text(): Promise<string>;
+  buffer(): Promise<Buffer>;
+  filename?: string;
+}
+
+// Single entry point for everything cfFetch's callers need: a normal page's
+// HTML/JSON, or a raw file's bytes (a .torrent, in practice), auto-detected
+// rather than requiring the caller to know which in advance.
+export async function cfFetch(url: string, opts: FetchOptions = {}): Promise<CfResponse> {
+  const { base64, filename } = await fetchViaSession(url, opts);
+  return {
+    text: async () => Buffer.from(base64, 'base64').toString('utf-8'),
+    buffer: async () => Buffer.from(base64, 'base64'),
+    filename
+  };
 }
 
 export async function closeBrowser(): Promise<void> {

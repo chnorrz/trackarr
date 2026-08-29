@@ -1,0 +1,31 @@
+indexers:
+  # These 3 were built-in providers before trackarr went all-Cardigann -
+  # ext-to.yml is trackarr's own (not on Prowlarr, so no source:); 1337x
+  # and eztv are Prowlarr's own upstream definitions, fetched on demand.
+  ext-to:
+    definition: ext-to
+
+  1337x:
+    definition: 1337x
+    source: prowlarr:v11
+
+  eztv:
+    definition: eztv
+    source: prowlarr:v11
+
+  kickass:
+    definition: kickasstorrents-to
+    source: prowlarr:v11
+
+  thepiratebay:
+    definition: thepiratebay
+    source: prowlarr:v11
+    config:
+      apiurl: apibay.org
+      top100: recent
+
+  tpb-audio:
+    definition: thepiratebay
+    source: prowlarr:v11
+    config:
+      top100: "100"

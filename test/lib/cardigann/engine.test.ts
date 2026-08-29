@@ -1,0 +1,423 @@
+import { test } from 'node:test';
+import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
+
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+const ROOT = path.resolve(__dirname, '..', '..', '..');
+
+const { runSearchAll } = await import(path.join(ROOT, 'dist', 'lib', 'cardigann', 'engine.js'));
+const { validateDefinitionYaml } = await import(path.join(ROOT, 'dist', 'lib', 'cardigann', 'load.js'));
+
+function baseSearchCtx(overrides: Record<string, unknown> = {}) {
+  return { keywords: '', categories: [], offset: 0, limit: 50, config: {}, ...overrides };
+}
+
+// ---- HTML backend, synthetic minimal definition ----------------------------
+
+function minimalHtmlDefinition(searchOverrides: Record<string, unknown> = {}) {
+  return {
+    caps: {
+      categorymappings: [
+        { id: '1', cat: 'Movies', desc: 'Movies' },
+        { id: '2', cat: 'TV', desc: 'TV Shows' }
+      ]
+    },
+    search: {
+      rows: { selector: 'tr.row' },
+      fields: {
+        title: { selector: 'a.title' },
+        details: { selector: 'a.title', attribute: 'href' },
+        download: { selector: 'a.magnet', attribute: 'href' },
+        size: { selector: 'td.size' },
+        category: { selector: 'td.cat' },
+        seeders: { selector: 'td.seeds' },
+        leechers: { selector: 'td.leech' },
+        date: { selector: 'td.date' }
+      },
+      ...searchOverrides
+    }
+  };
+}
+
+const HTML_BODY = `
+<table><tbody>
+  <tr class="row">
+    <td><a class="title" href="/t/1">Ubuntu 24.04 Desktop</a></td>
+    <td class="cat">1</td>
+    <td class="size">1.5 GB</td>
+    <td class="seeds">50</td>
+    <td class="leech">3</td>
+    <td class="date">2024-01-15T10:00:00Z</td>
+    <td><a class="magnet" href="magnet:?xt=urn:btih:ABCDEF1234567890&dn=Ubuntu">m</a></td>
+  </tr>
+  <tr class="row">
+    <td><a class="title" href="/t/2">Some TV Show S01E01</a></td>
+    <td class="cat">2</td>
+    <td class="size">700 MB</td>
+    <td class="seeds">10</td>
+    <td class="leech">1</td>
+    <td class="date">2024-01-16T10:00:00Z</td>
+    <td><a class="magnet" href="magnet:?xt=urn:btih:1234567890ABCDEF&dn=TVShow">m</a></td>
+  </tr>
+</tbody></table>
+`;
+
+test('runSearch (HTML): full pipeline - rows, fields, size parsing, category mapping, magnet capture', () => {
+  const items = runSearchAll(minimalHtmlDefinition(), HTML_BODY, baseSearchCtx());
+  assert.equal(items.length, 2);
+
+  const first = items[0];
+  assert.equal(first.title, 'Ubuntu 24.04 Desktop');
+  assert.equal(first.detailUrl, '/t/1');
+  assert.equal(first.size, Math.round(1.5 * 1024 ** 3));
+  assert.equal(first.category, 'Movies');
+  assert.equal(first.seeds, 50);
+  assert.equal(first.leechers, 3);
+  // The definition's field is named "download" (even though its value is a
+  // magnet: URI) - it lands in item.download, not item.magnet, which is
+  // only populated by a field actually named "magnet".
+  assert.equal(first.download, 'magnet:?xt=urn:btih:ABCDEF1234567890&dn=Ubuntu');
+  assert.equal(first.pubDate.toISOString(), '2024-01-15T10:00:00.000Z');
+});
+
+test('runSearch (HTML): category falls back to Other when the tracker id has no mapping', () => {
+  const body = HTML_BODY.replace('<td class="cat">1</td>', '<td class="cat">999</td>');
+  const items = runSearchAll(minimalHtmlDefinition(), body, baseSearchCtx());
+  assert.equal(items[0].category, 'Other');
+});
+
+test('runSearch (HTML): search.rows.filters andmatch excludes rows not matching every keyword', () => {
+  const def = minimalHtmlDefinition({ rows: { selector: 'tr.row', filters: [{ name: 'andmatch' }] } });
+  const items = runSearchAll(def, HTML_BODY, baseSearchCtx({ keywords: 'ubuntu 24.04' }));
+  assert.equal(items.length, 1);
+  assert.equal(items[0].title, 'Ubuntu 24.04 Desktop');
+});
+
+test('runSearch (HTML): .Result chaining - a later field can reference an earlier field\'s already-extracted value', () => {
+  const def = minimalHtmlDefinition();
+  (def.search.fields as Record<string, unknown>).title = { selector: 'a.title' };
+  (def.search.fields as Record<string, unknown>).description = { text: 'Category was: {{ .Result.category }}' };
+  const items = runSearchAll(def, HTML_BODY, baseSearchCtx());
+  // .Result.category is the field's own raw extracted value ("1") - category
+  // NAME mapping (caps.categorymappings) happens once, after every field has
+  // been extracted, and is never written back into .Result for other fields
+  // to see. This matches real Cardigann: mapping is the consuming
+  // application's concern, not something the template/filter system exposes.
+  assert.equal(items[0].description, 'Category was: 1');
+});
+
+test('runSearch (HTML): a filter with a templated arg is rendered against .Result before being applied (the YTS pattern)', () => {
+  const def = minimalHtmlDefinition();
+  // Fields must be declared in this order - JS object key order is
+  // extraction order, and _year has to be extracted before title's filter
+  // can reference {{ .Result._year }}. Rebuilding the whole fields object
+  // (rather than assigning def.search.fields._year onto the existing one)
+  // is deliberate: assigning a new key to an existing object always appends
+  // it at the end regardless of where you write the assignment in source,
+  // which would put _year AFTER title and silently break this exact test.
+  (def.search as { fields: unknown }).fields = {
+    _year: { text: '2020' },
+    title: { selector: 'a.title', filters: [{ name: 'append', args: '.{{ .Result._year }}' }] }
+  };
+  const items = runSearchAll(def, HTML_BODY, baseSearchCtx());
+  assert.equal(items[0].title, 'Ubuntu 24.04 Desktop.2020');
+});
+
+test('runSearch (HTML): case block resolves downloadvolumefactor-style fields, skipping the filter chain', () => {
+  const def = minimalHtmlDefinition();
+  (def.search.fields as Record<string, unknown>).downloadvolumefactor = {
+    case: { 'a.magnet': '0', '*': '1' }
+  };
+  const items = runSearchAll(def, HTML_BODY, baseSearchCtx());
+  // Every row here has a.magnet, so both should resolve to "0" via case,
+  // captured only as ctx.Result - runSearchAll doesn't surface arbitrary fields
+  // beyond the known CardigannItem shape, so assert indirectly via a
+  // description field referencing it.
+  (def.search.fields as Record<string, unknown>).description = { text: 'dlvf={{ .Result.downloadvolumefactor }}' };
+  const items2 = runSearchAll(def, HTML_BODY, baseSearchCtx());
+  assert.equal(items2[0].description, 'dlvf=0');
+  void items;
+});
+
+// ---- bare (unquoted) YAML numeric scalars in text:/default:/case: --------
+//
+// The schema (definitions/schema.json's SelectorBlock) explicitly allows
+// text/default/case values to be `oneOf: [string, number]` - an unquoted
+// `text: 1` in a real definition (eztv.yml's own `category: {text: 1}`)
+// parses as a genuine JS number, not a string. Confirmed live: this used to
+// silently render as '' (renderTemplate() given a non-string returned '',
+// not the literal "1"), which broke eztv.yml's category mapping end to end
+// (fell through to "Other" instead of "TV"). These reproduce it directly
+// with the same non-string-typed JS values YAML.parse would produce.
+
+test('runSearch (HTML): a bare numeric text: field (e.g. `text: 1`, unquoted in YAML) renders its literal value, not empty', () => {
+  const def = minimalHtmlDefinition();
+  (def.search.fields as Record<string, unknown>).category = { text: 1 };
+  const items = runSearchAll(def, HTML_BODY, baseSearchCtx());
+  assert.equal(items[0].category, 'Movies', 'tracker id "1" (from the bare number) must still map via categorymappings');
+});
+
+test('runSearch (HTML): a bare numeric default: (optional field, no match) renders its literal value, not empty', () => {
+  const def = minimalHtmlDefinition();
+  (def.search.fields as Record<string, unknown>).poster = { selector: 'img.nonexistent', optional: true, default: 0 };
+  const items = runSearchAll(def, HTML_BODY, baseSearchCtx());
+  assert.equal(items[0].poster, '0');
+});
+
+test('runSearch (HTML): case: with bare numeric values (e.g. `case: {a.magnet: 0, "*": 1}`) resolves to the literal value, not empty', () => {
+  const def = minimalHtmlDefinition();
+  (def.search.fields as Record<string, unknown>).downloadvolumefactor = { case: { 'a.magnet': 0, '*': 1 } };
+  (def.search.fields as Record<string, unknown>).description = { text: 'dlvf={{ .Result.downloadvolumefactor }}' };
+  const items = runSearchAll(def, HTML_BODY, baseSearchCtx());
+  assert.equal(items[0].description, 'dlvf=0');
+});
+
+test('runSearch (JSON): case: with bare numeric values (thepiratebay.yml\'s own shape) resolves to the literal value, not empty', () => {
+  const def = minimalJsonDefinition();
+  (def.search.fields as Record<string, unknown>).downloadvolumefactor = { selector: 'freeleech', case: { 0: 1, 1: 0 } };
+  const items = runSearchAll(def, JSON_BODY, baseSearchCtx());
+  assert.equal(items[0].downloadvolumefactor, undefined); // not surfaced on CardigannItem directly
+  const withDesc = minimalJsonDefinition();
+  (withDesc.search.fields as Record<string, unknown>).downloadvolumefactor = { selector: 'freeleech', case: { 0: 1, 1: 0 } };
+  (withDesc.search.fields as Record<string, unknown>).description = { text: 'dlvf={{ .Result.downloadvolumefactor }}' };
+  const itemsWithDesc = runSearchAll(withDesc, JSON_BODY, baseSearchCtx());
+  assert.equal(itemsWithDesc[0].description, 'dlvf=1'); // freeleech:0 -> case 0 -> 1
+});
+
+test('runSearch (HTML): a filter arg array with a bare numeric element renders it, not empty', () => {
+  const def = minimalHtmlDefinition();
+  (def.search.fields as Record<string, unknown>).title = {
+    selector: 'a.title',
+    filters: [{ name: 'append', args: [0] }]
+  };
+  const items = runSearchAll(def, HTML_BODY, baseSearchCtx());
+  assert.equal(items[0].title, 'Ubuntu 24.04 Desktop0');
+});
+
+test('runSearch (HTML): optional + default supplies a value when the selector does not match', () => {
+  const def = minimalHtmlDefinition();
+  (def.search.fields as Record<string, unknown>).poster = { selector: 'img.nonexistent', optional: true, default: 'no-poster' };
+  const items = runSearchAll(def, HTML_BODY, baseSearchCtx());
+  assert.equal(items[0].poster, 'no-poster');
+});
+
+test('runSearch (HTML): a field with no match and no default resolves to empty, not an error', () => {
+  const def = minimalHtmlDefinition();
+  const items = runSearchAll(def, HTML_BODY, baseSearchCtx());
+  assert.equal(items[0].imdbid, undefined);
+});
+
+test('runSearch (HTML): an unparseable date field falls back to "now", not a crash', () => {
+  const body = HTML_BODY.replace('2024-01-15T10:00:00Z', 'not-a-real-date');
+  const items = runSearchAll(minimalHtmlDefinition(), body, baseSearchCtx());
+  const delta = Math.abs(items[0].pubDate.getTime() - Date.now());
+  assert.ok(delta < 5000, 'pubDate should fall back to approximately now');
+});
+
+test('runSearch (HTML): a row that fails to match at all is simply excluded, not fatal for the rest', () => {
+  const items = runSearchAll(minimalHtmlDefinition(), '<table><tbody></tbody></table>', baseSearchCtx());
+  assert.deepEqual(items, []);
+});
+
+// ---- search.vars (.Vars.*) --------------------------------------------------
+
+test('runSearch (HTML): search.vars is extracted once per response, from anywhere in the page, and reused by every row', () => {
+  const def = minimalHtmlDefinition();
+  (def.search as Record<string, unknown>).vars = { token: { selector: 'meta[name=csrf-token]', attribute: 'content' } };
+  (def.search.fields as Record<string, unknown>).description = { text: 'token={{ .Vars.token }}' };
+  const body = `<html><head><meta name="csrf-token" content="page-tok"></head><body>${HTML_BODY}</body></html>`;
+  const items = runSearchAll(def, body, baseSearchCtx());
+  assert.equal(items.length, 2);
+  assert.equal(items[0].description, 'token=page-tok');
+  assert.equal(items[1].description, 'token=page-tok');
+});
+
+test('runSearch (HTML): a var with no match and no default resolves to empty, not an error', () => {
+  const def = minimalHtmlDefinition();
+  (def.search as Record<string, unknown>).vars = { token: { selector: 'meta[name=nonexistent]', attribute: 'content' } };
+  (def.search.fields as Record<string, unknown>).description = { text: 'token=[{{ .Vars.token }}]' };
+  const items = runSearchAll(def, HTML_BODY, baseSearchCtx());
+  assert.equal(items[0].description, 'token=[]');
+});
+
+test('runSearch (HTML): .Now is bound once per response - every row sees the exact same value', () => {
+  const def = minimalHtmlDefinition();
+  (def.search.fields as Record<string, unknown>).description = { text: '{{ .Now }}' };
+  const items = runSearchAll(def, HTML_BODY, baseSearchCtx());
+  assert.equal(items.length, 2);
+  assert.match(items[0].description as string, /^\d+$/);
+  assert.equal(items[0].description, items[1].description);
+});
+
+test('runSearch (JSON): search.vars reads from the parsed root, alongside the row array', () => {
+  const def = minimalJsonDefinition();
+  (def.search as Record<string, unknown>).vars = { token: { selector: 'meta.token' } };
+  (def.search.fields as Record<string, unknown>).details = { text: '{{ .Vars.token }}/{{ .Result._id }}' };
+  const body = JSON.stringify({ meta: { token: 'json-tok' }, results: JSON.parse(JSON_BODY) });
+  (def.search.rows as Record<string, unknown>).selector = 'results';
+  const items = runSearchAll(def, body, baseSearchCtx());
+  assert.equal(items[0].detailUrl, 'json-tok/42');
+});
+
+// ---- JSON backend, synthetic minimal definition -----------------------------
+
+function minimalJsonDefinition() {
+  return {
+    caps: {
+      categorymappings: [{ id: '201', cat: 'Movies', desc: 'Movies' }]
+    },
+    search: {
+      response: { type: 'json' as const },
+      rows: { selector: '$' },
+      fields: {
+        _id: { selector: 'id' },
+        title: { selector: 'name' },
+        details: { text: 'https://example.test/browse/{{ .Result._id }}' },
+        category: { selector: 'category' },
+        size: { selector: 'size' },
+        seeders: { selector: 'seeders' },
+        leechers: { selector: 'leechers' },
+        infohash: { selector: 'info_hash' },
+        downloadvolumefactor: { selector: 'freeleech', case: { '0': '1', '1': '0' } }
+      }
+    }
+  };
+}
+
+const JSON_BODY = JSON.stringify([
+  { id: '42', name: 'Some Linux ISO', category: '201', size: 1610612736, seeders: 88, leechers: 4, info_hash: 'A1B2C3', freeleech: 0 },
+  { id: '43', name: 'Another Release', category: '999', size: 512, seeders: 1, leechers: 0, info_hash: 'DEADBEEF', freeleech: 1 }
+]);
+
+test('runSearch (JSON): full pipeline - $-rooted rows, numeric category mapping, templated details from .Result._id', () => {
+  const items = runSearchAll(minimalJsonDefinition(), JSON_BODY, baseSearchCtx());
+  assert.equal(items.length, 2);
+
+  const first = items[0];
+  assert.equal(first.title, 'Some Linux ISO');
+  assert.equal(first.detailUrl, 'https://example.test/browse/42');
+  assert.equal(first.category, 'Movies');
+  assert.equal(first.size, 1610612736);
+  assert.equal(first.seeds, 88);
+  assert.equal(first.infohash, 'A1B2C3');
+
+  assert.equal(items[1].category, 'Other'); // 999 has no mapping
+});
+
+test('runSearch (JSON): case-block downloadvolumefactor resolves by value equality against a sibling field', () => {
+  const def = minimalJsonDefinition();
+  (def.search.fields as Record<string, unknown>).description = { text: 'dlvf={{ .Result.downloadvolumefactor }}' };
+  const items = runSearchAll(def, JSON_BODY, baseSearchCtx());
+  assert.equal(items[0].description, 'dlvf=1'); // freeleech:0 -> case "0" -> "1"
+  assert.equal(items[1].description, 'dlvf=0'); // freeleech:1 -> case "1" -> "0"
+});
+
+test('runSearch (JSON): count.selector resolving falsy short-circuits to zero results', () => {
+  const def = minimalJsonDefinition();
+  (def.search.rows as { count?: unknown }).count = { selector: '$[0].id' };
+  const items = runSearchAll(def, '[]', baseSearchCtx());
+  assert.deepEqual(items, []);
+});
+
+// ---- End-to-end against the real, checked-in faketracker.yml fixture ------
+
+test('runSearchAll: end to end against the real, checked-in faketracker.yml fixture (mechanics, not live-site fidelity)', () => {
+  const raw = fs.readFileSync(path.join(ROOT, 'test', 'fixtures', 'cardigann', 'faketracker.yml'), 'utf8');
+  const result = validateDefinitionYaml(raw);
+  assert.equal(result.ok, true, JSON.stringify(result.ok === false ? result.errors : null));
+
+  // Synthetic HTML built to match the fixture's own selectors
+  // (table.data > tbody > tr:has(a[href^="magnet:?xt="]), a.cellMainLink,
+  // span > strong, td.timeago, td:nth-child(N)) - this proves the ENGINE
+  // correctly executes a real definition's selector/filter syntax, without
+  // depending on any live tracker's actual markup.
+  const body = `
+    <table class="data"><tbody>
+      <tr>
+        <td>
+          <span><strong>&gt;Movies</strong></span>
+          <a class="cellMainLink" href="/torrent/123-ubuntu">Ubuntu 24.04 LTS Desktop</a>
+          <a href="magnet:?xt=urn:btih:ABCDEF1234567890&amp;dn=Ubuntu">magnet</a>
+        </td>
+        <td>1.5 GB</td>
+        <td>3 files</td>
+        <td class="timeago">2 hours and 1 day</td>
+        <td>50</td>
+        <td>5</td>
+      </tr>
+    </tbody></table>
+  `;
+
+  const items = runSearchAll(result.definition, body, baseSearchCtx({ keywords: 'ubuntu' }));
+  assert.equal(items.length, 1);
+
+  const item = items[0];
+  assert.equal(item.title, 'Ubuntu 24.04 LTS Desktop');
+  assert.equal(item.detailUrl, '/torrent/123-ubuntu');
+  // The fixture's own field is named "download", even though it selects a
+  // magnet: URI - it lands in item.download, not item.magnet.
+  assert.equal(item.download, 'magnet:?xt=urn:btih:ABCDEF1234567890&dn=Ubuntu');
+  assert.equal(item.size, Math.round(1.5 * 1024 ** 3));
+  assert.equal(item.seeds, 50);
+  assert.equal(item.leechers, 5);
+  assert.equal(item.category, 'Movies'); // via id "Movies" -> cat "Movies"
+  // timeago filter parsed "2 hours and 1 day" relative to real "now" -
+  // assert it landed roughly 26h in the past, not an exact instant.
+  const deltaMs = Date.now() - item.pubDate.getTime();
+  assert.ok(deltaMs > 25.5 * 3600 * 1000 && deltaMs < 26.5 * 3600 * 1000, `expected ~26h ago, got ${deltaMs}ms`);
+});
+
+// ---- preprocessingfilters / runSearchAll ------------------------------------
+
+test('search.preprocessingfilters run on the raw body before row parsing', () => {
+  // A bare <tr> soup with no wrapping <table> - HTML5 parsing rules would
+  // foster-parent (drop) it. prepend/append wrap it in a real table first,
+  // proving preprocessingfilters actually ran before selectDomRows().
+  const bareRows = `
+    <tr class="row"><td><a class="title" href="/t/1">Bare Row</a></td><td class="cat">1</td>
+      <td class="size">1 GB</td><td class="seeds">5</td><td class="leech">1</td><td class="date">2024-01-01</td>
+      <td><a class="magnet" href="magnet:?xt=urn:btih:AAA">m</a></td></tr>`;
+  const definition = minimalHtmlDefinition({
+    preprocessingfilters: [
+      { name: 'prepend', args: '<table><tbody>' },
+      { name: 'append', args: '</tbody></table>' }
+    ]
+  });
+
+  const items = runSearchAll(definition, bareRows, baseSearchCtx());
+  assert.equal(items.length, 1);
+  assert.equal(items[0].title, 'Bare Row');
+});
+
+test('runSearch (HTML): caps.categories object form is also read, not just categorymappings array form', () => {
+  const definition = {
+    caps: { categories: { '1': 'Movies', '2': 'TV' } },
+    search: minimalHtmlDefinition().search
+  };
+  const items = runSearchAll(definition, HTML_BODY, baseSearchCtx());
+  assert.equal(items[0].category, 'Movies');
+  assert.equal(items[1].category, 'TV');
+});
+
+test('runSearchAll ignores offset/limit entirely - slicing is adapter.ts\'s job, once across every path\'s concatenated results', () => {
+  const definition = minimalHtmlDefinition();
+  const all = runSearchAll(definition, HTML_BODY, baseSearchCtx({ offset: 0, limit: 1 }));
+  assert.equal(all.length, 2);
+});
+
+test('runSearch (HTML): search.rows.selector is itself a template, rendered against topCtx before matching', () => {
+  // Real precedent: Prowlarr's 1337x.yml (definition/prowlarr:v11) has a
+  // rows.selector that appends an optional :has(...) uploader filter
+  // driven off .Config.uploader.
+  const def = minimalHtmlDefinition({
+    rows: { selector: 'tr.row{{ if .Config.strict }}:has(.magnet[href*="ABCDEF1234567890"]){{ end }}' }
+  });
+  const withoutConfig = runSearchAll(def, HTML_BODY, baseSearchCtx());
+  assert.equal(withoutConfig.length, 2, 'empty .Config.strict renders the plain, unfiltered selector');
+
+  const withConfig = runSearchAll(def, HTML_BODY, baseSearchCtx({ config: { strict: 'True' } }));
+  assert.equal(withConfig.length, 1, 'non-empty .Config.strict renders the :has(...) clause, filtering rows');
+  assert.equal(withConfig[0].title, 'Ubuntu 24.04 Desktop');
+});

@@ -1,0 +1,133 @@
+---
+id: ext-to
+name: ext.to
+description: "ext.to is a Public torrent index for MOVIES / TV / MUSIC / GAMES / APPLICATIONS / BOOKS"
+language: en-US
+type: public
+encoding: UTF-8
+links:
+  - https://ext.to/
+
+caps:
+  categorymappings:
+    # The schema allows exactly one of category/categorydesc per definition
+    # (oneOf), so there's no separate fallback field - the category field's
+    # own regexp filter (below) does both jobs in one pass: return the full
+    # href for these six distinguished subcategories, else collapse to the
+    # bare top-level href. Covered end to end by
+    # test/lib/cardigann/ext-to-definition.test.ts.
+    - {id: "/books/audio-books/", cat: Audio/Audiobook}
+    - {id: "/books/ebooks/", cat: Books/EBook}
+    - {id: "/games/pc-games/", cat: PC/Games}
+    - {id: "/games/other-games/", cat: Console/Other}
+    - {id: "/applications/mac/", cat: PC/Mac}
+    - {id: "/applications/android/", cat: PC/Mobile-Android}
+    # Every other row collapses to its bare top-level href.
+    - {id: "/movies/", cat: Movies}
+    - {id: "/tv/", cat: TV}
+    - {id: "/anime/", cat: TV/Anime}
+    - {id: "/music/", cat: Audio}
+    - {id: "/books/", cat: Books}
+    - {id: "/games/", cat: PC/Games}
+    - {id: "/applications/", cat: PC}
+
+  modes:
+    search: [q]
+    tv-search: [q]
+    movie-search: [q]
+    music-search: [q]
+    book-search: [q]
+
+settings:
+  - name: info_flaresolverr
+    type: info_flaresolverr
+
+search:
+  paths:
+    - path: "browse/?{{ if .Keywords }}q={{ .Keywords }}{{ else }}sort=age&order=desc&age=4{{ end }}&page_size=100&page=1"
+    - path: "browse/?{{ if .Keywords }}q={{ .Keywords }}{{ else }}sort=age&order=desc&age=4{{ end }}&page_size=100&page=2"
+
+  # Extracted once per response, not once per row - every row's magnet POST
+  # needs the same page-level token/sessid. Never fetched separately: this
+  # search page is the ONLY page that ever carries window.searchPageToken -
+  # confirmed live, the item's own permalink page does not have it (see
+  # NOTES.md).
+  vars:
+    token:
+      selector: 'script:contains("searchPageToken")'
+      filters:
+        - name: regexp
+          args: "searchPageToken\\s*=\\s*'([^']+)'"
+    sessid:
+      selector: 'meta[name="csrf-token"]'
+      attribute: content
+
+  rows:
+    selector: table.search-table > tbody > tr
+
+  fields:
+    # Takes the row's most-specific category link, then collapses it down to
+    # a known categorymappings id: kept as-is for the six distinguished
+    # subcategories, else truncated to just the leading /segment/.
+    category:
+      selector: '.related-posted a[href^="/"]:not([href^="/user/"]):last'
+      attribute: href
+      filters:
+        - name: regexp
+          args: "^(/books/audio-books/|/books/ebooks/|/games/pc-games/|/games/other-games/|/applications/mac/|/applications/android/|/[^/]+/)"
+    title:
+      selector: a.torrent-title-link
+    details:
+      selector: a.torrent-title-link
+      attribute: href
+    # The row's own numeric torrent id, needed below to compute the HMAC.
+    # Must be declared before `download` - fields render in declaration
+    # order, and download's text: template reads .Result._id.
+    _id:
+      selector: 'a.search-magnet-btn[data-id]'
+      attribute: data-id
+    # No per-item link exists at all (magnets are resolved via a signed AJAX
+    # POST) - the full signed request is built right here instead, from this
+    # response's own .Vars.token/.Vars.sessid plus the row's own _id and
+    # .Now. download: block below just replays it as a POST body - no
+    # further page fetch happens at grab time.
+    download:
+      text: "{{ .Config.sitelink }}ajax/getSearchMagnet.php?torrent_id={{ .Result._id }}&hash=&name=&timestamp={{ .Now }}&hmac={{ sha256 (concat .Result._id \"|\" .Now \"|\" .Vars.token) }}&sessid={{ .Vars.sessid }}"
+    size:
+      selector: "td:nth-child(2) span:last-child"
+    date:
+      selector: "td:nth-child(4) span:last-child"
+      attribute: title
+    seeders:
+      selector: "td:nth-child(5) span:last-child"
+    leechers:
+      selector: "td:nth-child(6) span:last-child"
+    downloadvolumefactor:
+      text: 0
+    uploadvolumefactor:
+      text: 1
+
+# fields.download (above) already IS the fully-signed AJAX request, as a
+# GET-shaped URL captured at search time. This block just replays its own
+# query params as a POST body against its own path - the API requires POST,
+# confirmed live, and does not accept the request as a plain GET. No fetch
+# happens here at all: .DownloadUri.Query.* reads straight from the
+# captured URL, so a grab is exactly one HTTP request, same as the API call
+# itself.
+download:
+  headers:
+    X-Requested-With: [XMLHttpRequest]
+  before:
+    path: "{{ .DownloadUri.AbsolutePath }}"
+    method: post
+    allowEmptyInputs: true
+    inputs:
+      torrent_id: "{{ .DownloadUri.Query.torrent_id }}"
+      hash: "{{ .DownloadUri.Query.hash }}"
+      name: "{{ .DownloadUri.Query.name }}"
+      timestamp: "{{ .DownloadUri.Query.timestamp }}"
+      hmac: "{{ .DownloadUri.Query.hmac }}"
+      sessid: "{{ .DownloadUri.Query.sessid }}"
+  selectors:
+    - selector: "$.url"
+      usebeforeresponse: true

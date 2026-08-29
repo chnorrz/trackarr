@@ -5,17 +5,23 @@
   "type": "module",
   "main": "dist/server.js",
   "scripts": {
-    "build": "tsc",
+    "build": "tsc && node scripts/copy-assets.mjs",
     "start": "node dist/server.js",
     "lint": "eslint .",
     "test": "npm run build && node --experimental-test-module-mocks --test \"test/**/*.test.ts\"",
-    "typecheck": "tsc --noEmit -p tsconfig.test.json"
+    "typecheck": "tsc --noEmit -p tsconfig.test.json",
+    "validate:definitions": "npm run build && node dist/lib/cardigann/cli.js",
+    "validate:config": "npm run build && node dist/lib/cardigann/config-cli.js"
   },
   "dependencies": {
+    "ajv": "^8.20.0",
+    "ajv-formats": "^3.0.1",
     "camoufox-js": "^0.12.0",
     "cheerio": "^1.0.0",
     "express": "^5.2.1",
-    "playwright-core": "<1.61.0"
+    "fast-json-patch": "^3.1.1",
+    "playwright-core": "<1.61.0",
+    "yaml": "^2.9.0"
   },
   "devDependencies": {
     "@eslint/js": "^10.0.1",
