@@ -228,13 +228,19 @@ ${rows}
 
   function renderCamoufox(c) {
     if (!c.running) return 'Not running';
+    var totalLabel = c.totalPssBytes !== null
+      ? formatBytes(c.totalPssBytes) + ' PSS (' + formatBytes(c.totalRssBytes) + ' RSS)'
+      : formatBytes(c.totalRssBytes) + ' RSS (PSS unavailable)';
     var procList = c.processes
       .slice()
       .sort(function (a, b) { return b.rssBytes - a.rssBytes; })
-      .map(function (p) { return 'pid ' + p.pid + ': ' + formatBytes(p.rssBytes); })
+      .map(function (p) {
+        var mem = p.pssBytes !== null ? formatBytes(p.pssBytes) + ' pss' : formatBytes(p.rssBytes) + ' rss';
+        return 'pid ' + p.pid + ' (' + p.role + '): ' + mem;
+      })
       .join(', ');
     return 'Running &middot; ' + c.processCount + ' process' + (c.processCount === 1 ? '' : 'es') +
-      ' &middot; ' + formatBytes(c.totalRssBytes) + ' total' +
+      ' &middot; ' + totalLabel +
       '<div class="proc-list">' + escapeHtml(procList) + '</div>';
   }
 

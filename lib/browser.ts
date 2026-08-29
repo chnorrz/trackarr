@@ -114,6 +114,10 @@ async function launchSession(): Promise<BrowserSession> {
     ? { 'network.proxy.type': 2, 'network.proxy.autoconfig_url': pacDataUri }
     : undefined;
 
+  // Logged so the effective prefs used for a memory-optimization pass are a
+  // fact, not an assumption - see /status.json for what they cost in RAM.
+  console.error(`[camoufox] effective firefox_user_prefs: ${JSON.stringify(firefoxPrefs ?? {})}`);
+
   // Keep the argument as one object literal: Camoufox()'s return type is
   // generic on user_data_dir, and hoisting it to a variable loses that.
   const browser = await Camoufox({ headless, os, window: WINDOW_SIZE, firefox_user_prefs: firefoxPrefs });

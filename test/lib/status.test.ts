@@ -7,7 +7,7 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.resolve(__dirname, '..', '..');
 const { ProviderStatusTracker, renderStatusPage, buildStatusJson } = await import(path.join(ROOT, 'dist', 'lib', 'status.js'));
 
-const NOT_RUNNING = { running: false, processCount: 0, totalRssBytes: 0, processes: [] };
+const NOT_RUNNING = { running: false, processCount: 0, totalRssBytes: 0, totalPssBytes: null, processes: [] };
 
 function fakeProvider(id: string, name: string) {
   return { id, name, search: async () => [], resolveMagnet: async () => '' };
@@ -199,7 +199,13 @@ test('buildStatusJson includes every provider with its id, name, state and stats
 
 test('buildStatusJson passes the camoufox snapshot through unchanged', () => {
   const tracker = new ProviderStatusTracker();
-  const camoufox = { running: true, processCount: 3, totalRssBytes: 123456, processes: [{ pid: 1, rssBytes: 123456 }] };
+  const camoufox = {
+    running: true,
+    processCount: 3,
+    totalRssBytes: 123456,
+    totalPssBytes: 98765,
+    processes: [{ pid: 1, rssBytes: 123456, pssBytes: 98765, role: 'parent' }]
+  };
   const json = buildStatusJson({}, tracker, camoufox);
   assert.deepEqual(json.camoufox, camoufox);
 });

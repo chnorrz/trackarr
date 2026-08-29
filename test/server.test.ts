@@ -478,7 +478,7 @@ test('GET / request stats count a failed search separately from successes', asyn
   }, { statusTracker });
 });
 
-const NOT_RUNNING = { running: false, processCount: 0, totalRssBytes: 0, processes: [] };
+const NOT_RUNNING = { running: false, processCount: 0, totalRssBytes: 0, totalPssBytes: null, processes: [] };
 
 test('GET /status.json needs no apikey and returns a JSON document listing every provider', async () => {
   await withServer({ fake: fakeProvider() }, async (base) => {
@@ -510,9 +510,10 @@ test('GET /status.json surfaces the injected camoufox memory usage snapshot', as
     running: true,
     processCount: 2,
     totalRssBytes: 200 * 1024 * 1024,
+    totalPssBytes: 180 * 1024 * 1024,
     processes: [
-      { pid: 111, rssBytes: 150 * 1024 * 1024 },
-      { pid: 112, rssBytes: 50 * 1024 * 1024 }
+      { pid: 111, rssBytes: 150 * 1024 * 1024, pssBytes: 135 * 1024 * 1024, role: 'parent' },
+      { pid: 112, rssBytes: 50 * 1024 * 1024, pssBytes: 45 * 1024 * 1024, role: 'tab' }
     ]
   };
   await withServer({ fake: fakeProvider() }, async (base) => {
