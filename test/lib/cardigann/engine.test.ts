@@ -95,6 +95,14 @@ test('runSearch (HTML): search.rows.filters andmatch excludes rows not matching 
   assert.equal(items[0].title, 'Ubuntu 24.04 Desktop');
 });
 
+test('runSearch (HTML): andmatch matches the raw query, not keywords rewritten by keywordsfilters', () => {
+  const def = minimalHtmlDefinition({ rows: { selector: 'tr.row', filters: [{ name: 'andmatch' }] } });
+  // EZTV's keywordsfilters turn spaces into dashes for its search URL.
+  const items = runSearchAll(def, HTML_BODY, baseSearchCtx({ keywords: 'ubuntu-24.04', query: { Keywords: 'ubuntu 24.04' } }));
+  assert.equal(items.length, 1);
+  assert.equal(items[0].title, 'Ubuntu 24.04 Desktop');
+});
+
 test('runSearch (HTML): .Result chaining - a later field can reference an earlier field\'s already-extracted value', () => {
   const def = minimalHtmlDefinition();
   (def.search.fields as Record<string, unknown>).title = { selector: 'a.title' };
