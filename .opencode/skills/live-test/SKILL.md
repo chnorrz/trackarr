@@ -187,7 +187,7 @@ Classify before acting. Only one of these is a proxy problem.
 Container logs carry the detail the XML does not:
 
 ```bash
-docker logs trackarr-live 2>&1 | rg -i 'error|blocked|challenge|recycling' | tail -20
+docker logs trackarr-live 2>&1 | rg -i 'error|blocked|challenge|resetting|recycling' | tail -20
 ```
 
 ## 6. tinyproxy fallback — only for a 1006 hard block

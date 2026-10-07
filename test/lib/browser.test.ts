@@ -12,7 +12,14 @@ process.env.PROXY_URL = 'http://fake-proxy.invalid:8888';
 process.env.DOMAIN_OVER_PROXY = 'proxy-test.example';
 
 let gotoFails = false;
+// Fails only the next N non-blank navigations, for one-off failures.
+let gotoFailuresLeft = 0;
+// A wedged page cannot even load about:blank.
+let resetFails = false;
+// Leaving a challenge page: goto('about:blank') rejects but the page got there.
+let resetRejectsButLands = false;
 let pageCloses = 0;
+let pageResets = 0;
 
 // Tracks overlap of evaluate() calls across pages, to prove (or disprove)
 // that two cfFetch() operations for the same hostname never run at once.
@@ -69,6 +76,7 @@ const FAKE_DOWNLOAD_EVENT_TIMEOUT_MS = 30;
 // reused object would be found under every hostname at once.
 const createFakePage = () => {
   const downloadWaiters: Array<(d: FakeDownload) => void> = [];
+  let currentUrl = 'about:blank';
 
   return {
     isClosed: () => false,
@@ -89,13 +97,29 @@ const createFakePage = () => {
         filename: evaluateFilename
       };
     },
-    url: () => 'about:blank',
+    url: () => currentUrl,
     goto: async (url: string) => {
+      if (url === 'about:blank') {
+        if (resetFails) throw new Error('page.goto: Timeout 5000ms exceeded.');
+        currentUrl = url;
+        pageResets++;
+        if (resetRejectsButLands) {
+          throw new Error('page.goto: Navigation to "about:blank" is interrupted by another navigation to "about:blank"');
+        }
+        return null;
+      }
       gotoUrls.push(url);
-      if (gotoFails) throw new Error('page.goto: Timeout 15000ms exceeded.');
+      if (gotoFails || gotoFailuresLeft > 0) {
+        gotoFailuresLeft = Math.max(0, gotoFailuresLeft - 1);
+        // A failed navigation still leaves the page on the target, as a
+        // stuck challenge page would.
+        currentUrl = url;
+        throw new Error('page.goto: Timeout 15000ms exceeded.');
+      }
 
       if (url === challengeOnFirstGotoFor && !challengedUrls.has(url)) {
         challengedUrls.add(url);
+        currentUrl = url;
         return { headers: () => ({ 'cf-mitigated': 'challenge' }), status: () => 200 };
       }
 
@@ -119,6 +143,7 @@ const createFakePage = () => {
       }
 
       if (url === gotoDownloadStartingFor) throw new Error('page.goto: Download is starting');
+      currentUrl = url;
       return { headers: () => ({}), status: () => 200 };
     },
     // Fake stand-in for Playwright's real page.waitForEvent('download', ...):
@@ -227,20 +252,74 @@ test('concurrent cfFetch calls for the same new hostname only create one page', 
   assert.equal(camoufoxCalls, 1);
 });
 
-test('a page that failed is thrown away instead of being handed to the next caller', async () => {
+test('a failed page that resets to about:blank is kept, not closed', async () => {
+  newPageCalls = 0;
+  pageCloses = 0;
+  pageResets = 0;
+
+  gotoFails = true;
+  await assert.rejects(
+    cfFetch('https://reset-test.example/one'),
+    /Timeout 15000ms/,
+    'the original failure must still reach the caller'
+  );
+  gotoFails = false;
+  assert.equal(pageResets, 1);
+  assert.equal(pageCloses, 0, 'closing a page leaks its window in Camoufox, so a resettable page must stay open');
+
+  const recovered = await (await cfFetch('https://reset-test.example/two')).text();
+
+  assert.equal(recovered, '<html><body>cleared, not a challenge</body></html>');
+  assert.equal(newPageCalls, 1, 'the reset page must be reused, not replaced');
+});
+
+test('a reset that rejects but still lands on about:blank keeps the page', async () => {
   newPageCalls = 0;
   pageCloses = 0;
 
   gotoFails = true;
+  resetRejectsButLands = true;
+  await assert.rejects(cfFetch('https://interrupted-reset-test.example/one'), /Timeout 15000ms/);
+  gotoFails = false;
+  resetRejectsButLands = false;
+  assert.equal(pageCloses, 0, 'Playwright reports leaving a challenge page as interrupted although it worked');
+
+  await cfFetch('https://interrupted-reset-test.example/two');
+  assert.equal(newPageCalls, 1);
+});
+
+test('a call queued behind a failing call for the same hostname still succeeds', async () => {
+  newPageCalls = 0;
+  pageCloses = 0;
+
+  gotoFailuresLeft = 1;
+  const [first, second] = await Promise.allSettled([
+    cfFetch('https://cascade-test.example/one'),
+    cfFetch('https://cascade-test.example/two')
+  ]);
+
+  assert.equal(first.status, 'rejected');
+  assert.equal(second.status, 'fulfilled', 'one failure must not fail every call already queued for that hostname');
+  assert.equal(pageCloses, 0);
+  assert.equal(newPageCalls, 1);
+});
+
+test('a wedged page that cannot reset is thrown away instead of being handed to the next caller', async () => {
+  newPageCalls = 0;
+  pageCloses = 0;
+
+  gotoFails = true;
+  resetFails = true;
   await assert.rejects(
     cfFetch('https://wedge-test.example/one'),
     /Timeout 15000ms/,
     'the original failure must still reach the caller'
   );
   assert.equal(newPageCalls, 1);
-  assert.equal(pageCloses, 1, 'the failed page must be closed, not left open');
+  assert.equal(pageCloses, 1, 'the wedged page must be closed, not left open');
 
   gotoFails = false;
+  resetFails = false;
   const recovered = await (await cfFetch('https://wedge-test.example/two')).text();
 
   assert.equal(recovered, '<html><body>cleared, not a challenge</body></html>');
