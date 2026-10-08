@@ -174,7 +174,11 @@ export function runSearchAll(definition: Record<string, unknown>, body: string, 
         }
         if (f.name === 'andmatch') {
           const maxLength = f.args === undefined ? undefined : Number(Array.isArray(f.args) ? f.args[0] : f.args);
-          return andMatch(text, searchCtx.keywords, maxLength);
+          // The raw query, not .Keywords: keywordsfilters rewrite the query
+          // for the site's URL (EZTV turns "breaking bad" into
+          // "breaking-bad"), which no row would contain. Prowlarr also
+          // matches against the raw search term.
+          return andMatch(text, searchCtx.query?.Keywords ?? searchCtx.keywords, maxLength);
         }
         return true;
       });
