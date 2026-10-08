@@ -656,3 +656,62 @@ can regress): the same hand-built fixture the old hand-written
 instead. Hand-written `providers/{ext-to,1337x,eztv}.ts` (and
 `lib/paging.ts`, only ever used by them) are gone - every indexer is
 Cardigann-driven and config-declared (section 1).
+
+## 18. Closing a page leaks its whole browser window
+
+**Symptom.** After 3.5 days of uptime the Camoufox parent process sat at
+3.4 GB resident, and Cloudflare challenges failed more and more often.
+Content processes (the tabs) were all small, 50-160 MB each.
+
+**How it was measured.** Firefox on Linux writes a full `about:memory`
+report for every process when the parent gets `SIGRTMIN` (signal 34). No
+pref and no restart needed:
+
+```bash
+docker exec trackarr sh -c 'kill -34 <parent pid>'   # pid from the status page
+docker exec trackarr sh -c 'ls -t /tmp/unified-memory-report-*.json.gz | head -1'
+```
+
+Note the `unified-` prefix. Read it with `about:memory` → Load, or with a
+script over `json.load(gzip.open(...))['reports']`.
+
+**What it showed** (parent process):
+
+- `window-objects/top(none)/detached`: **1712 MB in 338 detached
+  `browser.xhtml` windows**, about 5 MB each. In Juggler every page is its
+  own top-level browser window (`TargetRegistry._newPageInternal` calls
+  `Services.ww.openWindow`), and `page.close()` closes that window. The
+  window is then never freed.
+- About 450 MB of strings in Juggler's JSM global, including 1.4 MB
+  response bodies with `copies=32`. That is Juggler's `ResponseStorage`
+  (`NetworkObserver.js`, up to 100 MB of response bodies per page, kept
+  for `getResponseBody`), held alive with the leaked windows.
+
+The logs had 1741 `recycling page` lines over the same uptime: section 15's
+`recyclePage()` closed a page on every failure. Many hit an already-closed
+page, because the page was looked up *before* waiting on `serializeHost`.
+One failure closed the page under every call queued for that hostname,
+each of those failed and recycled too, and each replacement page had to
+navigate (and often solve) from scratch.
+
+**The fix.** In `fetchViaSession()` (behind `cfFetch()`):
+
+- A failed page is reset with `goto('about:blank')` (5s timeout) and kept.
+  It is only closed when even that fails, which is the genuinely wedged tab
+  from section 15. Those closes still leak a window, but are rare; look for
+  `[cf] recycling page, it could not reset` in the logs.
+- The persistent page is looked up inside `serializeHost`, so a queued call
+  gets the page as the previous call left it.
+- Leaving a Cloudflare challenge page, `goto('about:blank')` often rejects
+  with `interrupted by another navigation to "about:blank"` although the
+  page did get there. The reset therefore checks `page.url()` before giving
+  up; without that, every failed solve would still close its page.
+
+Verified live in the container, with a memory dump after each scenario:
+plain `newPage` + `close` x10 left 0 detached windows; closing a page parked
+on an unsolved 1337x challenge left 3 of 5; closing mid-navigation left 1 of
+5. Ten `cfFetch` failures with the fix left 0 and reused one page.
+
+Since pages now live much longer, each one holds up to 100 MB of
+`ResponseStorage`. That is bounded per page, so it is a fixed cost per
+hostname, not a leak.

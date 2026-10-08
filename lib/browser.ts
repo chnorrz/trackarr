@@ -181,6 +181,23 @@ function recyclePage(hostname: string, page: Page): void {
   void page.close().catch(() => {});
 }
 
+const RESET_TIMEOUT_MS = 5000;
+
+// Closing a page leaks its whole browser window in Camoufox's Juggler
+// (NOTES.md section 18), so a failed page is reset in place and only closed
+// if it is wedged badly enough that it cannot even load about:blank.
+async function resetOrRecyclePage(hostname: string, page: Page): Promise<void> {
+  try {
+    await page.goto('about:blank', { timeout: RESET_TIMEOUT_MS });
+  } catch (err) {
+    // Leaving a Cloudflare challenge page often rejects with "interrupted by
+    // another navigation to about:blank" even though the page did get there.
+    if (!page.isClosed() && page.url() === 'about:blank') return;
+    console.error(`[cf] recycling page, it could not reset: ${(err as Error).message}`);
+    recyclePage(hostname, page);
+  }
+}
+
 // Body always read as base64 via res.blob() + FileReader.readAsDataURL(),
 // not res.arrayBuffer(): Firefox's Xray wrappers (the boundary
 // page.evaluate()'s injected code runs under) forbid reading TypedArray
@@ -311,26 +328,29 @@ async function fetchViaSession(url: string, opts: FetchOptions): Promise<{ base6
   if (cached !== undefined) return { base64: cached };
 
   const hostname = new URL(url).hostname;
-  const page = await getOrCreatePersistentPage(hostname);
-  await applyCookieHeader(page, hostname, headers);
-
   const allowDownload = method === 'GET' && !body;
-
-  // A download's bytes ARE the response - nothing left to fetch, and (like
-  // resolveMagnet's own choice for a Cardigann torrent) not worth caching.
-  const navigate = async (allow: boolean): Promise<{ download: { base64: string; filename?: string } } | { response: PlaywrightResponse | null }> => {
-    const nav = await serializeNav(() => navigateOrDownload(page, url, allow));
-    if (nav.kind === 'download') {
-      warnDroppedDownloadHeaders(url, headers);
-      return { download: { base64: nav.base64, filename: nav.filename } };
-    }
-    return { response: nav.response };
-  };
 
   // Exclusive per hostname: a second call for the same page must wait for
   // this one to finish, not interleave its own goto()/solveChallenge() with it.
+  // The page is looked up inside the lock, so a queued call gets the page as
+  // the previous call left it, not one that call has since closed.
   return serializeHost(hostname)(async () => {
+    const page = await getOrCreatePersistentPage(hostname);
+
+    // A download's bytes ARE the response - nothing left to fetch, and (like
+    // resolveMagnet's own choice for a Cardigann torrent) not worth caching.
+    const navigate = async (allow: boolean): Promise<{ download: { base64: string; filename?: string } } | { response: PlaywrightResponse | null }> => {
+      const nav = await serializeNav(() => navigateOrDownload(page, url, allow));
+      if (nav.kind === 'download') {
+        warnDroppedDownloadHeaders(url, headers);
+        return { download: { base64: nav.base64, filename: nav.filename } };
+      }
+      return { response: nav.response };
+    };
+
     try {
+      await applyCookieHeader(page, hostname, headers);
+
       let firstNav = false;
       let response: PlaywrightResponse | null = null;
 
@@ -392,8 +412,8 @@ async function fetchViaSession(url: string, opts: FetchOptions): Promise<{ base6
       return { base64: retried.base64, filename: retried.filename };
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
-      console.error(`[cf] recycling page for ${url} after failure: ${message}`);
-      recyclePage(hostname, page);
+      console.error(`[cf] resetting page for ${url} after failure: ${message}`);
+      await resetOrRecyclePage(hostname, page);
       throw err;
     }
   });
