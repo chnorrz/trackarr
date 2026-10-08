@@ -715,3 +715,26 @@ on an unsolved 1337x challenge left 3 of 5; closing mid-navigation left 1 of
 Since pages now live much longer, each one holds up to 100 MB of
 `ResponseStorage`. That is bounded per page, so it is a fixed cost per
 hostname, not a leak.
+
+### Side effect: the solver clicked the wrong window
+
+Right after this fix shipped, every 1337x and kickass solve failed with
+`widget rendered and was clicked 11x but Cloudflare never let a navigation
+through`, while ext.to and EZTV (which rarely need a solve) stayed fine.
+
+Every page is its own top-level window, and under Xvfb with no window
+manager they all sit at the same spot, stacked in the order they were
+raised. The xdotool click goes to whichever window is on top at that
+point, which was usually another tracker's page. Before this fix, a failed
+page was closed and the retry opened a fresh window on top, which hid the
+problem. With one long-lived window per hostname, the window being solved
+is often underneath.
+
+`solveChallenge()` now calls `page.bringToFront()` before every click
+(Juggler's `activateAndRun` → `window.focus()`, which raises the window
+without a window manager). Before every click rather than once, because
+another hostname's navigation can restack the windows mid-solve.
+
+Reproduced live: solve 1337x, open kickass on top, clear cookies, solve
+1337x again. Without the raise, step 3 failed with "clicked 11x" in 2 of 2
+runs; with it, it cleared in about 7s with 2 clicks in 2 of 2.
