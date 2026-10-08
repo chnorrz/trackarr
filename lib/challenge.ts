@@ -221,6 +221,18 @@ async function getClearanceCookie(page: Page): Promise<string> {
   return value;
 }
 
+// Every page is its own top-level window, all stacked at the same spot on a
+// display with no window manager, so an X-level click lands on whichever one
+// was raised last. Raised before every click: another host's navigation can
+// restack the windows mid-solve.
+async function raiseWindow(page: Page): Promise<void> {
+  try {
+    await page.bringToFront();
+  } catch (error) {
+    console.error('[cf] could not raise the challenge window:', error);
+  }
+}
+
 // Deliberately never navigates: an own page.goto() here races Cloudflare's
 // post-solve redirect and hangs for the full goto timeout.
 export async function solveChallenge(page: Page): Promise<string> {
@@ -266,6 +278,7 @@ export async function solveChallenge(page: Page): Promise<string> {
         if (widget) {
           widgetSeen = true;
           clicks++;
+          await raiseWindow(page);
           await widget.clickOnce(pointer);
         }
         nextClickAt = Date.now() + (widget ? CLICK_COOLDOWN_MS : PROBE_INTERVAL_MS);

@@ -4,9 +4,10 @@ import express, { type Application, type Request, type Response } from 'express'
 import { closeBrowser, cfFetch } from './lib/browser.js';
 import { categoriesXml } from './lib/categories.js';
 import { TTLCache } from './lib/cache.js';
-import { ProviderStatusTracker, renderStatusPage } from './lib/status.js';
-import { providerMap } from './providers/index.js';
-import type { MagnetRef, Provider, SearchItem } from './lib/types.js';
+import { getCamoufoxMemoryUsage, type CamoufoxMemoryUsage } from './lib/processStats.js';
+import { ProviderStatusTracker, buildStatusJson, renderStatusPage } from './lib/status.js';
+import { buildProviderMap } from './providers/index.js';
+import type { MagnetRef, Provider, ResolvedDownload, SearchItem, SearchMode } from './lib/types.js';
 
 const PORT = process.env.PORT || 9117;
 const API_KEY = process.env.API_KEY || 'changeme';
@@ -44,15 +45,38 @@ function sendError(res: Response, code: number, description: string): void {
 <error code="${code}" description="${xmlEscape(description)}" />`);
 }
 
+// Torznab convention (confirmed against Prowlarr's own IndexerCapabilities.cs):
+// every element is always present, available="no" for an unsupported mode -
+// not omitted. music (Cardigann's own caps.modes key: music-search) renders
+// as <audio-search> - Newznab's own naming mismatch, not ours.
+const ALL_MODES: readonly SearchMode[] = ['search', 'tvsearch', 'movie', 'music', 'book'];
+const MODE_ELEMENT: Record<SearchMode, string> = {
+  search: 'search',
+  tvsearch: 'tv-search',
+  movie: 'movie-search',
+  music: 'audio-search',
+  book: 'book-search'
+};
+
+function isSearchMode(t: string | undefined): t is SearchMode {
+  return t !== undefined && (ALL_MODES as readonly string[]).includes(t);
+}
+
 function capsXml(provider: Provider): string {
+  const supported = new Set(provider.searchModes);
+  const searching = ALL_MODES
+    .map((mode) => {
+      const params = provider.searchParams[mode] ?? ['q'];
+      return `    <${MODE_ELEMENT[mode]} available="${supported.has(mode) ? 'yes' : 'no'}" supportedParams="${params.join(',')}" />`;
+    })
+    .join('\n');
+
   return `<?xml version="1.0" encoding="UTF-8"?>
 <caps>
   <server title="${xmlEscape(provider.name)}" strapline="${xmlEscape(provider.name)} Torznab proxy" />
   <limits max="${MAX_LIMIT}" default="${DEFAULT_LIMIT}" />
   <searching>
-    <search available="yes" supportedParams="q" />
-    <tv-search available="yes" supportedParams="q" />
-    <movie-search available="yes" supportedParams="q" />
+${searching}
   </searching>
   <categories>
 ${categoriesXml(provider.categories)}
@@ -64,12 +88,14 @@ export interface AppOptions {
   apiKey?: string;
   magnetCacheTtlMs?: number;
   statusTracker?: ProviderStatusTracker;
+  getCamoufoxMemoryUsage?: () => Promise<CamoufoxMemoryUsage>;
 }
 
 export function createApp(providers: Record<string, Provider>, opts: AppOptions = {}): Application {
   const apiKey = opts.apiKey ?? API_KEY;
-  const magnetCache = new TTLCache<string>(opts.magnetCacheTtlMs ?? MAGNET_CACHE_TTL_MS);
+  const magnetCache = new TTLCache<ResolvedDownload>(opts.magnetCacheTtlMs ?? MAGNET_CACHE_TTL_MS);
   const statusTracker = opts.statusTracker ?? new ProviderStatusTracker();
+  const camoufoxMemoryUsage = opts.getCamoufoxMemoryUsage ?? getCamoufoxMemoryUsage;
 
   function checkKey(req: Request, res: Response): boolean {
     if (queryString(req.query.apikey) !== apiKey) {
@@ -79,17 +105,21 @@ export function createApp(providers: Record<string, Provider>, opts: AppOptions 
     return true;
   }
 
-  async function resolveMagnet(provider: Provider, ref: MagnetRef): Promise<{ magnet: string; cached: boolean }> {
-    const cacheKey = `${provider.id}:${ref.id ?? ref.url}`;
-    const cachedMagnet = magnetCache.get(cacheKey);
-    if (cachedMagnet) {
+  async function resolveMagnet(provider: Provider, ref: MagnetRef): Promise<{ resolved: ResolvedDownload; cached: boolean }> {
+    const cacheKey = `${provider.id}:${ref.url}`;
+    const cachedResolved = magnetCache.get(cacheKey);
+    if (cachedResolved) {
       console.error(`[cache] magnet hit for ${provider.id} ${JSON.stringify(ref)}`);
-      return { magnet: cachedMagnet, cached: true };
+      return { resolved: cachedResolved, cached: true };
     }
 
-    const magnet = await provider.resolveMagnet(ref);
-    magnetCache.set(cacheKey, magnet);
-    return { magnet, cached: false };
+    const resolved = await provider.resolveMagnet(ref);
+    // Only cache a magnet: a .torrent file's bytes are fetched fresh and
+    // streamed straight through below, not cached here - same reasoning as
+    // adapter.ts's own magnetCache (a one-shot download, not worth the
+    // memory to hold onto).
+    if (resolved.kind === 'magnet') magnetCache.set(cacheKey, resolved);
+    return { resolved, cached: false };
   }
 
   function buildRss(req: Request, provider: Provider, items: SearchItem[], total: number): string {
@@ -98,7 +128,6 @@ export function createApp(providers: Record<string, Provider>, opts: AppOptions 
       .map((it) => {
         const downloadUrl =
           `${req.protocol}://${req.get('host')}/${provider.id}/download?apikey=${encodeURIComponent(apiKey)}` +
-          (it.id != null ? `&id=${it.id}` : '') +
           `&url=${encodeURIComponent(it.detailUrl)}`;
         const peers = it.seeds + it.leechers;
         return `  <item>
@@ -143,6 +172,11 @@ ${rows}
     res.type('html').send(renderStatusPage(providers, statusTracker));
   });
 
+  app.get('/status.json', async (_req: Request, res: Response) => {
+    const camoufox = await camoufoxMemoryUsage();
+    res.json(buildStatusJson(providers, statusTracker, camoufox));
+  });
+
   function getProvider(req: Request, res: Response): Provider | null {
     const provider = providers[req.params.provider as string];
     if (!provider) {
@@ -165,8 +199,15 @@ ${rows}
 
     if (!checkKey(req, res)) return;
 
-    if (t === 'search' || t === 'tvsearch' || t === 'movie') {
+    if (isSearchMode(t)) {
+      if (!provider.searchModes.includes(t)) {
+        sendError(res, 203, `Function not available: t=${t}`);
+        return;
+      }
+
       const q = queryString(req.query.q) || '';
+      const season = queryString(req.query.season);
+      const ep = queryString(req.query.ep);
       const catParam = queryString(req.query.cat);
       if (catParam && !/^\d+(,\d+)*$/.test(catParam)) {
         sendError(res, 201, 'Incorrect parameter: cat must be a comma-separated list of non-negative integers');
@@ -196,7 +237,7 @@ ${rows}
       limit = Math.min(limit, MAX_LIMIT);
 
       try {
-        const { items, total } = await provider.search(q, { categories, offset, limit });
+        const { items, total } = await provider.search(q, { categories, offset, limit, type: t, season, ep });
         statusTracker.recordRequest(provider.id, true);
         res.type('application/xml').send(buildRss(req, provider, items, total));
       } catch (err) {
@@ -217,18 +258,26 @@ ${rows}
 
     if (!checkKey(req, res)) return;
 
-    const idParam = queryString(req.query.id);
-    const id = idParam ? parseInt(idParam, 10) : null;
-    const url = queryString(req.query.url) || null;
-    if (!id && !url) {
-      sendError(res, 200, 'Missing parameter: id or url');
+    const url = queryString(req.query.url);
+    if (!url) {
+      sendError(res, 200, 'Missing parameter: url');
       return;
     }
 
     try {
-      const { magnet, cached } = await resolveMagnet(provider, { id, url });
+      const { resolved, cached } = await resolveMagnet(provider, { url });
       statusTracker.recordRequest(provider.id, true, { cached });
-      res.redirect(302, magnet);
+      if (resolved.kind === 'magnet') {
+        res.redirect(302, resolved.magnet);
+      } else {
+        // A real .torrent file: already fetched server-side (through the
+        // same Cloudflare-bypassed session a downstream client couldn't
+        // manage on its own), so the bytes are sent directly - not a
+        // redirect, which would just hand the client a URL it can't reach.
+        res.type('application/x-bittorrent');
+        res.set('Content-Disposition', `attachment; filename="${resolved.filename.replace(/"/g, '')}"`);
+        res.send(resolved.data);
+      }
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
       statusTracker.recordRequest(provider.id, false, { error: message });
@@ -257,7 +306,7 @@ async function warmProvider(provider: Provider, statusTracker: ProviderStatusTra
 
 let keepAliveTimer: ReturnType<typeof setTimeout> | null = null;
 
-function scheduleKeepAlive(statusTracker: ProviderStatusTracker): void {
+function scheduleKeepAlive(statusTracker: ProviderStatusTracker, providers: Record<string, Provider>): void {
   if (!KEEPALIVE_INTERVAL_MS) {
     console.log('Keep-alive disabled (KEEPALIVE_INTERVAL_MS=0)');
     return;
@@ -267,7 +316,7 @@ function scheduleKeepAlive(statusTracker: ProviderStatusTracker): void {
   const tick = async () => {
     // Sequential, not parallel: solves are serialised anyway (XTEST input is
     // global), and this keeps at most one browser page open at a time.
-    for (const provider of Object.values(providerMap)) {
+    for (const provider of Object.values(providers)) {
       await warmProvider(provider, statusTracker);
     }
     const next = KEEPALIVE_INTERVAL_MS * (0.8 + Math.random() * 0.4);
@@ -286,16 +335,24 @@ async function shutdown(): Promise<void> {
 
 const isMain = import.meta.url === `file://${process.argv[1]}`;
 if (isMain) {
+  // Every indexer is Cardigann-driven and config-declared; a source: URL
+  // needs a real fetch to resolve, so this is awaited before listen()
+  // rather than built synchronously. A malformed config file throws out of
+  // here and crashes the boot - see buildProviderMap()'s own doc comment.
+  const providers = await buildProviderMap();
   const statusTracker = new ProviderStatusTracker();
-  const app = createApp(providerMap, { statusTracker });
+  const app = createApp(providers, { statusTracker });
   app.listen(PORT, () => {
     console.log(`Torznab server listening on http://localhost:${PORT}`);
     console.log(`  status page: http://localhost:${PORT}/`);
-    for (const provider of Object.values(providerMap)) {
+    if (Object.keys(providers).length === 0) {
+      console.log(`  No indexers configured - see config/trackarr.yml.example (CONFIG_FILE env var to point elsewhere).`);
+    }
+    for (const provider of Object.values(providers)) {
       console.log(`  ${provider.name}: http://localhost:${PORT}/${provider.id}/api`);
     }
     console.log(`API key: ${API_KEY}${API_KEY === 'changeme' ? ' (set API_KEY env var to something real!)' : ''}`);
-    scheduleKeepAlive(statusTracker);
+    scheduleKeepAlive(statusTracker, providers);
   });
 
   process.on('SIGINT', shutdown);

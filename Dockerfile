@@ -20,6 +20,7 @@ RUN npx camoufox-js fetch
 
 COPY lib ./lib
 COPY providers ./providers
+COPY scripts ./scripts
 COPY server.ts ./
 RUN npm run build
 
@@ -71,7 +72,11 @@ RUN DEBIAN_FRONTEND=noninteractive apt-get update && \
     && fc-cache -f /usr/local/share/fonts
 
 COPY --from=builder /app/dist ./
-
+# definitions/schema.json is required at runtime for every Cardigann
+# definition regardless of source: (read cwd-relative, see
+# scripts/copy-assets.mjs) - vendored .yml files (currently just ext-to.yml)
+# come along too, for the bundled-fallback resolution tier.
+COPY definitions ./definitions
 
 ENV PORT=9117
 # The browser runs non-headless against this display. It must be a real size:
